@@ -1,0 +1,21 @@
+# Databricks Apps manifest for RT_onto_demo
+command:
+  - streamlit
+  - run
+  - app/app.py
+  - --server.port
+  - "8080"
+  - --server.address
+  - "0.0.0.0"
+env:
+  - name: RT_ONTO_DATA_MODE
+    value: "warehouse"   # live views exist in jai_ontos.demo_schema; "seed" for offline
+  - name: RT_ONTO_WAREHOUSE_ID
+    value: "bf7ffcda00a8c351"   # jai-sql-warehouse (310314146ebd3230 not present)
+  - name: RT_ONTO_TARGET_CATALOG
+    value: "jai_ontos"
+  - name: RT_ONTO_TARGET_SCHEMA
+    value: "demo_schema"
+# Warehouse mode auth: a Databricks App service principal (SDK default creds) or a
+# PAT via DATABRICKS_HOST + DATABRICKS_TOKEN. Locally, set DATABRICKS_CONFIG_PROFILE
+# (e.g. jai-classic) and the SDK statement API is used — no PAT needed.

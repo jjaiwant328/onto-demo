@@ -1,0 +1,79 @@
+@prefix rdf:  <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix owl:  <http://www.w3.org/2002/07/owl#> .
+@prefix xsd:  <http://www.w3.org/2001/XMLSchema#> .
+@prefix rt:   <https://retailer.example/onto/retail_traffic_labor#> .
+
+# ------------------------------------------------------------------------------
+# RT_onto — Store Traffic & Labor Efficiency ontology (minimal, first use case).
+# Business vocabulary is stable; physical mappings live in source_mapping.yaml.
+# KPI formulas live in semantic_measures.yaml (not duplicated here).
+# ------------------------------------------------------------------------------
+
+rt:RetailTrafficLabor a owl:Ontology ;
+    rdfs:label "Retail Store Traffic & Labor Efficiency" ;
+    rdfs:comment "Minimal ontology for the store traffic/labor efficiency product." .
+
+# ---- Classes -----------------------------------------------------------------
+rt:Store a owl:Class ;
+    rdfs:label "Store" ;
+    rdfs:comment "A physical Retailer store/site." .
+
+rt:CalendarDay a owl:Class ;
+    rdfs:label "Calendar Day" ;
+    rdfs:comment "A single calendar date." .
+
+rt:StoreTrafficDay a owl:Class ;
+    rdfs:label "Store Traffic Day" ;
+    rdfs:comment "Customer traffic for one store on one day (derived from POS)." .
+
+rt:StoreLaborDay a owl:Class ;
+    rdfs:label "Store Labor Day" ;
+    rdfs:comment "Labor hours and cost for one store on one day." .
+
+rt:StoreDayEfficiency a owl:Class ;
+    rdfs:label "Store Day Efficiency" ;
+    rdfs:comment "Conformed traffic+labor with efficiency KPIs for one store-day." .
+
+# ---- Object properties (relationships) ---------------------------------------
+rt:forStore a owl:ObjectProperty ;
+    rdfs:label "for store" ;
+    rdfs:domain [ owl:unionOf ( rt:StoreTrafficDay rt:StoreLaborDay rt:StoreDayEfficiency ) ] ;
+    rdfs:range rt:Store .
+
+rt:onDay a owl:ObjectProperty ;
+    rdfs:label "on day" ;
+    rdfs:domain [ owl:unionOf ( rt:StoreTrafficDay rt:StoreLaborDay rt:StoreDayEfficiency ) ] ;
+    rdfs:range rt:CalendarDay .
+
+rt:trafficOf a owl:ObjectProperty ;
+    rdfs:label "traffic of" ;
+    rdfs:domain rt:StoreDayEfficiency ; rdfs:range rt:StoreTrafficDay .
+
+rt:laborOf a owl:ObjectProperty ;
+    rdfs:label "labor of" ;
+    rdfs:domain rt:StoreDayEfficiency ; rdfs:range rt:StoreLaborDay .
+
+# ---- Datatype properties -----------------------------------------------------
+rt:storeNumber a owl:DatatypeProperty ; rdfs:domain rt:Store ; rdfs:range xsd:integer .
+rt:storeName   a owl:DatatypeProperty ; rdfs:domain rt:Store ; rdfs:range xsd:string .
+rt:storeCity   a owl:DatatypeProperty ; rdfs:domain rt:Store ; rdfs:range xsd:string .
+rt:stateCode   a owl:DatatypeProperty ; rdfs:domain rt:Store ; rdfs:range xsd:string .
+rt:regionName  a owl:DatatypeProperty ; rdfs:domain rt:Store ; rdfs:range xsd:string .
+rt:storeStatus a owl:DatatypeProperty ; rdfs:domain rt:Store ; rdfs:range xsd:string .
+
+rt:calendarDate a owl:DatatypeProperty ; rdfs:domain rt:CalendarDay ; rdfs:range xsd:date .
+rt:dateKey      a owl:DatatypeProperty ; rdfs:domain rt:CalendarDay ; rdfs:range xsd:integer .
+
+rt:totalCustomers a owl:DatatypeProperty ; rdfs:domain rt:StoreTrafficDay ; rdfs:range xsd:integer .
+rt:shopCustomers  a owl:DatatypeProperty ; rdfs:domain rt:StoreTrafficDay ; rdfs:range xsd:integer .
+rt:fuelCustomers  a owl:DatatypeProperty ; rdfs:domain rt:StoreTrafficDay ; rdfs:range xsd:integer .
+rt:dualCustomers  a owl:DatatypeProperty ; rdfs:domain rt:StoreTrafficDay ; rdfs:range xsd:integer .
+
+rt:totalLaborHours a owl:DatatypeProperty ; rdfs:domain rt:StoreLaborDay ; rdfs:range xsd:decimal .
+rt:totalLaborCost  a owl:DatatypeProperty ; rdfs:domain rt:StoreLaborDay ; rdfs:range xsd:decimal .
+
+# Derived KPIs (formulas in semantic_measures.yaml)
+rt:laborCostPerCustomer          a owl:DatatypeProperty ; rdfs:domain rt:StoreDayEfficiency ; rdfs:range xsd:decimal .
+rt:laborHoursPerCustomer         a owl:DatatypeProperty ; rdfs:domain rt:StoreDayEfficiency ; rdfs:range xsd:decimal .
+rt:dualCustomerConversionRatePct a owl:DatatypeProperty ; rdfs:domain rt:StoreDayEfficiency ; rdfs:range xsd:decimal .

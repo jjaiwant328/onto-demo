@@ -1,0 +1,21 @@
+# OntoBricks project config
+project:
+  name: rt_onto_retail_traffic_labor
+  use_case: store_traffic_labor_efficiency
+  description: Ontology design + schema mapping for Store Traffic & Labor Efficiency.
+ontology:
+  file: ../../ontology/retail_traffic_labor.ttl
+  namespace: "https://retailer.example/onto/retail_traffic_labor#"
+  prefix: rt
+source:
+  catalog: fc_entdata_gold       # override to jai_ontos for local rt_str_lbr
+  schemas: { dim: cdm_dim, bi: cdm_bi, pos: cdm_pos }
+target:
+  catalog: jai_ontos
+  schema: demo_schema
+  prefix: jai_
+  warehouse_id: "310314146ebd3230"
+mapping:
+  file: ../mappings/retail_traffic_labor_mapping.yaml
+measures:
+  file: ../../ontology/semantic_measures.yaml

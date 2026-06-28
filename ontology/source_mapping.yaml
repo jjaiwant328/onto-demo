@@ -1,0 +1,90 @@
+# source_mapping.yaml
+# Business concept -> physical schema mapping (the semantic adapter).
+# Source defaults to the documented reference catalog. Override source.catalog/
+# source.schema to point at the local physical schema jai_ontos.rt_str_lbr if it
+# mirrors these tables. Serving objects are always written to the target below.
+
+version: 1
+source:
+  # Documented reference model from inputs/describe_table_extended.csv.
+  catalog: fc_entdata_gold
+  schemas:
+    dim: cdm_dim
+    bi:  cdm_bi
+    pos: cdm_pos
+  # To use the local physical schema instead, set:
+  #   catalog: jai_ontos
+  #   schemas: { dim: rt_str_lbr, bi: rt_str_lbr, pos: rt_str_lbr }
+target:
+  catalog: jai_ontos
+  schema: demo_schema
+  prefix: jai_
+warehouse_id: "310314146ebd3230"
+
+classes:
+  Store:
+    source_table: "${source.catalog}.cdm_dim.dim_store"
+    grain: store
+    key: { ontology: storeNumber, column: store_number }
+    columns:
+      storeName: store_name
+      storeCity: store_city
+      stateCode: state_code
+      storeStatus: store_status
+    enrichment:
+      regionName:
+        from: "${source.catalog}.cdm_bi.storebonuses"
+        join: "store_number = storenumber"
+        column: region_nm
+        grain: month            # region is monthly; take latest per store. See A3.
+    notes: dim_store_attr is an alternate/wider source with the same keys.
+
+  CalendarDay:
+    source_table: "${source.catalog}.cdm_dim.dim_calendar"
+    grain: day
+    key: { ontology: dateKey, column: date_key }
+    columns:
+      calendarDate: date
+      dayName: day_nm
+      monthName: month_nm
+      year: year
+
+  StoreLaborDay:
+    source_table: "${source.catalog}.cdm_bi.smmry_labor"
+    grain: store_day            # source is sub-daily (per position); summed in SQL
+    keys:
+      storeNumber: store_number
+      dateKey: transaction_date_key
+    measures:
+      totalLaborHours: { agg: sum, column: labor_hours }
+      totalLaborCost:  { agg: sum, column: labor_amount }
+
+  StoreTrafficDay:
+    source_table: "${source.catalog}.cdm_pos.sale_transaction_header"
+    grain: store_day            # source is per-transaction; aggregated in SQL
+    keys:
+      storeNumber: store_num
+      dateKey: business_date_key
+      businessDate: business_date
+    discriminators:
+      shop_vs_fuel: outside_sale_flag    # 'N' = shop, 'Y' = fuel. See A4.
+      customer_id: cust_id               # sparse / loyalty only. See A5.
+      transaction_key: txn_key
+    measures:
+      totalCustomers: "count(distinct coalesce(cust_id, txn_key))"
+      shopCustomers: "count(distinct case when outside_sale_flag='N' then coalesce(cust_id, txn_key) end)"
+      fuelCustomers: "count(distinct case when outside_sale_flag='Y' then coalesce(cust_id, txn_key) end)"
+      dualCustomers: "see sql/01 — customers with both shop and fuel on the day"
+
+  StoreDayEfficiency:
+    derived: true
+    from: [StoreTrafficDay, StoreLaborDay, Store, CalendarDay]
+    join: "traffic.store_number = labor.store_number AND traffic.date_key = labor.date_key"
+    serving_view: "${target.catalog}.${target.schema}.jai_store_day_traffic_labor"
+    kpis_from: ontology/semantic_measures.yaml
+
+assumptions:
+  A2: "Source defaults to fc_entdata_gold; override for jai_ontos.rt_str_lbr."
+  A3: "Region from storebonuses.region_nm (monthly); division/area not in inventory."
+  A4: "Shop/fuel split via outside_sale_flag."
+  A5: "cust_id is loyalty-biased; dual-customer metrics under-count anonymous visits."

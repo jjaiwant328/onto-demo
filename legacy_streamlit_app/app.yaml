@@ -1,0 +1,23 @@
+# Databricks Apps manifest (deployed at the repo root).
+command:
+  - sh
+  - -c
+  - >-
+    streamlit run app/app.py
+    --server.port ${DATABRICKS_APP_PORT:-8080}
+    --server.address 0.0.0.0
+    --server.headless true
+    --server.enableCORS false
+    --server.enableXsrfProtection false
+env:
+  - name: RT_ONTO_DATA_MODE
+    value: "warehouse"          # reads live views in jai_ontos.demo_schema
+  - name: RT_ONTO_WAREHOUSE_ID
+    value: "bf7ffcda00a8c351"   # jai-sql-warehouse
+  - name: RT_ONTO_TARGET_CATALOG
+    value: "jai_ontos"
+  - name: RT_ONTO_TARGET_SCHEMA
+    value: "demo_schema"
+# Auth: the app runs as a Databricks Apps service principal; the SDK picks up its
+# credentials automatically. Grant that SP: USE CATALOG jai_ontos, USE SCHEMA
+# demo_schema, SELECT on the jai_ views, and CAN USE on the SQL warehouse.

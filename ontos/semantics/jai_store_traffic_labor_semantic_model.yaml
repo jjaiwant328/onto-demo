@@ -1,0 +1,46 @@
+# Ontos semantic-model registration: links ontology classes <-> measures <-> serving columns
+apiVersion: ontos/v1
+kind: SemanticModel
+metadata:
+  name: jai_store_traffic_labor_semantic_model
+  product: jai_store_traffic_labor_efficiency
+  ontology: ontology/retail_traffic_labor.ttl
+  measures: ontology/semantic_measures.yaml
+spec:
+  entities:
+    Store:
+      key: store_number
+      serving_columns: [store_number, store_name, store_city, state_code, region_name, store_status]
+      dimension: true
+    CalendarDay:
+      key: date_key
+      serving_columns: [date_key, calendar_day]
+      dimension: true
+    StoreTrafficDay:
+      key: [store_number, date_key]
+      serving_columns: [total_customers, shop_customers, fuel_customers, dual_customers]
+    StoreLaborDay:
+      key: [store_number, date_key]
+      serving_columns: [total_labor_hours, total_labor_cost]
+    StoreDayEfficiency:
+      key: [store_number, date_key]
+      derived_from: [StoreTrafficDay, StoreLaborDay]
+      serving_columns: [labor_cost_per_customer, labor_hours_per_customer, dual_customer_conversion_rate_pct]
+  measure_bindings:
+    total_customers: { entity: StoreTrafficDay, column: total_customers }
+    shop_customers: { entity: StoreTrafficDay, column: shop_customers }
+    fuel_customers: { entity: StoreTrafficDay, column: fuel_customers }
+    dual_customers: { entity: StoreTrafficDay, column: dual_customers }
+    total_labor_hours: { entity: StoreLaborDay, column: total_labor_hours }
+    total_labor_cost: { entity: StoreLaborDay, column: total_labor_cost }
+    labor_cost_per_customer: { entity: StoreDayEfficiency, column: labor_cost_per_customer }
+    labor_hours_per_customer: { entity: StoreDayEfficiency, column: labor_hours_per_customer }
+    dual_customer_conversion_rate_pct: { entity: StoreDayEfficiency, column: dual_customer_conversion_rate_pct }
+  default_dimensions: [region_name, state_code, store_number, calendar_day]
+  serving_view: jai_ontos.demo_schema.jai_store_day_traffic_labor
+  validation:
+    status: draft
+    checks:
+      - every entity key maps to a serving column: pass
+      - every measure binding resolves to a contract column: pass
+      - region_name nullable handled by app filters: pass

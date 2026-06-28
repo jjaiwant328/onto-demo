@@ -1,0 +1,90 @@
+# semantic_measures.yaml
+# Single source of truth for KPI definitions. SQL serving views and the app
+# must match these formulas exactly. Do not redefine KPIs anywhere else.
+
+version: 1
+domain: retail_store_operations
+use_case: store_traffic_labor_efficiency
+grain: store_day            # one row per store_number x calendar_day (unless noted)
+
+# ---- Base measures (additive at store-day grain) -------------------------------
+measures:
+  total_customers:
+    type: base
+    description: Distinct customer visits at a store on a day. Uses cust_id when
+      present, else distinct transaction key (anonymous visits).
+    formula_sql: "count(distinct coalesce(cust_id, txn_key))"
+    source: cdm_pos.sale_transaction_header
+    unit: customers
+    additive: true
+
+  shop_customers:
+    type: base
+    description: Visits with an inside/shop sale (outside_sale_flag = 'N').
+    formula_sql: "count(distinct case when outside_sale_flag = 'N' then coalesce(cust_id, txn_key) end)"
+    source: cdm_pos.sale_transaction_header
+    unit: customers
+    additive: true
+
+  fuel_customers:
+    type: base
+    description: Visits with an outside-court/fuel sale (outside_sale_flag = 'Y').
+    formula_sql: "count(distinct case when outside_sale_flag = 'Y' then coalesce(cust_id, txn_key) end)"
+    source: cdm_pos.sale_transaction_header
+    unit: customers
+    additive: true
+
+  dual_customers:
+    type: base
+    description: Customers with BOTH shop and fuel activity on the same store-day.
+      Loyalty-biased (requires a resolvable cust_id). See assumption A5.
+    formula_sql: "count(distinct case when has_shop = 1 and has_fuel = 1 then cust_id end)"
+    source: cdm_pos.sale_transaction_header
+    unit: customers
+    additive: true
+
+  total_labor_hours:
+    type: base
+    description: Total scheduled/worked labor hours at a store on a day.
+    formula_sql: "sum(labor_hours)"
+    source: cdm_bi.smmry_labor
+    unit: hours
+    additive: true
+
+  total_labor_cost:
+    type: base
+    description: Total labor cost (amount) at a store on a day.
+    formula_sql: "sum(labor_amount)"
+    source: cdm_bi.smmry_labor
+    unit: usd
+    additive: true
+
+# ---- Derived KPIs (ratios; NOT additive — recompute from base sums) ------------
+  dual_customer_conversion_rate_pct:
+    type: derived
+    description: Share of customers who bought both shop and fuel.
+    formula_sql: "100.0 * sum(dual_customers) / nullif(sum(total_customers), 0)"
+    unit: percent
+    additive: false
+    depends_on: [dual_customers, total_customers]
+
+  labor_cost_per_customer:
+    type: derived
+    description: Labor cost per customer — primary efficiency KPI (lower is better).
+    formula_sql: "sum(total_labor_cost) / nullif(sum(total_customers), 0)"
+    unit: usd_per_customer
+    additive: false
+    depends_on: [total_labor_cost, total_customers]
+
+  labor_hours_per_customer:
+    type: derived
+    description: Labor hours per customer — staffing intensity (lower is leaner).
+    formula_sql: "sum(total_labor_hours) / nullif(sum(total_customers), 0)"
+    unit: hours_per_customer
+    additive: false
+    depends_on: [total_labor_hours, total_customers]
+
+notes:
+  - Derived KPIs must be computed from re-aggregated base sums, never by averaging
+    pre-computed per-day ratios.
+  - nullif(...,0) guards divide-by-zero (closed days / zero traffic).

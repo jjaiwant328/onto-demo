@@ -1,0 +1,38 @@
+# OntoBricks materialization config
+# How ontology classes/edges materialize to the serving layer (and, optionally, a graph).
+materialization:
+  mode: serving_views          # serving_views | graph | both
+  target:
+    catalog: jai_ontos
+    schema: demo_schema
+    prefix: jai_
+  warehouse_id: "310314146ebd3230"
+
+  nodes:
+    - class: Store
+      materialize_to: jai_store_day_traffic_labor   # store attrs denormalized into serving view
+      id: store_number
+    - class: CalendarDay
+      materialize_to: jai_store_day_traffic_labor
+      id: date_key
+    - class: StoreDayEfficiency
+      materialize_to: jai_store_day_traffic_labor
+      id: [store_number, date_key]
+
+  edges:
+    - predicate: forStore
+      from: StoreDayEfficiency
+      to: Store
+      via: "store_number = store_number"
+    - predicate: onDay
+      from: StoreDayEfficiency
+      to: CalendarDay
+      via: "date_key = date_key"
+
+  graph:
+    enabled: false             # flip to true to emit a property-graph projection
+    note: >-
+      First pass materializes to relational serving views only. A graph projection
+      (e.g. for path queries Store->Region->...) is a future enhancement.
+  refresh:
+    strategy: view             # views recompute on read; switch to table+schedule if needed

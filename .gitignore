@@ -1,0 +1,25 @@
+# ---- Node / AppKit (new deployed app) ----
+node_modules/
+client/dist/
+dist/
+build/
+.databricks/
+.smoke-test/
+test-results/
+playwright-report/
+# Auto-generated AppKit types (endpoint-specific, varies per developer)
+shared/appkit-types/serving.d.ts
+
+# ---- Python (legacy_streamlit_app) ----
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ipynb_checkpoints/
+# Generated synthetic seed (recreate with: python legacy_streamlit_app/app/seed/generate_seed.py)
+legacy_streamlit_app/app/seed/*.parquet
+
+# ---- Local env ----
+.env
+*.local
+.DS_Store

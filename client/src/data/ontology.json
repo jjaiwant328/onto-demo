@@ -1,0 +1,322 @@
+{
+  "generatedAt": "2026-06-27T23:48:20.833Z",
+  "ontologyLabel": "Retail Store Traffic & Labor Efficiency",
+  "classes": [
+    {
+      "class": "Store",
+      "label": "Store",
+      "comment": "",
+      "grain": "store",
+      "source_table": "${source.catalog}.cdm_dim.dim_store",
+      "derived": false
+    },
+    {
+      "class": "CalendarDay",
+      "label": "Calendar Day",
+      "comment": "",
+      "grain": "day",
+      "source_table": "${source.catalog}.cdm_dim.dim_calendar",
+      "derived": false
+    },
+    {
+      "class": "StoreTrafficDay",
+      "label": "Store Traffic Day",
+      "comment": "",
+      "grain": "store_day",
+      "source_table": "${source.catalog}.cdm_pos.sale_transaction_header",
+      "derived": false
+    },
+    {
+      "class": "StoreLaborDay",
+      "label": "Store Labor Day",
+      "comment": "",
+      "grain": "store_day",
+      "source_table": "${source.catalog}.cdm_bi.smmry_labor",
+      "derived": false
+    },
+    {
+      "class": "StoreDayEfficiency",
+      "label": "Store Day Efficiency",
+      "comment": "",
+      "grain": "derived",
+      "source_table": "(derived)",
+      "derived": true
+    }
+  ],
+  "relationships": [
+    {
+      "predicate": "forStore",
+      "label": "for store",
+      "from": [
+        "StoreTrafficDay",
+        "StoreLaborDay",
+        "StoreDayEfficiency"
+      ],
+      "to": "Store"
+    },
+    {
+      "predicate": "onDay",
+      "label": "on day",
+      "from": [
+        "StoreTrafficDay",
+        "StoreLaborDay",
+        "StoreDayEfficiency"
+      ],
+      "to": "CalendarDay"
+    },
+    {
+      "predicate": "trafficOf",
+      "label": "traffic of",
+      "from": [
+        "StoreDayEfficiency"
+      ],
+      "to": "StoreTrafficDay"
+    },
+    {
+      "predicate": "laborOf",
+      "label": "labor of",
+      "from": [
+        "StoreDayEfficiency"
+      ],
+      "to": "StoreLaborDay"
+    }
+  ],
+  "mappings": [
+    {
+      "class": "Store",
+      "property": "storeNumber",
+      "source": "${source.catalog}.cdm_dim.dim_store",
+      "column": "store_number",
+      "role": "key"
+    },
+    {
+      "class": "Store",
+      "property": "storeName",
+      "source": "${source.catalog}.cdm_dim.dim_store",
+      "column": "store_name",
+      "role": "attribute"
+    },
+    {
+      "class": "Store",
+      "property": "storeCity",
+      "source": "${source.catalog}.cdm_dim.dim_store",
+      "column": "store_city",
+      "role": "attribute"
+    },
+    {
+      "class": "Store",
+      "property": "stateCode",
+      "source": "${source.catalog}.cdm_dim.dim_store",
+      "column": "state_code",
+      "role": "attribute"
+    },
+    {
+      "class": "Store",
+      "property": "storeStatus",
+      "source": "${source.catalog}.cdm_dim.dim_store",
+      "column": "store_status",
+      "role": "attribute"
+    },
+    {
+      "class": "CalendarDay",
+      "property": "dateKey",
+      "source": "${source.catalog}.cdm_dim.dim_calendar",
+      "column": "date_key",
+      "role": "key"
+    },
+    {
+      "class": "CalendarDay",
+      "property": "calendarDate",
+      "source": "${source.catalog}.cdm_dim.dim_calendar",
+      "column": "date",
+      "role": "attribute"
+    },
+    {
+      "class": "CalendarDay",
+      "property": "dayName",
+      "source": "${source.catalog}.cdm_dim.dim_calendar",
+      "column": "day_nm",
+      "role": "attribute"
+    },
+    {
+      "class": "CalendarDay",
+      "property": "monthName",
+      "source": "${source.catalog}.cdm_dim.dim_calendar",
+      "column": "month_nm",
+      "role": "attribute"
+    },
+    {
+      "class": "CalendarDay",
+      "property": "year",
+      "source": "${source.catalog}.cdm_dim.dim_calendar",
+      "column": "year",
+      "role": "attribute"
+    },
+    {
+      "class": "StoreLaborDay",
+      "property": "storeNumber",
+      "source": "${source.catalog}.cdm_bi.smmry_labor",
+      "column": "store_number",
+      "role": "key"
+    },
+    {
+      "class": "StoreLaborDay",
+      "property": "dateKey",
+      "source": "${source.catalog}.cdm_bi.smmry_labor",
+      "column": "transaction_date_key",
+      "role": "key"
+    },
+    {
+      "class": "StoreLaborDay",
+      "property": "totalLaborHours",
+      "source": "${source.catalog}.cdm_bi.smmry_labor",
+      "column": "labor_hours",
+      "role": "measure"
+    },
+    {
+      "class": "StoreLaborDay",
+      "property": "totalLaborCost",
+      "source": "${source.catalog}.cdm_bi.smmry_labor",
+      "column": "labor_amount",
+      "role": "measure"
+    },
+    {
+      "class": "StoreTrafficDay",
+      "property": "storeNumber",
+      "source": "${source.catalog}.cdm_pos.sale_transaction_header",
+      "column": "store_num",
+      "role": "key"
+    },
+    {
+      "class": "StoreTrafficDay",
+      "property": "dateKey",
+      "source": "${source.catalog}.cdm_pos.sale_transaction_header",
+      "column": "business_date_key",
+      "role": "key"
+    },
+    {
+      "class": "StoreTrafficDay",
+      "property": "businessDate",
+      "source": "${source.catalog}.cdm_pos.sale_transaction_header",
+      "column": "business_date",
+      "role": "key"
+    },
+    {
+      "class": "StoreTrafficDay",
+      "property": "totalCustomers",
+      "source": "${source.catalog}.cdm_pos.sale_transaction_header",
+      "column": "count(distinct coalesce(cust_id, txn_key))",
+      "role": "measure"
+    },
+    {
+      "class": "StoreTrafficDay",
+      "property": "shopCustomers",
+      "source": "${source.catalog}.cdm_pos.sale_transaction_header",
+      "column": "count(distinct case when outside_sale_flag='N' then coalesce(cust_id, txn_key) end)",
+      "role": "measure"
+    },
+    {
+      "class": "StoreTrafficDay",
+      "property": "fuelCustomers",
+      "source": "${source.catalog}.cdm_pos.sale_transaction_header",
+      "column": "count(distinct case when outside_sale_flag='Y' then coalesce(cust_id, txn_key) end)",
+      "role": "measure"
+    },
+    {
+      "class": "StoreTrafficDay",
+      "property": "dualCustomers",
+      "source": "${source.catalog}.cdm_pos.sale_transaction_header",
+      "column": "see sql/01 — customers with both shop and fuel on the day",
+      "role": "measure"
+    }
+  ],
+  "measures": [
+    {
+      "measure": "total_customers",
+      "type": "base",
+      "unit": "customers",
+      "formula": "count(distinct coalesce(cust_id, txn_key))",
+      "description": "Distinct customer visits at a store on a day. Uses cust_id when present, else distinct transaction key (anonymous visits).",
+      "depends_on": []
+    },
+    {
+      "measure": "shop_customers",
+      "type": "base",
+      "unit": "customers",
+      "formula": "count(distinct case when outside_sale_flag = 'N' then coalesce(cust_id, txn_key) end)",
+      "description": "Visits with an inside/shop sale (outside_sale_flag = 'N').",
+      "depends_on": []
+    },
+    {
+      "measure": "fuel_customers",
+      "type": "base",
+      "unit": "customers",
+      "formula": "count(distinct case when outside_sale_flag = 'Y' then coalesce(cust_id, txn_key) end)",
+      "description": "Visits with an outside-court/fuel sale (outside_sale_flag = 'Y').",
+      "depends_on": []
+    },
+    {
+      "measure": "dual_customers",
+      "type": "base",
+      "unit": "customers",
+      "formula": "count(distinct case when has_shop = 1 and has_fuel = 1 then cust_id end)",
+      "description": "Customers with BOTH shop and fuel activity on the same store-day. Loyalty-biased (requires a resolvable cust_id). See assumption A5.",
+      "depends_on": []
+    },
+    {
+      "measure": "total_labor_hours",
+      "type": "base",
+      "unit": "hours",
+      "formula": "sum(labor_hours)",
+      "description": "Total scheduled/worked labor hours at a store on a day.",
+      "depends_on": []
+    },
+    {
+      "measure": "total_labor_cost",
+      "type": "base",
+      "unit": "usd",
+      "formula": "sum(labor_amount)",
+      "description": "Total labor cost (amount) at a store on a day.",
+      "depends_on": []
+    },
+    {
+      "measure": "dual_customer_conversion_rate_pct",
+      "type": "derived",
+      "unit": "percent",
+      "formula": "100.0 * sum(dual_customers) / nullif(sum(total_customers), 0)",
+      "description": "Share of customers who bought both shop and fuel.",
+      "depends_on": [
+        "dual_customers",
+        "total_customers"
+      ]
+    },
+    {
+      "measure": "labor_cost_per_customer",
+      "type": "derived",
+      "unit": "usd_per_customer",
+      "formula": "sum(total_labor_cost) / nullif(sum(total_customers), 0)",
+      "description": "Labor cost per customer — primary efficiency KPI (lower is better).",
+      "depends_on": [
+        "total_labor_cost",
+        "total_customers"
+      ]
+    },
+    {
+      "measure": "labor_hours_per_customer",
+      "type": "derived",
+      "unit": "hours_per_customer",
+      "formula": "sum(total_labor_hours) / nullif(sum(total_customers), 0)",
+      "description": "Labor hours per customer — staffing intensity (lower is leaner).",
+      "depends_on": [
+        "total_labor_hours",
+        "total_customers"
+      ]
+    }
+  ],
+  "assumptions": {
+    "A2": "Source defaults to fc_entdata_gold; override for jai_ontos.rt_str_lbr.",
+    "A3": "Region from storebonuses.region_nm (monthly); division/area not in inventory.",
+    "A4": "Shop/fuel split via outside_sale_flag.",
+    "A5": "cust_id is loyalty-biased; dual-customer metrics under-count anonymous visits."
+  }
+}

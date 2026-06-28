@@ -1,0 +1,49 @@
+# Ontos data contract for the serving layer
+apiVersion: ontos/v1
+kind: DataContract
+metadata:
+  name: jai_store_traffic_labor_efficiency_contract
+  product: jai_store_traffic_labor_efficiency
+  owner: jaiwant.jonathan@databricks.com
+  status: defined            # defined | active | breaking
+spec:
+  serving_object: jai_ontos.demo_schema.jai_store_day_traffic_labor
+  grain: one row per (store_number, calendar_day)
+  warehouse_id: "310314146ebd3230"
+  schema:
+    - { name: store_number, type: int, nullable: false, key: true }
+    - { name: store_name, type: string, nullable: true }
+    - { name: store_city, type: string, nullable: true }
+    - { name: state_code, type: string, nullable: true }
+    - { name: region_name, type: string, nullable: true }   # A3
+    - { name: store_status, type: string, nullable: true }
+    - { name: date_key, type: int, nullable: false, key: true }
+    - { name: calendar_day, type: date, nullable: false, key: true }
+    - { name: total_customers, type: bigint, nullable: false }
+    - { name: shop_customers, type: bigint, nullable: false }
+    - { name: fuel_customers, type: bigint, nullable: false }
+    - { name: dual_customers, type: bigint, nullable: false }
+    - { name: total_labor_hours, type: "decimal(18,2)", nullable: false }
+    - { name: total_labor_cost, type: "decimal(18,2)", nullable: false }
+    - { name: labor_cost_per_customer, type: "decimal(18,4)", nullable: true }
+    - { name: labor_hours_per_customer, type: "decimal(18,4)", nullable: true }
+    - { name: dual_customer_conversion_rate_pct, type: "decimal(18,2)", nullable: true }
+  quality_checks:
+    - id: unique_grain
+      rule: count(*) = count(distinct store_number, date_key)
+    - id: non_negative_customers
+      rule: min(total_customers) >= 0
+    - id: kpi_divzero_guarded
+      rule: labor_cost_per_customer is null only when total_customers = 0
+    - id: customer_parts_consistent
+      rule: shop_customers <= total_customers AND fuel_customers <= total_customers
+  freshness:
+    sla: data available by 06:00 local for prior business_date
+    basis: calendar_day
+  scope:
+    included: store-day traffic + labor + efficiency KPIs for active stores
+    excluded: fuel margin, shrink, bonuses, customer PII
+  assumptions:
+    - Derived KPIs computed from re-aggregated base sums (see semantic_measures.yaml)
+    - region_name may be stale (monthly source) or null (A3)
+    - dual_customers loyalty-biased (A5)

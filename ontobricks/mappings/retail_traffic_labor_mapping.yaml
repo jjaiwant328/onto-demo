@@ -1,0 +1,68 @@
+# OntoBricks class/property -> physical column mapping (with join + grain detail).
+# Companion to ../../ontology/source_mapping.yaml; this file is OntoBricks-native
+# and adds materialization-oriented detail (joins, grain resolution, validation).
+version: 1
+source_catalog: fc_entdata_gold
+mappings:
+  - class: Store
+    table: cdm_dim.dim_store
+    grain: store
+    properties:
+      storeNumber: store_number
+      storeName: store_name
+      storeCity: store_city
+      stateCode: state_code
+      storeStatus: store_status
+    enrich:
+      - property: regionName
+        table: cdm_bi.storebonuses
+        column: region_nm
+        join: store_number = storenumber
+        grain_resolution: "latest report_month per store"
+
+  - class: CalendarDay
+    table: cdm_dim.dim_calendar
+    grain: day
+    properties:
+      dateKey: date_key
+      calendarDate: date
+      dayName: day_nm
+      monthName: month_nm
+      year: year
+
+  - class: StoreLaborDay
+    table: cdm_bi.smmry_labor
+    grain_source: store_position_day
+    grain_target: store_day
+    grain_resolution: "GROUP BY store_number, transaction_date_key; sum hours & amount"
+    properties:
+      storeNumber: store_number
+      dateKey: transaction_date_key
+      totalLaborHours: { agg: sum, column: labor_hours }
+      totalLaborCost: { agg: sum, column: labor_amount }
+
+  - class: StoreTrafficDay
+    table: cdm_pos.sale_transaction_header
+    grain_source: transaction
+    grain_target: store_day
+    grain_resolution: "GROUP BY store_num, business_date_key; distinct-count customers"
+    properties:
+      storeNumber: store_num
+      dateKey: business_date_key
+      businessDate: business_date
+    derived:
+      totalCustomers: "count(distinct coalesce(cust_id, txn_key))"
+      shopCustomers: "count(distinct case when outside_sale_flag='N' then coalesce(cust_id,txn_key) end)"
+      fuelCustomers: "count(distinct case when outside_sale_flag='Y' then coalesce(cust_id,txn_key) end)"
+      dualCustomers: "count of cust_id with both shop and fuel on the day (see sql/01)"
+
+  - class: StoreDayEfficiency
+    derived: true
+    join: "traffic.store_number = labor.store_number AND traffic.date_key = labor.date_key"
+    materialized_view: jai_ontos.demo_schema.jai_store_day_traffic_labor
+
+validation_notes:
+  - dim_store has no daily traffic; traffic is derived from POS (StoreTrafficDay).
+  - division/area absent in inventory -> not modeled (A3).
+  - outside_sale_flag assumed for shop/fuel split (A4); revisit if Retailer differs.
+  - cust_id sparse -> dual metrics loyalty-biased (A5).

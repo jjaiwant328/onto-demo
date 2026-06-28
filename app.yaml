@@ -1,0 +1,8 @@
+command: ['npm', 'run', 'start']
+env:
+  # Inject the SQL warehouse id (from the attached `sql-warehouse` resource) for
+  # the AppKit analytics plugin. The Databricks Apps builder runs `npm install`
+  # + `npm run build` (which needs devDependencies like tsc/vite), then runs this
+  # command. The `start` script sets NODE_ENV=production for the running server.
+  - name: DATABRICKS_WAREHOUSE_ID
+    valueFrom: sql-warehouse

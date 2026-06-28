@@ -1,0 +1,38 @@
+# Sample graph-oriented queries (illustrative) over the RT_onto ontology.
+# These express intent against the conceptual model; the equivalent executable
+# SQL is in sample_queries.sql. A graph projection is not enabled by default
+# (see config/materialization.yaml -> graph.enabled).
+
+# 1. Efficiency for one store over a date range
+query StoreEfficiencyTrend {
+  storeDayEfficiency(
+    where: { store: { storeNumber: 1234 }, day: { between: ["2026-01-01", "2026-01-31"] } }
+    orderBy: { calendarDate: ASC }
+  ) {
+    onDay { calendarDate }
+    forStore { storeNumber storeName regionName }
+    laborCostPerCustomer
+    laborHoursPerCustomer
+    dualCustomerConversionRatePct
+  }
+}
+
+# 2. Worst-efficiency stores in a region (opportunity discovery)
+query RegionOpportunities {
+  stores(where: { regionName: "Southeast" }) {
+    storeNumber
+    storeName
+    efficiency: storeDayEfficiencyAggregate(period: LAST_30_DAYS) {
+      avgLaborCostPerCustomer
+      totalCustomers
+    }
+  }
+}
+
+# 3. Dual-customer conversion by store
+query DualConversion {
+  storeDayEfficiencyAggregate(groupBy: forStore, period: LAST_30_DAYS) {
+    forStore { storeNumber storeName }
+    dualCustomerConversionRatePct
+  }
+}

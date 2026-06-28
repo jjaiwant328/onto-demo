@@ -1,0 +1,129 @@
+{
+  "name": "jai_ontos — Store Traffic & Labor Efficiency",
+  "version": "1.0",
+  "_comment": "ER data model for the Cytoscape Graph Explorer (Data model tab). Schema matches the databricks-industry-solutions model-viewer contract: domains[].products[] = tables, product.attributes[] = columns, attribute.foreign_key_to = 'domain.table.column'. Source tables reflect fc_entdata_gold reference columns; serving views are jai_ontos.demo_schema (see sql/ and ontology/source_mapping.yaml).",
+  "domains": [
+    {
+      "name": "retail_store_operations",
+      "description": "Store Traffic & Labor Efficiency — governed model in jai_ontos.demo_schema",
+      "division": "Retail",
+      "products": [
+        {
+          "name": "dim_store",
+          "subdomain": "Dimensions",
+          "description": "Store dimension (cdm_dim.dim_store)",
+          "tags": ["dimension"],
+          "attributes": [
+            { "name": "store_number", "type": "int", "primary_key": true, "description": "Store natural key" },
+            { "name": "store_name", "type": "string" },
+            { "name": "store_city", "type": "string" },
+            { "name": "state_code", "type": "string" },
+            { "name": "store_status", "type": "string" }
+          ]
+        },
+        {
+          "name": "dim_calendar",
+          "subdomain": "Dimensions",
+          "description": "Calendar dimension (cdm_dim.dim_calendar)",
+          "tags": ["dimension"],
+          "attributes": [
+            { "name": "date_key", "type": "int", "primary_key": true, "description": "Date surrogate key" },
+            { "name": "date", "type": "timestamp" },
+            { "name": "day_nm", "type": "string" },
+            { "name": "month_nm", "type": "string" },
+            { "name": "year", "type": "string" }
+          ]
+        },
+        {
+          "name": "smmry_labor",
+          "subdomain": "Source facts",
+          "description": "Labor summary, store-position-day grain (cdm_bi.smmry_labor)",
+          "tags": ["fact", "labor"],
+          "attributes": [
+            { "name": "labor_key", "type": "bigint", "primary_key": true },
+            { "name": "store_number", "type": "int", "foreign_key_to": "retail_store_operations.dim_store.store_number" },
+            { "name": "transaction_date_key", "type": "int", "foreign_key_to": "retail_store_operations.dim_calendar.date_key" },
+            { "name": "labor_hours", "type": "decimal" },
+            { "name": "labor_amount", "type": "decimal" },
+            { "name": "labor_position", "type": "string" }
+          ]
+        },
+        {
+          "name": "sale_transaction_header",
+          "subdomain": "Source facts",
+          "description": "POS sale transactions, transaction grain (cdm_pos.sale_transaction_header)",
+          "tags": ["fact", "pos", "traffic"],
+          "attributes": [
+            { "name": "txn_key", "type": "string", "primary_key": true },
+            { "name": "store_num", "type": "int", "foreign_key_to": "retail_store_operations.dim_store.store_number" },
+            { "name": "business_date_key", "type": "int", "foreign_key_to": "retail_store_operations.dim_calendar.date_key" },
+            { "name": "business_date", "type": "date" },
+            { "name": "cust_id", "type": "string" },
+            { "name": "outside_sale_flag", "type": "string", "description": "N=shop, Y=fuel (A4)" }
+          ]
+        },
+        {
+          "name": "storebonuses",
+          "subdomain": "Source facts",
+          "description": "Region enrichment, monthly grain (cdm_bi.storebonuses)",
+          "tags": ["enrichment"],
+          "attributes": [
+            { "name": "storenumber", "type": "int", "foreign_key_to": "retail_store_operations.dim_store.store_number" },
+            { "name": "region_nm", "type": "string" },
+            { "name": "report_month", "type": "string" }
+          ]
+        },
+        {
+          "name": "jai_store_day_traffic_labor",
+          "subdomain": "Serving views",
+          "description": "Conformed store-day traffic + labor + KPIs (jai_ontos.demo_schema)",
+          "tags": ["serving", "view"],
+          "attributes": [
+            { "name": "store_number", "type": "int", "primary_key": true, "foreign_key_to": "retail_store_operations.dim_store.store_number" },
+            { "name": "date_key", "type": "int", "primary_key": true, "foreign_key_to": "retail_store_operations.dim_calendar.date_key" },
+            { "name": "calendar_day", "type": "date" },
+            { "name": "region_name", "type": "string" },
+            { "name": "total_customers", "type": "bigint" },
+            { "name": "shop_customers", "type": "bigint" },
+            { "name": "fuel_customers", "type": "bigint" },
+            { "name": "dual_customers", "type": "bigint" },
+            { "name": "total_labor_hours", "type": "decimal" },
+            { "name": "total_labor_cost", "type": "decimal" },
+            { "name": "labor_cost_per_customer", "type": "decimal" },
+            { "name": "labor_hours_per_customer", "type": "decimal" },
+            { "name": "dual_customer_conversion_rate_pct", "type": "decimal" }
+          ]
+        },
+        {
+          "name": "jai_store_efficiency_summary",
+          "subdomain": "Serving views",
+          "description": "Store-level rollup of KPIs (jai_ontos.demo_schema)",
+          "tags": ["serving", "view"],
+          "attributes": [
+            { "name": "store_number", "type": "int", "primary_key": true, "foreign_key_to": "retail_store_operations.jai_store_day_traffic_labor.store_number" },
+            { "name": "active_days", "type": "int" },
+            { "name": "total_customers", "type": "bigint" },
+            { "name": "labor_cost_per_customer", "type": "decimal" },
+            { "name": "labor_hours_per_customer", "type": "decimal" },
+            { "name": "dual_customer_conversion_rate_pct", "type": "decimal" },
+            { "name": "avg_daily_customers", "type": "decimal" }
+          ]
+        },
+        {
+          "name": "jai_store_efficiency_opportunities",
+          "subdomain": "Serving views",
+          "description": "Ranked efficiency opportunities (jai_ontos.demo_schema)",
+          "tags": ["serving", "view"],
+          "attributes": [
+            { "name": "store_number", "type": "int", "primary_key": true, "foreign_key_to": "retail_store_operations.jai_store_efficiency_summary.store_number" },
+            { "name": "opportunity_rank", "type": "int" },
+            { "name": "benchmark_lcpc", "type": "decimal" },
+            { "name": "lcpc_gap", "type": "decimal" },
+            { "name": "opportunity_usd", "type": "decimal" },
+            { "name": "opportunity_flag", "type": "string" }
+          ]
+        }
+      ]
+    }
+  ]
+}

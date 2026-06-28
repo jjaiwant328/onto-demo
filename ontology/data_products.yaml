@@ -1,0 +1,36 @@
+# data_products.yaml
+# File-based product registry (the app reads this when the SQL registry view is
+# not available). Add one entry per governed product. Starts with one product.
+
+version: 1
+products:
+  - product_name: jai_store_traffic_labor_efficiency
+    display_name: Store Traffic & Labor Efficiency
+    domain: retail_store_operations
+    business_outcome: >-
+      Identify stores over- or under-staffed relative to customer traffic and
+      rank efficiency opportunities (labor cost per customer).
+    serving_view: jai_ontos.demo_schema.jai_store_day_traffic_labor
+    summary_view: jai_ontos.demo_schema.jai_store_efficiency_summary
+    opportunities_view: jai_ontos.demo_schema.jai_store_efficiency_opportunities
+    ontology_file: ontology/retail_traffic_labor.ttl
+    semantic_measures_file: ontology/semantic_measures.yaml
+    mapping_file: ontology/source_mapping.yaml
+    contract_file: ontos/contracts/jai_store_traffic_labor_efficiency_contract.yaml
+    semantic_model_file: ontos/semantics/jai_store_traffic_labor_semantic_model.yaml
+    source_tables:
+      - fc_entdata_gold.cdm_dim.dim_store
+      - fc_entdata_gold.cdm_dim.dim_calendar
+      - fc_entdata_gold.cdm_bi.smmry_labor
+      - fc_entdata_gold.cdm_pos.sale_transaction_header
+      - fc_entdata_gold.cdm_bi.storebonuses
+    owner: jaiwant.jonathan@databricks.com
+    maturity: incubating          # incubating | beta | ga
+    ontology_status: draft        # draft | validated | published
+    contract_status: defined      # defined | active | breaking
+    app_enabled: true
+    tags: [retail, labor, traffic, efficiency, store-ops]
+    kpis:
+      - labor_cost_per_customer
+      - labor_hours_per_customer
+      - dual_customer_conversion_rate_pct

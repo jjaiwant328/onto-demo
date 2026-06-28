@@ -1,0 +1,71 @@
+{
+  "generatedNote": "Domain -> data product catalog derived from fc_entdata_gold (98-table inventory). Each product lists real fact/dim tables; the app derives ontology classes, mappings, lineage and candidate measures at runtime from schema.json. Only products with `serving` configured have live warehouse data; the rest are schema-derived (no synthetic data).",
+  "domains": [
+    {
+      "name": "store_operations_labor",
+      "label": "Store Operations & Labor",
+      "description": "Store performance, staffing efficiency, drive-thru, cash accuracy and bonuses.",
+      "products": [
+        {"product_name":"jai_store_traffic_labor_efficiency","display_name":"Store Traffic & Labor Efficiency","business_outcome":"Rank stores by labor cost per customer and surface staffing efficiency opportunities.","fact_tables":["cdm_bi.smmry_labor","cdm_pos.sale_transaction_header"],"dim_tables":["cdm_dim.dim_store","cdm_dim.dim_calendar","cdm_bi.storebonuses"],"kpis":["labor_cost_per_customer","labor_hours_per_customer","dual_customer_conversion_rate_pct"],"live":true,"maturity":"ga"},
+        {"product_name":"jai_drive_thru_performance","display_name":"Drive-Thru Performance","business_outcome":"Measure drive-thru speed of service (greet/service/queue) and find slow lanes.","fact_tables":["cdm_bi.fact_drive_thru"],"dim_tables":["cdm_dim.dim_store","cdm_dim.dim_calendar"],"kpis":["avg_service_time","avg_lane_queue","cars_per_hour"],"maturity":"incubating"},
+        {"product_name":"jai_cashier_over_short","display_name":"Cashier Over / Short","business_outcome":"Detect cash handling variance by cashier and store.","fact_tables":["cdm_bi.fact_cashier_overshort"],"dim_tables":["cdm_dim.dim_store","cdm_dim.dim_calendar","cdm_dim.dim_store_operator"],"kpis":["total_over_short","over_short_per_shift"],"maturity":"incubating"},
+        {"product_name":"jai_store_bonus_margin","display_name":"Store Bonus & Margin","business_outcome":"Track store CM margin and shrink against bonus eligibility by region.","fact_tables":["cdm_bi.storebonuses"],"dim_tables":["cdm_dim.dim_store"],"kpis":["cm_margin","total_shrink"],"maturity":"incubating"}
+      ]
+    },
+    {
+      "name": "fuel",
+      "label": "Fuel",
+      "description": "Fuel volume, pricing competitiveness, margin and terminal supply.",
+      "products": [
+        {"product_name":"jai_fuel_sales_performance","display_name":"Fuel Sales Performance","business_outcome":"Track fuel volume and retail sales by store, grade and day.","fact_tables":["cdm_bi.smmry_fuel_sales"],"dim_tables":["cdm_dim.dim_store","cdm_dim.dim_calendar","cdm_dim.dim_finished_grade"],"kpis":["units_sold","retail_sales","fuel_margin"],"maturity":"incubating"},
+        {"product_name":"jai_fuel_pricing_competitiveness","display_name":"Fuel Pricing & Competitiveness","business_outcome":"Compare our street price to OPIS competitors and market share.","fact_tables":["cdm_bi.opis_price_live","cdm_bi.opis_competitor","cdm_bi.import_opis_marketshare"],"dim_tables":["cdm_dim.dim_opis_station"],"kpis":["price_gap_to_market","market_share"],"maturity":"incubating"},
+        {"product_name":"jai_fuel_margin_cost","display_name":"Fuel Margin & Cost","business_outcome":"Analyze fuel cost vs retail to manage margin and taxes.","fact_tables":["cdm_bi.smmry_fuel_sales"],"dim_tables":["cdm_dim.dim_fuel_vendor","cdm_dim.dim_site_fuel_prod_tax","cdm_dim.dim_calendar"],"kpis":["cost_sales","retail_sales","gross_margin_pct"],"maturity":"incubating"},
+        {"product_name":"jai_fuel_supply_liftings","display_name":"Fuel Supply & Liftings","business_outcome":"Monitor terminal liftings volume and vendor supply.","fact_tables":["cdm_bi.fact_allegro_trade_liftings"],"dim_tables":["cdm_dim.dim_allegro_vendor","cdm_dim.dim_allegro_terminal_info","cdm_dim.dim_allegro_finished_grade"],"kpis":["lifting_volume","vendor_supply_mix"],"maturity":"incubating"}
+      ]
+    },
+    {
+      "name": "merchandise_inventory",
+      "label": "Merchandise & Inventory",
+      "description": "In-store merchandise sales, inventory position, purchasing and shrink.",
+      "products": [
+        {"product_name":"jai_merchandise_sales","display_name":"Merchandise Sales","business_outcome":"Analyze in-store merch sales by item, category and store.","fact_tables":["cdm_bi.fact_pdi_rwmerch_sales"],"dim_tables":["cdm_dim.dim_item","cdm_dim.dim_products","cdm_dim.dim_store","cdm_dim.dim_calendar"],"kpis":["merch_sales","units_sold","gross_margin"],"maturity":"incubating"},
+        {"product_name":"jai_inventory_position","display_name":"Inventory Position","business_outcome":"Track on-hand inventory value and movement by item and store.","fact_tables":["cdm_bi.smmry_inventory","cdm_bi.smmry_inventory_balance"],"dim_tables":["cdm_dim.dim_item","cdm_dim.dim_store"],"kpis":["ending_inventory_value","inventory_turns"],"maturity":"incubating"},
+        {"product_name":"jai_purchasing_replenishment","display_name":"Purchasing & Replenishment","business_outcome":"Monitor purchases, orders and transfers against demand.","fact_tables":["cdm_bi.smmry_purchases","cdm_bi.smmry_orders","cdm_bi.smmry_transfers"],"dim_tables":["cdm_dim.dim_vendors","cdm_dim.dim_item"],"kpis":["purchase_cost","order_quantity","transfer_quantity"],"maturity":"incubating"},
+        {"product_name":"jai_shrink_loss","display_name":"Shrink & Loss","business_outcome":"Quantify merchandise shrink and loss by item and store.","fact_tables":["cdm_bi.smmry_shrink"],"dim_tables":["cdm_dim.dim_item","cdm_dim.dim_store","cdm_dim.dim_calendar"],"kpis":["shrink_value","shrink_pct_of_sales"],"maturity":"incubating"}
+      ]
+    },
+    {
+      "name": "sales_pos",
+      "label": "Sales & POS",
+      "description": "Basket analytics, tender mix, guest counts and exceptions from POS.",
+      "products": [
+        {"product_name":"jai_basket_transaction_analytics","display_name":"Basket & Transaction Analytics","business_outcome":"Analyze basket size, items per basket and net sales by store/day.","fact_tables":["cdm_pos.sale_transaction_header","cdm_pos.sale_transaction_detail"],"dim_tables":["cdm_dim.dim_store","cdm_dim.dim_calendar"],"kpis":["avg_basket_value","items_per_basket","net_sales"],"maturity":"incubating"},
+        {"product_name":"jai_tender_mix","display_name":"Tender Mix","business_outcome":"Break down sales by tender type and track digital/loyalty share.","fact_tables":["cdm_pos.sale_transaction_tender"],"dim_tables":["cdm_dim.dim_tender_code","cdm_dim.dim_store","cdm_dim.dim_calendar"],"kpis":["tender_amount","digital_tender_share"],"maturity":"incubating"},
+        {"product_name":"jai_guest_traffic_counts","display_name":"Guest Traffic & Counts","business_outcome":"Track guest counts and traffic trends by store and daypart.","fact_tables":["cdm_bi.smmry_guestcounts"],"dim_tables":["cdm_dim.dim_store","cdm_dim.dim_calendar"],"kpis":["guest_count","guests_per_day"],"maturity":"incubating"},
+        {"product_name":"jai_voids_exceptions","display_name":"Voids & Exceptions","business_outcome":"Surface void transactions and exception patterns for loss prevention.","fact_tables":["cdm_pos.void_transaction_header","cdm_pos.void_transaction_detail"],"dim_tables":["cdm_dim.dim_store","cdm_dim.dim_calendar"],"kpis":["void_amount","void_rate"],"maturity":"incubating"}
+      ]
+    },
+    {
+      "name": "finance_accounting",
+      "label": "Finance & Accounting",
+      "description": "General ledger, cash management, credits, rebates and refunds.",
+      "products": [
+        {"product_name":"jai_gl_monthly_balances","display_name":"GL Monthly Balances","business_outcome":"Review GL monthly balances by account, region and division.","fact_tables":["cdm_bi.gl_monthly_balances","cdm_bi.gl_monthly_balances_detail"],"dim_tables":["cdm_dim.dim_chart_of_accounts","cdm_dim.dim_store"],"kpis":["monthly_balance","actual_vs_budget"],"maturity":"incubating"},
+        {"product_name":"jai_cash_management_shrink","display_name":"Cash Management & Shrink","business_outcome":"Track daily cash shrink and reconciliation by store.","fact_tables":["cdm_bi.fact_daily_cash_shrink"],"dim_tables":["cdm_dim.dim_store","cdm_dim.dim_calendar"],"kpis":["cash_shrink","cash_variance"],"maturity":"incubating"},
+        {"product_name":"jai_credits_rebates","display_name":"Credits & Rebates","business_outcome":"Monitor vendor credits and rebate accruals.","fact_tables":["cdm_bi.smmry_credits","cdm_bi.smmry_rebates"],"dim_tables":["cdm_dim.dim_rebates","cdm_dim.dim_store"],"kpis":["credit_amount","rebate_amount"],"maturity":"incubating"},
+        {"product_name":"jai_refunds","display_name":"Refunds","business_outcome":"Analyze refund volume and value for loss prevention.","fact_tables":["cdm_bi.fact_rwradiant_refunds","cdm_bi.smmry_radiant_refund_rw"],"dim_tables":["cdm_dim.dim_store","cdm_dim.dim_calendar"],"kpis":["refund_amount","refund_rate"],"maturity":"incubating"}
+      ]
+    },
+    {
+      "name": "customer_marketing",
+      "label": "Customer & Marketing",
+      "description": "Customer 360, promotions, store offers and loyalty engagement.",
+      "products": [
+        {"product_name":"jai_customer_360","display_name":"Customer 360","business_outcome":"Unify customer profile and purchase behavior (loyalty).","fact_tables":["cdm_pos.sale_transaction_header"],"dim_tables":["cdm_dim.dim_customer","cdm_dim.dim_store"],"kpis":["active_customers","spend_per_customer"],"maturity":"incubating"},
+        {"product_name":"jai_promotions_effectiveness","display_name":"Promotions Effectiveness","business_outcome":"Measure lift and redemption of promotions.","fact_tables":["cdm_bi.fact_promotion","cdm_pos.sale_promotions"],"dim_tables":["cdm_dim.dim_promotion","cdm_dim.dim_store","cdm_dim.dim_calendar"],"kpis":["promo_redemptions","promo_sales_lift"],"maturity":"incubating"},
+        {"product_name":"jai_store_offers","display_name":"Store Offers","business_outcome":"Track store-level offers and availability.","fact_tables":["cdm_dim.dim_store_offers"],"dim_tables":["cdm_dim.dim_store","cdm_dim.dim_calendar"],"kpis":["active_offers","offer_coverage"],"maturity":"incubating"},
+        {"product_name":"jai_loyalty_rewards_engagement","display_name":"Loyalty & Rewards Engagement","business_outcome":"Track loyalty/rewards transaction share and engagement.","fact_tables":["cdm_pos.sale_transaction_header"],"dim_tables":["cdm_dim.dim_customer","cdm_dim.dim_store","cdm_dim.dim_calendar"],"kpis":["loyalty_txn_share","rewards_members_active"],"maturity":"incubating"}
+      ]
+    }
+  ]
+}
