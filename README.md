@@ -27,28 +27,59 @@ Adding a product to `client/src/data/catalog.json` is all that's needed to light
 The 24 products span domains: `store_operations_labor`, `fuel`,
 `merchandise_inventory`, `sales_pos`, `finance_accounting`, `customer_marketing`.
 
-### Upload a schema → regenerate everything (hybrid generation)
+### Loading a new schema (regenerate the whole catalog)
 
-The header **Schema** button uploads a `describe_table_extended.csv`
-(`catalog, schema, table, column_name, data_type, comment`). On upload the whole
-catalog is **regenerated from scratch, session-scoped** (not persisted), and every
-section re-derives from it. Pipeline (`client/src/lib/catalogGen.ts`):
-1. **Parse** the CSV → schema map (skipping describe-extended metadata rows).
-2. **Heuristic grouping (always, offline, client-side):** cluster tables into
-   domains by business-keyword buckets (fuel / store+labor / merch+inventory /
-   sales+pos / finance / customer), falling back to the UC schema name; pick
-   fact-like anchors (numeric measures + key + date), attach joinable dims,
-   **cap 4 products/domain**, derive display name / outcome / candidate KPIs.
-3. **LLM polish (optional, graceful fallback):** the "Refine with Foundation Model"
-   checkbox posts the heuristic draft + a schema summary to `POST /api/generate-catalog`,
-   which calls the attached Foundation Model (`databricks-claude-sonnet-4-5`, via the
-   AppKit `serving` plugin + OAuth SP token) to refine domain/product names, outcomes,
-   and KPIs. Any failure/timeout/no-endpoint silently falls back to the heuristic; the
-   result is sanitized so the model can't introduce tables/columns absent from the schema.
-4. **Reset to default** restores the bundled `catalog.json`/`schema.json` (the flagship
-   live product works on the default catalog).
+The header **Schema** button loads a schema two ways; either runs the **same
+hybrid pipeline** and regenerates the catalog **session-scoped** (not persisted):
+heuristic grouping (always, offline, client-side — keyword-bucket domains, fact-like
+anchors, joinable dims, ≤4 products/domain, derived names/outcomes/KPIs) + optional
+**LLM polish** (the "Refine with Foundation Model" checkbox → `POST /api/generate-catalog`
+→ the attached `databricks-claude-sonnet-4-5` via the AppKit `serving` plugin + OAuth SP
+token; silent heuristic fallback on any failure; result sanitized so the model can't add
+tables/columns not in the schema). **Reset to default** restores the bundled
+`catalog.json`/`schema.json` (the flagship live product works on the default catalog).
+Both options support wildcards (`*` or `%`).
 
-The active `{catalog, schema}` lives in the product context, so an upload
+**Option 1 — script → CSV → upload.** Generate a `describe_table_extended.csv`
+(`catalog, schema, table, column_name, data_type, comment`) with the included script,
+then upload it via Schema → **Upload CSV**:
+
+```bash
+# one reachable schema
+python scripts/generate_schema_csv.py \
+  --profile jai-classic --warehouse-id bf7ffcda00a8c351 \
+  --catalog jai_ontos --schema demo_schema --table '*' \
+  --out inputs/jai_ontos_demo.csv
+
+# every schema in a catalog
+python scripts/generate_schema_csv.py --catalog jai_ontos --schema '*' --table '*' \
+  --out inputs/jai_ontos_all.csv
+
+# wildcards across catalogs, only dim_ tables (* or % both work)
+python scripts/generate_schema_csv.py --catalog 'jai_*' --schema '*' --table 'dim_*' \
+  --out inputs/jai_dims.csv
+```
+
+The script queries `<catalog>.information_schema.columns` with LIKE filters via the
+SQL statement API and enumerates catalogs when `--catalog` is a wildcard.
+
+**Option 2 — live connection (in the app).** Schema → **Live connection**: pick a
+**Catalog** (dropdown from `SHOW CATALOGS`), then a **Schema** (dropdown from
+`information_schema.schemata`), or type a **wildcard pattern** for
+catalog/schema/table (e.g. catalog `jai_*`, schema `*`, table `dim_*` — patterns
+override the dropdown). "Introspect & generate" calls `POST /api/introspect-schema`,
+which reads `information_schema.columns` through the attached warehouse and feeds the
+result into the same pipeline.
+
+**App-SP grants & reachability.** The live option runs as the app service principal
+(`bf309888-d7fa-4311-b847-22b6a8b19693`), which has `USE CATALOG` on `jai_ontos` and
+`USE SCHEMA` + `SELECT` on `jai_ontos.demo_schema` (extend grants to introspect other
+schemas). `information_schema` only shows objects the SP can see. Some catalogs are
+**not reachable** in this workspace (e.g. `fc_entdata_gold`) — the app catches the
+permission/empty case and shows a clear "no access / no tables matched" message
+instead of crashing.
+
+The active `{catalog, schema}` lives in the product context, so loading a schema
 regenerates domains → products → components → enterprise graph → contracts as new.
 
 ## App = six sections
