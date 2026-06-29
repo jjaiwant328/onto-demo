@@ -34,7 +34,7 @@ import {
 } from '@databricks/appkit-ui/react';
 import { sql } from '@databricks/appkit-ui/js';
 import { ChevronDown, Users, DollarSign, Clock, Repeat, Info } from 'lucide-react';
-import { fmtInt, fmtUsd, fmtNum, fmtPct, fmtUsd0 } from '../lib/format';
+import { fmtUsd, fmtNum, fmtPct } from '../lib/format';
 import { useProduct } from '../lib/product';
 
 // Business View dispatcher: live products keep the warehouse-backed dashboard;
@@ -169,7 +169,7 @@ function LiveBusinessView() {
         <KpiCard
           icon={<Users className="h-4 w-4" />}
           label="Total customers"
-          value={k ? fmtInt(k.total_customers) : null}
+          value={k ? fmtNum(k.total_customers) : null}
           loading={kpi.loading}
         />
         <KpiCard
@@ -187,7 +187,7 @@ function LiveBusinessView() {
         <KpiCard
           icon={<Repeat className="h-4 w-4" />}
           label="Dual conversion"
-          value={k ? fmtPct(k.dual_customer_conversion_rate_pct) : null}
+          value={k ? fmtPct(k.dual_customer_conversion_rate_pct, 3) : null}
           loading={kpi.loading}
         />
       </div>
@@ -267,7 +267,7 @@ function LiveBusinessView() {
                       </TableCell>
                       <TableCell>{r.region_name}</TableCell>
                       <TableCell>{r.state_code}</TableCell>
-                      <TableCell className="text-right">{fmtInt(r.total_customers)}</TableCell>
+                      <TableCell className="text-right">{fmtNum(r.total_customers)}</TableCell>
                       <TableCell className="text-right">
                         {fmtUsd(r.labor_cost_per_customer)}
                       </TableCell>
@@ -275,7 +275,7 @@ function LiveBusinessView() {
                         {fmtNum(r.labor_hours_per_customer)}
                       </TableCell>
                       <TableCell className="text-right">
-                        {fmtPct(r.dual_customer_conversion_rate_pct)}
+                        {fmtPct(r.dual_customer_conversion_rate_pct, 3)}
                       </TableCell>
                     </TableRow>
                   ))}
@@ -299,7 +299,7 @@ function LiveBusinessView() {
             <div className="text-xs uppercase tracking-wide text-muted-foreground">
               Identified opportunity
             </div>
-            <div className="text-xl font-bold text-foreground">{fmtUsd0(totalOpp)}</div>
+            <div className="text-xl font-bold text-foreground">{fmtUsd(totalOpp)}</div>
           </div>
         </CardHeader>
         <CardContent>
@@ -331,10 +331,10 @@ function LiveBusinessView() {
                       {r.store_number} — {r.store_name}
                     </TableCell>
                     <TableCell>{r.region_name}</TableCell>
-                    <TableCell className="text-right">{fmtUsd(r.labor_cost_per_customer, 4)}</TableCell>
-                    <TableCell className="text-right">{fmtUsd(r.benchmark_lcpc, 4)}</TableCell>
-                    <TableCell className="text-right">{fmtUsd(r.lcpc_gap, 4)}</TableCell>
-                    <TableCell className="text-right">{fmtUsd0(r.opportunity_usd)}</TableCell>
+                    <TableCell className="text-right">{fmtUsd(r.labor_cost_per_customer)}</TableCell>
+                    <TableCell className="text-right">{fmtUsd(r.benchmark_lcpc)}</TableCell>
+                    <TableCell className="text-right">{fmtUsd(r.lcpc_gap)}</TableCell>
+                    <TableCell className="text-right">{fmtUsd(r.opportunity_usd)}</TableCell>
                     <TableCell>
                       <Badge variant={r.opportunity_flag === 'opportunity' ? 'default' : 'outline'}>
                         {r.opportunity_flag}
