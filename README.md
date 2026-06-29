@@ -82,7 +82,7 @@ instead of crashing.
 The active `{catalog, schema}` lives in the product context, so loading a schema
 regenerates domains → products → components → enterprise graph → contracts as new.
 
-## App = six sections
+## App = seven sections + a Copilot
 
 All sections consume the selected product's derived `components`.
 
@@ -91,9 +91,32 @@ All sections consume the selected product's derived `components`.
 | **Data Products** | The domains (cards), the selected domain's products (table with maturity + live/schema-derived status), and the selected product's detail (outcome, fact/dim source tables, KPIs) + "Data Contract" / "Export PDF" actions. |
 | **Ontology Studio** | Derived entities (one per source table) + column mappings with role badges (key/measure/attribute). Validation queries the warehouse only for the live product; others show "schema-derived (no live serving layer)". |
 | **Semantic Explorer** | Derived lineage relationships (shared-key FKs) + measures (base fact measures) and the product's headline KPIs + entity→property drill-down. |
-| **Graph Explorer** | Cytoscape.js viewer with a two-view toggle: **Explore** — ONE enterprise-wide map (enterprise → domains → products → deduplicated shared tables → metric views), concentric layered layout. The current selection is **highlighted** while the rest stays visible-but-dimmed; clicking any node centers it and rings its neighbors so you can *travel* across the map — including through a shared dimension to another product — with breadcrumb / Back / Overview. **Ontology + lineage** — the per-product static layered map. Cytoscape via CDN. |
-| **Data Contract** | The ontos-style DataContract per product (`deriveContract`): serving object, grain, schema (type/nullable/key), quality checks, freshness SLA, scope, lineage, assumptions. Curated for the flagship; derived for the rest. Has an **Export PDF** button. |
+| **Graph Explorer** | Cytoscape.js viewer with a two-view toggle: **Explore** — ONE enterprise-wide map (enterprise → domains → products → deduplicated shared tables → metric views), concentric layered layout. The current selection is **highlighted** while the rest stays visible-but-dimmed; clicking any node centers it and rings its neighbors so you can *travel* across the map — with breadcrumb / Back / Overview. A focused **KPI node shows a "Drivers" panel** ("affected by" base measures/columns + joined dims, and related measures). **Ontology + lineage** — the per-product static layered map. Cytoscape via CDN. |
+| **Data Contract** | The ontos-style DataContract per product (`deriveContract`): serving object, grain, schema, quality checks, freshness SLA, scope, lineage, assumptions. Curated for the flagship; derived for the rest. Has **Export PDF**. |
+| **Action Center** | A prescriptive action layer: **Exceptions** (live products — real `opportunities` rows → HIGH/MEDIUM queue items, LLM-enriched root-cause/recommended-action/confidence, deterministic fallback if the LLM is down) + **Scenario signals** (a form → LLM-prioritized, clearly "Scenario-driven" actions). Lifecycle is **in-session only**: Approve / Modify / Reject with a SIMULATED execution trail and a header summary. No external writes. |
 | **Business View** | **Live product:** warehouse-backed KPI cards, daily trend, filters, diagnostics, opportunity rankings (derived KPIs recomputed from base sums in SQL — see `config/queries/*.sql`). **Schema-derived products:** a "schema-derived preview" notice + KPI definitions + fact-table column shapes (no warehouse query, no fabricated data). |
+
+The header **Copilot** opens a chat panel that answers questions grounded in the
+selected product's components (ontology classes, measures+formulas, relationships,
+KPIs); for live products the server also attaches a compact `opportunities` snapshot.
+If the answer proposes an action, an "Add to action queue" button pushes it into the
+Action Center (shared via the in-session `actions` context). Gated on
+`GET /api/llm-status` — disabled with an explanation if no endpoint is configured.
+
+### Action layer (Action Center + Copilot + graph drivers)
+
+The prescriptive layer reuses the existing infra and degrades gracefully when the
+Foundation Model endpoint is absent:
+- `client/src/lib/actions.ts` — action types, a **deterministic** action-builder from
+  `opportunities` rows (the LLM-down fallback), and the in-session queue context.
+- `POST /api/recommend-actions` (`mode: exceptions|scenario`) and `POST /api/copilot`
+  call `appkit.serving('llm').invoke` (alias `llm`, endpoint
+  `databricks-claude-sonnet-4-5`); copilot may call `appkit.analytics.query` for a live
+  flagship snapshot. Both fall back cleanly (exceptions still render from the
+  deterministic builder; copilot returns a short "unavailable" note).
+- Graph "drivers" are **deterministic** (`deriveComponents.ts` parses each measure's
+  formula for referenced base measures/columns + adds joined dims; `related` = measures
+  sharing an input) with an optional best-effort one-line LLM narration via `/api/copilot`.
 
 ### Data Contract + Export PDF
 
@@ -123,23 +146,29 @@ client/                      React 19 + Vite + Tailwind frontend
                              buildEnterpriseGraph(catalog, schema) -> the full map
     lib/catalogGen.ts        parseDescribeCsv() + buildCatalog() (heuristic generation)
     lib/contract.ts          deriveContract(product, components) -> ontos DataContract
+    lib/actions.ts           action types + deterministic builder + in-session queue ctx
+    lib/summary.ts           componentsSummary() — compact LLM grounding context
     lib/format.ts            KPI display formatters
     lib/graphData.ts         Shared graph node/edge types + kind colors/labels
     lib/cytoscape.d.ts       Ambient types for the CDN cytoscape global
+    components/SchemaLoader.tsx   Upload CSV / Live connection schema loaders
+    components/Copilot.tsx        Ontology Copilot chat panel (Sheet)
     data/catalog.json        default 6 domains × 4 products (one product live: true)
     data/schema.json         98 fc_entdata_gold tables (columns) — drives derivation
     data/ontology.json       Curated ontology artifacts (flagship reference)
     data/model.json          Curated ER model (flagship reference)
     pages/                   DataProducts, OntologyStudio (+ LiveValidation),
-                             SemanticExplorer, GraphExplorer, DataContract,
+                             SemanticExplorer, GraphExplorer (+ Drivers panel),
+                             DataContract, ActionCenter, BusinessView,
                              TravelCanvas (Explore: enterprise map + travel),
-                             CytoscapeCanvas (Ontology tab), BusinessView,
+                             CytoscapeCanvas (Ontology tab),
                              PrintProduct (/print/:product — PDF export)
 config/queries/              Type-safe SQL queries (analytics plugin)
   product_registry.sql  filter_options.sql  kpi_summary.sql
   daily_trend.sql  store_diagnostics.sql  opportunities.sql
 server/server.ts             AppKit server (analytics + serving + server plugins);
-                             /api/generate-catalog (LLM polish), /api/llm-status
+                             /api/generate-catalog, /api/recommend-actions, /api/copilot,
+                             /api/introspect-schema, /api/catalogs, /api/llm-status
 scripts/build-ontology-json.mjs   TTL/YAML → client/src/data/ontology.json
 shared/appkit-types/         Auto-generated query/serving types (typegen)
 app.yaml                     Databricks Apps manifest (npm run start)

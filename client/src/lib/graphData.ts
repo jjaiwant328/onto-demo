@@ -53,6 +53,9 @@ export type InspectorNode = {
   columns?: Column[];
   formula?: string;
   source?: string;
+  // Feature 3 — graph "drivers" overlay for KPI/measure nodes
+  drivers?: string[];
+  related?: string[];
   // section the "Open in" button should navigate to (ontology view only)
   openIn?: 'data-products' | 'ontology-studio' | 'business-view' | null;
 };

@@ -67,6 +67,9 @@ export type DerivedMeasure = {
   unit: string;
   formula: string;
   description: string;
+  // Feature 3 — graph "drivers" overlay (deterministic, no new data):
+  drivers?: string[]; // base measures/columns + joined dims this measure depends on
+  related?: string[]; // other measures sharing an input with this one
 };
 export type DerivedTable = {
   table: string; // "cdm_xx.table"
@@ -256,6 +259,40 @@ export function deriveProduct(product: CatalogProduct, schema: Schema): DerivedC
     });
   }
 
+  // ----- Feature 3: per-measure drivers + related (deterministic) -----
+  // A measure's drivers = the base measures / columns referenced in its formula,
+  // plus the joined dimension tables (the conformed context it's sliced by).
+  const measureNames = new Set(measures.map((m) => m.measure));
+  const factColNames = new Set(
+    factTables.flatMap((t) => (schema[t] ?? []).map((c) => c.name.toLowerCase()))
+  );
+  const joinedDims = dimTables.map((t) => shortName(t));
+  const driverMap: Record<string, string[]> = {};
+  for (const m of measures) {
+    const idents = (m.formula.toLowerCase().match(/[a-z_][a-z0-9_]*/g) ?? []).filter(
+      (tok) => !['sum', 'count', 'distinct', 'nullif', 'case', 'when', 'then', 'end', 'avg', 'min', 'max', 'and', 'or', 'else', 'null', 'as', 'coalesce'].includes(tok)
+    );
+    const refs = new Set<string>();
+    for (const id of idents) {
+      if (id === m.measure.toLowerCase()) continue;
+      if (measureNames.has(id) || factColNames.has(id)) refs.add(id);
+    }
+    // derived KPIs without a parsed formula: fall back to the base measures
+    if (m.type === 'derived' && refs.size === 0) {
+      for (const bm of measures) if (bm.type === 'base') refs.add(bm.measure);
+    }
+    const drivers = [...refs, ...joinedDims.map((d) => `${d} (dim)`)];
+    driverMap[m.measure] = [...refs]; // for relatedness (measures/cols only)
+    m.drivers = drivers;
+  }
+  // related = measures that share at least one driver input
+  for (const m of measures) {
+    const mine = new Set(driverMap[m.measure] ?? []);
+    m.related = measures
+      .filter((o) => o.measure !== m.measure && (driverMap[o.measure] ?? []).some((d) => mine.has(d)))
+      .map((o) => o.measure);
+  }
+
   // ----- unified travel graph (tables + FK + serving view + product + KPIs) ---
   const nodes: Record<string, UnifiedNode> = {};
   const edges: UnifiedEdge[] = [];
@@ -319,9 +356,11 @@ export function deriveProduct(product: CatalogProduct, schema: Schema): DerivedC
   if (viewId) addEdge(viewId, pid, 'produces');
   else for (const t of factTables) addEdge(tableNodeId(t), pid, 'feeds');
 
-  // KPI nodes
+  // KPI nodes (carry drivers/related for the graph "drivers" overlay)
+  const measureByName = new Map(measures.map((m) => [m.measure, m]));
   for (const k of product.kpis) {
     const id = `kpi:${k}`;
+    const m = measureByName.get(k);
     nodes[id] = {
       id,
       label: k,
@@ -329,6 +368,9 @@ export function deriveProduct(product: CatalogProduct, schema: Schema): DerivedC
       kindLabel: UNIFIED_KIND_LABEL.kpi,
       color: UNIFIED_KIND_COLOR.kpi,
       detail: 'Headline KPI',
+      formula: m?.formula,
+      drivers: m?.drivers,
+      related: m?.related,
       openIn: 'business-view',
     };
     addEdge(pid, id);

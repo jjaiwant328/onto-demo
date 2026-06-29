@@ -8,11 +8,14 @@ import { Button } from '@databricks/appkit-ui/react';
 import { Printer, ArrowLeft } from 'lucide-react';
 import { useProduct } from '../lib/product';
 import { deriveContract } from '../lib/contract';
+import { useActions } from '../lib/actions';
 
 export function PrintProduct() {
   const { productName } = useParams();
   const navigate = useNavigate();
   const { domains, components, selectedProduct, setSelectedProduct } = useProduct();
+  const { queue } = useActions();
+  const approvedActions = queue.filter((a) => a.status === 'approved' || a.status === 'modified');
 
   // ensure the requested product is the selected one (so components match)
   useEffect(() => {
@@ -271,6 +274,34 @@ export function PrintProduct() {
           </tbody>
         </table>
       </section>
+
+      {/* 5. approved actions (in-session, from the Action Center) */}
+      {approvedActions.length > 0 && (
+        <section>
+          <h2>5 · Approved Actions</h2>
+          <p className="muted">In-session approvals from the Action Center (simulated execution).</p>
+          <table className="grid">
+            <thead>
+              <tr>
+                <th>Priority</th>
+                <th>Issue</th>
+                <th>Recommended action</th>
+                <th>Status</th>
+              </tr>
+            </thead>
+            <tbody>
+              {approvedActions.map((a) => (
+                <tr key={a.id}>
+                  <td>{a.priority}</td>
+                  <td>{a.issue}</td>
+                  <td>{a.recommended_action}</td>
+                  <td>{a.status}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </section>
+      )}
 
       <footer className="doc-footer">
         RT_onto_demo · {product.display_name} · {contract.name} · generated {generated}

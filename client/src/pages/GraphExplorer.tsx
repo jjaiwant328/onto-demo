@@ -4,7 +4,7 @@
 //   Tab 2 "Ontology + lineage" — static layered overview map.
 // Cytoscape is the CDN global (window.cytoscape); styling/interaction adapted
 // from the databricks-industry-solutions model-viewer reference.
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import {
   Card,
   CardContent,
@@ -17,9 +17,10 @@ import {
   TabsTrigger,
   TabsContent,
 } from '@databricks/appkit-ui/react';
-import { X, Database, KeyRound, Link2, Info } from 'lucide-react';
+import { X, Database, KeyRound, Link2, Info, Activity } from 'lucide-react';
 import { useNavigate } from 'react-router';
 import { useProduct } from '../lib/product';
+import { Badge } from '@databricks/appkit-ui/react';
 import { CytoscapeCanvas } from './CytoscapeCanvas';
 import { TravelCanvas } from './TravelCanvas';
 import { ONTO_KIND_COLOR, type InspectorNode } from '../lib/graphData';
@@ -373,6 +374,9 @@ function Inspector({
                 </code>
               </div>
             )}
+            {(node.drivers?.length || node.related?.length) && (
+              <DriversPanel node={node} />
+            )}
             {node.columns && node.columns.length > 0 && (
               <div>
                 <div className="flex items-center gap-1.5 text-xs text-muted-foreground mb-1">
@@ -419,5 +423,74 @@ function Inspector({
         )}
       </CardContent>
     </Card>
+  );
+}
+
+// Feature 3 — graph "drivers" overlay for a focused KPI/measure node.
+// Shows deterministic drivers ("affected by") + related measures, plus an optional
+// best-effort one-line LLM narration (non-blocking; silent if the LLM is absent).
+function DriversPanel({ node }: { node: InspectorNode }) {
+  const { selectedProduct, components } = useProduct();
+  const [note, setNote] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    setNote(null);
+    if (!node.drivers?.length) return;
+    fetch('/api/copilot', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        question: `In one short sentence, what drives the KPI "${node.label}" and what should an operator watch? Drivers: ${node.drivers.join(', ')}.`,
+        product: selectedProduct.product_name,
+        live: components.live,
+        productContext: `KPI ${node.label} formula: ${node.formula ?? 'n/a'}; drivers: ${node.drivers.join(', ')}`,
+      }),
+    })
+      .then((r) => r.json())
+      .then((d) => {
+        if (!cancelled && d?.answer && !/not configured|unavailable/i.test(d.answer)) {
+          setNote(String(d.answer).split('\n')[0].slice(0, 240));
+        }
+      })
+      .catch(() => {
+        /* non-blocking */
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [node.label, node.formula, node.drivers, selectedProduct.product_name, components.live]);
+
+  return (
+    <div className="rounded-md border bg-muted/30 p-2 space-y-2">
+      <div className="flex items-center gap-1.5 text-xs font-medium text-foreground">
+        <Activity className="h-3.5 w-3.5" /> Drivers
+      </div>
+      {node.drivers && node.drivers.length > 0 && (
+        <div className="text-xs">
+          <span className="text-muted-foreground">Affected by: </span>
+          <span className="flex flex-wrap gap-1 mt-1">
+            {node.drivers.map((d) => (
+              <Badge key={d} variant="outline">
+                {d}
+              </Badge>
+            ))}
+          </span>
+        </div>
+      )}
+      {node.related && node.related.length > 0 && (
+        <div className="text-xs">
+          <span className="text-muted-foreground">Related measures: </span>
+          <span className="flex flex-wrap gap-1 mt-1">
+            {node.related.map((r) => (
+              <Badge key={r} variant="secondary">
+                {r}
+              </Badge>
+            ))}
+          </span>
+        </div>
+      )}
+      {note && <p className="text-xs text-muted-foreground italic border-t pt-1.5">{note}</p>}
+    </div>
   );
 }

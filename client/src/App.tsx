@@ -1,5 +1,5 @@
 import { createBrowserRouter, RouterProvider, NavLink, Outlet, Navigate } from 'react-router';
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import {
   Button,
   Sheet,
@@ -16,14 +16,17 @@ import {
 } from '@databricks/appkit-ui/react';
 import { Menu, Store } from 'lucide-react';
 import { ProductProvider, useProduct } from './lib/product';
+import { ActionsContext, type ActionItem } from './lib/actions';
 import { DataProducts } from './pages/DataProducts';
 import { OntologyStudio } from './pages/OntologyStudio';
 import { SemanticExplorer } from './pages/SemanticExplorer';
 import { BusinessView } from './pages/BusinessView';
 import { GraphExplorer } from './pages/GraphExplorer';
 import { DataContract } from './pages/DataContract';
+import { ActionCenter } from './pages/ActionCenter';
 import { PrintProduct } from './pages/PrintProduct';
 import { SchemaLoader } from './components/SchemaLoader';
+import { Copilot } from './components/Copilot';
 
 const NAV = [
   { to: '/data-products', label: 'Data Products' },
@@ -31,8 +34,23 @@ const NAV = [
   { to: '/semantic-explorer', label: 'Semantic Explorer' },
   { to: '/graph-explorer', label: 'Graph Explorer' },
   { to: '/data-contract', label: 'Data Contract' },
+  { to: '/action-center', label: 'Action Center' },
   { to: '/business-view', label: 'Business View' },
 ];
+
+// in-session action queue provider (shared by Action Center + Copilot)
+function ActionsProvider({ children }: { children: React.ReactNode }) {
+  const [queue, setQueue] = useState<ActionItem[]>([]);
+  const addAction = useCallback(
+    (a: ActionItem) => setQueue((prev) => (prev.some((p) => p.id === a.id) ? prev : [a, ...prev])),
+    []
+  );
+  return (
+    <ActionsContext.Provider value={{ queue, setQueue, addAction }}>
+      {children}
+    </ActionsContext.Provider>
+  );
+}
 
 const navLinkClass = ({ isActive }: { isActive: boolean }) =>
   `px-3 py-1.5 rounded-md text-sm font-medium transition-colors ${
@@ -131,6 +149,9 @@ function Layout() {
         <NavLinks className="hidden md:flex gap-1" linkClass={navLinkClass} />
         <div className="ml-auto flex items-center gap-2">
           <div className="hidden md:block">
+            <Copilot />
+          </div>
+          <div className="hidden md:block">
             <SchemaLoader />
           </div>
           <div className="hidden md:block">
@@ -149,8 +170,11 @@ function Layout() {
                 <div className="mt-4 mb-2">
                   <SchemaLoader />
                 </div>
-                <div className="mb-4">
+                <div className="mb-2">
                   <CatalogPicker />
+                </div>
+                <div className="mb-4">
+                  <Copilot />
                 </div>
                 <NavLinks
                   className="flex flex-col gap-1"
@@ -185,6 +209,7 @@ const router = createBrowserRouter([
       { path: '/semantic-explorer', element: <SemanticExplorer /> },
       { path: '/graph-explorer', element: <GraphExplorer /> },
       { path: '/data-contract', element: <DataContract /> },
+      { path: '/action-center', element: <ActionCenter /> },
       { path: '/business-view', element: <BusinessView /> },
       { path: '*', element: <Navigate to="/data-products" replace /> },
     ],
@@ -196,7 +221,9 @@ const router = createBrowserRouter([
 export default function App() {
   return (
     <ProductProvider>
-      <RouterProvider router={router} />
+      <ActionsProvider>
+        <RouterProvider router={router} />
+      </ActionsProvider>
     </ProductProvider>
   );
 }

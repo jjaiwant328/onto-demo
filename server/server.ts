@@ -194,9 +194,161 @@ createApp({
           res.json({ catalog: draft, llm: false, reason: String(err) });
         }
       });
+
+      // single-turn LLM completion helper (graceful: returns null if unavailable)
+      const llmComplete = async (prompt: string, maxTokens = 2000): Promise<string | null> => {
+        if (!hasLlm) return null;
+        try {
+          const body = {
+            messages: [{ role: 'user', content: prompt }],
+            max_tokens: maxTokens,
+            temperature: 0.3,
+          } as Parameters<ReturnType<typeof appkit.serving>['invoke']>[0];
+          const r = (await appkit.serving('llm').invoke(body)) as {
+            ok?: boolean;
+            data?: { choices?: { message?: { content?: string } }[] };
+            choices?: { message?: { content?: string } }[];
+          };
+          if (r && r.ok === false) return null;
+          const payload = r?.data ?? (r as { choices?: { message?: { content?: string } }[] });
+          return payload?.choices?.[0]?.message?.content ?? null;
+        } catch {
+          return null;
+        }
+      };
+
+      // ---- Feature 1: recommend actions (exceptions enrichment OR scenario) ----
+      // Body: { mode, product, componentsSummary, signals?, opportunities? }
+      // → JSON array [{id,priority,issue,root_cause,recommended_action,confidence,store?}]
+      app.post('/api/recommend-actions', async (req, res) => {
+        const b = (req.body ?? {}) as {
+          mode?: 'exceptions' | 'scenario';
+          product?: string;
+          componentsSummary?: string;
+          signals?: Record<string, unknown>;
+          opportunities?: unknown[];
+        };
+        const mode = b.mode === 'scenario' ? 'scenario' : 'exceptions';
+        if (!hasLlm) {
+          res.json({ actions: [], llm: false, reason: 'no serving endpoint configured' });
+          return;
+        }
+        const prompt =
+          mode === 'exceptions'
+            ? `You are an ops analyst for the data product "${b.product}". For EACH opportunity row ` +
+              `below (stores running labor cost per customer over their peer benchmark), produce a ` +
+              `prescriptive action. Return ONLY a JSON array; each item: {id, store, priority ` +
+              `("HIGH"|"MEDIUM"|"LOW"), issue, root_cause, recommended_action, confidence (0..1)}. ` +
+              `Base priority on opportunity_usd. Keep root_cause and recommended_action one sentence ` +
+              `each, concrete and labor/staffing-focused.\n\nPRODUCT CONTEXT:\n${b.componentsSummary ?? ''}` +
+              `\n\nOPPORTUNITY ROWS:\n${JSON.stringify(b.opportunities ?? []).slice(0, 40000)}`
+            : `You are an ops analyst for the data product "${b.product}". Given operating SIGNALS ` +
+              `and the product's semantics, produce a prioritized list of prescriptive actions the ` +
+              `team should take. Return ONLY a JSON array; each item: {id, priority ` +
+              `("HIGH"|"MEDIUM"|"LOW"), issue, root_cause, recommended_action, confidence (0..1)}. ` +
+              `Ground the actions in the product's measures/KPIs.\n\nPRODUCT CONTEXT:\n` +
+              `${b.componentsSummary ?? ''}\n\nSIGNALS:\n${JSON.stringify(b.signals ?? {})}`;
+        const content = await llmComplete(prompt, 4000);
+        const json = extractJsonArray(content ?? '');
+        if (json) {
+          res.json({ actions: json, llm: true, mode });
+          return;
+        }
+        res.json({ actions: [], llm: false, mode, reason: 'model returned no usable JSON' });
+      });
+
+      // ---- Feature 2: Ontology Copilot ----
+      // Body: { question, productContext, history?, product?, live? }
+      // → { answer, action? }. For live products may attach a kpi_summary snapshot.
+      app.post('/api/copilot', async (req, res) => {
+        const b = (req.body ?? {}) as {
+          question?: string;
+          productContext?: string;
+          history?: { role: string; content: string }[];
+          product?: string;
+          live?: boolean;
+        };
+        const question = (b.question ?? '').trim();
+        if (!question) {
+          res.status(400).json({ answer: 'Ask a question about the selected data product.' });
+          return;
+        }
+        if (!hasLlm) {
+          res.json({
+            answer:
+              'The Foundation Model endpoint is not configured for this deployment, so the Copilot is unavailable. The ontology, contract, and graph views still work without it.',
+          });
+          return;
+        }
+
+        // optional live snapshot for the flagship (best-effort)
+        let snapshot = '';
+        if (b.live) {
+          try {
+            const rows = await appkit.analytics.query(
+              "SELECT * FROM jai_ontos.demo_schema.jai_store_efficiency_opportunities ORDER BY opportunity_rank LIMIT 10"
+            );
+            snapshot = `\n\nLIVE SNAPSHOT (top opportunities):\n${JSON.stringify(rows).slice(0, 6000)}`;
+          } catch {
+            /* ignore snapshot failures */
+          }
+        }
+
+        const hist = (b.history ?? [])
+          .slice(-6)
+          .map((h) => `${h.role}: ${h.content}`)
+          .join('\n');
+        const prompt =
+          `You are the Ontology Copilot for a governed data-product app. Answer the user's question ` +
+          `GROUNDED ONLY in the product context (ontology classes, measures/KPIs + formulas, ` +
+          `relationships) and any live snapshot provided — do not invent tables, columns, or numbers. ` +
+          `Be concise (2-5 sentences). If the user is asking to DO something operational (e.g. fix a ` +
+          `store, adjust staffing), you MAY additionally propose ONE action as a fenced \`\`\`json ` +
+          `block with {priority, issue, root_cause, recommended_action, confidence}. Otherwise omit it.` +
+          `\n\nPRODUCT (${b.product ?? ''}) CONTEXT:\n${b.productContext ?? ''}${snapshot}` +
+          (hist ? `\n\nCONVERSATION:\n${hist}` : '') +
+          `\n\nUSER QUESTION:\n${question}`;
+        const content = (await llmComplete(prompt, 2000)) ?? '';
+        if (!content) {
+          res.json({ answer: 'The model did not return a response. Please try again.' });
+          return;
+        }
+        const action = extractJsonObject(content);
+        // strip the fenced json from the visible answer
+        const answer = content.replace(/```(?:json)?\s*[\s\S]*?```/g, '').trim() || content;
+        res.json({ answer, action: action && action.recommended_action ? action : undefined });
+      });
     });
   },
 }).catch(console.error);
+
+// parse a JSON array from possibly-fenced model output
+function extractJsonArray(text: string): Record<string, unknown>[] | null {
+  if (!text) return null;
+  const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/);
+  const body = fenced ? fenced[1] : text;
+  const start = body.indexOf('[');
+  const end = body.lastIndexOf(']');
+  if (start < 0 || end <= start) return null;
+  try {
+    const arr = JSON.parse(body.slice(start, end + 1));
+    return Array.isArray(arr) ? arr : null;
+  } catch {
+    return null;
+  }
+}
+
+// parse a single JSON object (e.g. a proposed action) from fenced model output
+function extractJsonObject(text: string): Record<string, string> | null {
+  const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/);
+  if (!fenced) return null;
+  try {
+    const obj = JSON.parse(fenced[1].trim());
+    return obj && typeof obj === 'object' && !Array.isArray(obj) ? obj : null;
+  } catch {
+    return null;
+  }
+}
 
 function humanizeSqlError(err: unknown): string {
   const msg = String((err as { message?: string })?.message ?? err);
