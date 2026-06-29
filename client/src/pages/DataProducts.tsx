@@ -9,6 +9,7 @@ import {
   CardTitle,
   CardDescription,
   Badge,
+  Button,
   Table,
   TableBody,
   TableCell,
@@ -16,7 +17,8 @@ import {
   TableHeader,
   TableRow,
 } from '@databricks/appkit-ui/react';
-import { CheckCircle2 } from 'lucide-react';
+import { CheckCircle2, FileText, FileDown } from 'lucide-react';
+import { useNavigate } from 'react-router';
 import { useProduct } from '../lib/product';
 
 function maturityVariant(m: string): 'default' | 'secondary' | 'outline' {
@@ -27,6 +29,7 @@ function maturityVariant(m: string): 'default' | 'secondary' | 'outline' {
 }
 
 export function DataProducts() {
+  const navigate = useNavigate();
   const { domains, selectedDomain, setSelectedDomain, selectedProduct, setSelectedProduct } =
     useProduct();
 
@@ -127,17 +130,33 @@ export function DataProducts() {
       {/* selected product detail */}
       <Card className="shadow-sm">
         <CardHeader>
-          <CardTitle className="flex items-center gap-2">
-            Selected: {selectedProduct.display_name}
-            {selectedProduct.live ? (
-              <Badge variant="default" className="gap-1">
-                <CheckCircle2 className="h-3 w-3" /> live
-              </Badge>
-            ) : (
-              <Badge variant="outline">schema-derived</Badge>
-            )}
-          </CardTitle>
-          <CardDescription>{selectedDomain.label}</CardDescription>
+          <div className="flex items-start justify-between gap-4">
+            <div>
+              <CardTitle className="flex items-center gap-2">
+                Selected: {selectedProduct.display_name}
+                {selectedProduct.live ? (
+                  <Badge variant="default" className="gap-1">
+                    <CheckCircle2 className="h-3 w-3" /> live
+                  </Badge>
+                ) : (
+                  <Badge variant="outline">schema-derived</Badge>
+                )}
+              </CardTitle>
+              <CardDescription>{selectedDomain.label}</CardDescription>
+            </div>
+            <div className="flex gap-2 shrink-0">
+              <Button variant="outline" size="sm" className="gap-1.5" onClick={() => navigate('/data-contract')}>
+                <FileText className="h-4 w-4" /> Data Contract
+              </Button>
+              <Button
+                size="sm"
+                className="gap-1.5"
+                onClick={() => navigate(`/print/${selectedProduct.product_name}`)}
+              >
+                <FileDown className="h-4 w-4" /> Export PDF
+              </Button>
+            </div>
+          </div>
         </CardHeader>
         <CardContent className="space-y-4 text-sm">
           <div>

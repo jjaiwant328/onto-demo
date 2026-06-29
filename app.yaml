@@ -6,3 +6,7 @@ env:
   # command. The `start` script sets NODE_ENV=production for the running server.
   - name: DATABRICKS_WAREHOUSE_ID
     valueFrom: sql-warehouse
+  # Foundation Model endpoint name for the optional catalog-polish LLM pass
+  # (serving plugin alias "llm"). From the attached `serving-endpoint` resource.
+  - name: DATABRICKS_SERVING_ENDPOINT_NAME
+    valueFrom: serving-endpoint

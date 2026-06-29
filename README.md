@@ -27,17 +27,53 @@ Adding a product to `client/src/data/catalog.json` is all that's needed to light
 The 24 products span domains: `store_operations_labor`, `fuel`,
 `merchandise_inventory`, `sales_pos`, `finance_accounting`, `customer_marketing`.
 
-## App = five sections
+### Upload a schema → regenerate everything (hybrid generation)
 
-All five sections consume the selected product's derived `components`.
+The header **Schema** button uploads a `describe_table_extended.csv`
+(`catalog, schema, table, column_name, data_type, comment`). On upload the whole
+catalog is **regenerated from scratch, session-scoped** (not persisted), and every
+section re-derives from it. Pipeline (`client/src/lib/catalogGen.ts`):
+1. **Parse** the CSV → schema map (skipping describe-extended metadata rows).
+2. **Heuristic grouping (always, offline, client-side):** cluster tables into
+   domains by business-keyword buckets (fuel / store+labor / merch+inventory /
+   sales+pos / finance / customer), falling back to the UC schema name; pick
+   fact-like anchors (numeric measures + key + date), attach joinable dims,
+   **cap 4 products/domain**, derive display name / outcome / candidate KPIs.
+3. **LLM polish (optional, graceful fallback):** the "Refine with Foundation Model"
+   checkbox posts the heuristic draft + a schema summary to `POST /api/generate-catalog`,
+   which calls the attached Foundation Model (`databricks-claude-sonnet-4-5`, via the
+   AppKit `serving` plugin + OAuth SP token) to refine domain/product names, outcomes,
+   and KPIs. Any failure/timeout/no-endpoint silently falls back to the heuristic; the
+   result is sanitized so the model can't introduce tables/columns absent from the schema.
+4. **Reset to default** restores the bundled `catalog.json`/`schema.json` (the flagship
+   live product works on the default catalog).
+
+The active `{catalog, schema}` lives in the product context, so an upload
+regenerates domains → products → components → enterprise graph → contracts as new.
+
+## App = six sections
+
+All sections consume the selected product's derived `components`.
 
 | Section | What it shows |
 | --- | --- |
-| **Data Products** | The 6 domains (cards), the selected domain's 4 products (table with maturity + live/schema-derived status), and the selected product's detail (outcome, fact/dim source tables, KPIs). |
+| **Data Products** | The domains (cards), the selected domain's products (table with maturity + live/schema-derived status), and the selected product's detail (outcome, fact/dim source tables, KPIs) + "Data Contract" / "Export PDF" actions. |
 | **Ontology Studio** | Derived entities (one per source table) + column mappings with role badges (key/measure/attribute). Validation queries the warehouse only for the live product; others show "schema-derived (no live serving layer)". |
 | **Semantic Explorer** | Derived lineage relationships (shared-key FKs) + measures (base fact measures) and the product's headline KPIs + entity→property drill-down. |
-| **Graph Explorer** | Cytoscape.js viewer with a two-view toggle: **Explore** — ONE enterprise-wide map (enterprise → 6 domains → 24 products → deduplicated shared tables → metric views), rendered in a concentric layered layout. The current domain/product selection is **highlighted** while the rest stays visible-but-dimmed (highlight, not filter); clicking any node centers it and rings its neighbors so you can *travel* across the map — including hopping through a shared dimension (e.g. `dim_store`, used by 20 products) to another product — with breadcrumb / Back / Overview. **Ontology + lineage** — the per-product static layered map. Inspector shows columns/PK/FK for tables or a KPI formula. Cytoscape loads via CDN (no npm dep); focus-navigation adapted from the databricks-industry-solutions model-viewer. |
-| **Business View** | **Live product:** warehouse-backed KPI cards, daily trend, region/state/store filters, store diagnostics, opportunity rankings (derived KPIs recomputed from base sums in SQL — see `config/queries/*.sql`). **Schema-derived products:** a "schema-derived preview" notice + KPI definitions + fact-table column shapes (no warehouse query, no fabricated data). |
+| **Graph Explorer** | Cytoscape.js viewer with a two-view toggle: **Explore** — ONE enterprise-wide map (enterprise → domains → products → deduplicated shared tables → metric views), concentric layered layout. The current selection is **highlighted** while the rest stays visible-but-dimmed; clicking any node centers it and rings its neighbors so you can *travel* across the map — including through a shared dimension to another product — with breadcrumb / Back / Overview. **Ontology + lineage** — the per-product static layered map. Cytoscape via CDN. |
+| **Data Contract** | The ontos-style DataContract per product (`deriveContract`): serving object, grain, schema (type/nullable/key), quality checks, freshness SLA, scope, lineage, assumptions. Curated for the flagship; derived for the rest. Has an **Export PDF** button. |
+| **Business View** | **Live product:** warehouse-backed KPI cards, daily trend, filters, diagnostics, opportunity rankings (derived KPIs recomputed from base sums in SQL — see `config/queries/*.sql`). **Schema-derived products:** a "schema-derived preview" notice + KPI definitions + fact-table column shapes (no warehouse query, no fabricated data). |
+
+### Data Contract + Export PDF
+
+Every product has a **Data Contract** (`client/src/lib/contract.ts` → `deriveContract`)
+following the ontos DataContract structure (the flagship uses the curated
+`ontos/contracts/*.yaml`; others are derived from the product's components, with
+sensible quality checks — unique grain, non-negative measures, parts ≤ total).
+**Export PDF** opens a zero-dependency print-optimized document
+(`/print/:product`, `@media print` CSS, `window.print()`) containing the product
+summary, the contract, the ontology (entities/mappings/measures), and a
+lineage snapshot — a clean save-as-PDF brief.
 
 The flagship's live KPIs are always **recomputed from base sums in SQL**
 (`sum(total_labor_cost)/sum(total_customers)`), never averaged from per-row ratios.
@@ -48,30 +84,35 @@ The flagship's live KPIs are always **recomputed from base sums in SQL**
 client/                      React 19 + Vite + Tailwind frontend
   index.html                 Loads Cytoscape.js from CDN (window.cytoscape)
   src/
-    App.tsx                  Layout, 5-section router, Domain + Product selectors
-    lib/product.tsx          Catalog context: domains/products + deriveProduct()
-                             + the one-time enterprise map & selection highlight
+    App.tsx                  Layout, 6-section router, Domain + Product selectors
+    components/SchemaLoader.tsx  Upload describe-CSV → regenerate catalog (+LLM, +reset)
+    lib/product.tsx          Active-catalog context: domains/products + deriveProduct()
+                             + enterprise map + load/reset controls
     lib/deriveComponents.ts  THE SKILL: deriveProduct(product, schema) -> components;
                              buildEnterpriseGraph(catalog, schema) -> the full map
+    lib/catalogGen.ts        parseDescribeCsv() + buildCatalog() (heuristic generation)
+    lib/contract.ts          deriveContract(product, components) -> ontos DataContract
     lib/format.ts            KPI display formatters
     lib/graphData.ts         Shared graph node/edge types + kind colors/labels
     lib/cytoscape.d.ts       Ambient types for the CDN cytoscape global
-    data/catalog.json        6 domains × 4 products (one product live: true)
+    data/catalog.json        default 6 domains × 4 products (one product live: true)
     data/schema.json         98 fc_entdata_gold tables (columns) — drives derivation
     data/ontology.json       Curated ontology artifacts (flagship reference)
     data/model.json          Curated ER model (flagship reference)
     pages/                   DataProducts, OntologyStudio (+ LiveValidation),
-                             SemanticExplorer, GraphExplorer,
+                             SemanticExplorer, GraphExplorer, DataContract,
                              TravelCanvas (Explore: enterprise map + travel),
-                             CytoscapeCanvas (Ontology tab), BusinessView
+                             CytoscapeCanvas (Ontology tab), BusinessView,
+                             PrintProduct (/print/:product — PDF export)
 config/queries/              Type-safe SQL queries (analytics plugin)
   product_registry.sql  filter_options.sql  kpi_summary.sql
   daily_trend.sql  store_diagnostics.sql  opportunities.sql
-server/server.ts             AppKit server (analytics + server plugins)
+server/server.ts             AppKit server (analytics + serving + server plugins);
+                             /api/generate-catalog (LLM polish), /api/llm-status
 scripts/build-ontology-json.mjs   TTL/YAML → client/src/data/ontology.json
 shared/appkit-types/         Auto-generated query/serving types (typegen)
 app.yaml                     Databricks Apps manifest (npm run start)
-databricks.yml               Asset Bundle (app + sql-warehouse resource)
+databricks.yml               Asset Bundle (app + sql-warehouse + serving-endpoint)
 ```
 
 The AppKit **analytics plugin** executes the `config/queries/*.sql` files against

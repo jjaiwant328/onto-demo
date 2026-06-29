@@ -21,12 +21,16 @@ import { OntologyStudio } from './pages/OntologyStudio';
 import { SemanticExplorer } from './pages/SemanticExplorer';
 import { BusinessView } from './pages/BusinessView';
 import { GraphExplorer } from './pages/GraphExplorer';
+import { DataContract } from './pages/DataContract';
+import { PrintProduct } from './pages/PrintProduct';
+import { SchemaLoader } from './components/SchemaLoader';
 
 const NAV = [
   { to: '/data-products', label: 'Data Products' },
   { to: '/ontology-studio', label: 'Ontology Studio' },
   { to: '/semantic-explorer', label: 'Semantic Explorer' },
   { to: '/graph-explorer', label: 'Graph Explorer' },
+  { to: '/data-contract', label: 'Data Contract' },
   { to: '/business-view', label: 'Business View' },
 ];
 
@@ -127,6 +131,9 @@ function Layout() {
         <NavLinks className="hidden md:flex gap-1" linkClass={navLinkClass} />
         <div className="ml-auto flex items-center gap-2">
           <div className="hidden md:block">
+            <SchemaLoader />
+          </div>
+          <div className="hidden md:block">
             <CatalogPicker />
           </div>
           <div className="md:hidden">
@@ -139,7 +146,10 @@ function Layout() {
                 <SheetHeader>
                   <SheetTitle>Navigation</SheetTitle>
                 </SheetHeader>
-                <div className="mt-4 mb-4">
+                <div className="mt-4 mb-2">
+                  <SchemaLoader />
+                </div>
+                <div className="mb-4">
                   <CatalogPicker />
                 </div>
                 <NavLinks
@@ -174,10 +184,13 @@ const router = createBrowserRouter([
       { path: '/ontology-studio', element: <OntologyStudio /> },
       { path: '/semantic-explorer', element: <SemanticExplorer /> },
       { path: '/graph-explorer', element: <GraphExplorer /> },
+      { path: '/data-contract', element: <DataContract /> },
       { path: '/business-view', element: <BusinessView /> },
       { path: '*', element: <Navigate to="/data-products" replace /> },
     ],
   },
+  // standalone print route (no app chrome) for clean PDF export
+  { path: '/print/:productName', element: <PrintProduct /> },
 ]);
 
 export default function App() {

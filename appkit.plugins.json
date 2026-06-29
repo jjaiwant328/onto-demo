@@ -308,7 +308,8 @@
           }
         ],
         "optional": []
-      }
+      },
+      "requiredByTemplate": true
     }
   },
   "scaffolding": {
