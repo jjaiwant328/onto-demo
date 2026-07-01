@@ -56,6 +56,9 @@ export type InspectorNode = {
   // Feature 3 — graph "drivers" overlay for KPI/measure nodes
   drivers?: string[];
   related?: string[];
+  // conformed shared dimension (combined view) — sources it was merged from
+  conformed?: boolean;
+  conformedSources?: string[];
   // section the "Open in" button should navigate to (ontology view only)
   openIn?: 'data-products' | 'ontology-studio' | 'business-view' | null;
 };

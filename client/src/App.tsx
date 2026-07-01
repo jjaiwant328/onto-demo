@@ -11,11 +11,16 @@ import {
   SelectItem,
   SelectTrigger,
   SelectValue,
+  Popover,
+  PopoverTrigger,
+  PopoverContent,
+  Checkbox,
   Badge,
   useIsMobile,
 } from '@databricks/appkit-ui/react';
-import { Menu, Store } from 'lucide-react';
+import { Menu, Store, Layers } from 'lucide-react';
 import { ProductProvider, useProduct } from './lib/product';
+import type { SchemaEntry } from './lib/combineSchemas';
 import { ActionsContext, type ActionItem } from './lib/actions';
 import { DataProducts } from './pages/DataProducts';
 import { OntologyStudio } from './pages/OntologyStudio';
@@ -88,61 +93,138 @@ function NavLinks({
   );
 }
 
-function SchemaSelector() {
-  const { schemaOptions, activeSchemaId, selectSchema } = useProduct();
+// Multi-select schema menu (PopoverContent): one = view alone, 2+ = combined.
+function SheetlessSchemaMenu({
+  schemaEntries,
+  selectedSchemaIds,
+  toggleSchema,
+  combineAll,
+}: {
+  schemaEntries: SchemaEntry[];
+  selectedSchemaIds: string[];
+  toggleSchema: (id: string) => void;
+  combineAll: () => void;
+}) {
   return (
-    <Select value={activeSchemaId} onValueChange={selectSchema}>
-      <SelectTrigger className="w-56" aria-label="Schema">
-        <SelectValue placeholder="Schema" />
-      </SelectTrigger>
-      <SelectContent>
-        {schemaOptions.map((s) => (
-          <SelectItem key={s.id} value={s.id}>
-            {s.label}
-          </SelectItem>
+    <PopoverContent className="w-72 p-2" align="start">
+      <div className="flex items-center justify-between px-1 pb-1">
+        <span className="text-xs font-medium text-muted-foreground">
+          Schemas ({schemaEntries.length})
+        </span>
+        {schemaEntries.length > 1 && (
+          <Button variant="ghost" size="sm" className="h-6 gap-1 text-xs" onClick={combineAll}>
+            <Layers className="h-3 w-3" /> Combine all
+          </Button>
+        )}
+      </div>
+      <div className="flex flex-col gap-0.5 max-h-72 overflow-auto">
+        {schemaEntries.map((s) => (
+          <label
+            key={s.id}
+            className="flex items-center gap-2 rounded-md px-2 py-1.5 text-sm hover:bg-muted cursor-pointer"
+          >
+            <Checkbox
+              checked={selectedSchemaIds.includes(s.id)}
+              onCheckedChange={() => toggleSchema(s.id)}
+            />
+            <span className="truncate">{s.label}</span>
+          </label>
         ))}
-      </SelectContent>
-    </Select>
+      </div>
+      <p className="text-[11px] text-muted-foreground px-1 pt-1">
+        Select 1 to view alone; 2+ to combine &amp; conform shared dimensions.
+      </p>
+    </PopoverContent>
+  );
+}
+
+function CustomerSchemaPicker() {
+  const {
+    customers,
+    customerId,
+    setCustomer,
+    schemaEntries,
+    selectedSchemaIds,
+    toggleSchema,
+    combineAll,
+    combined,
+  } = useProduct();
+  const [open, setOpen] = useState(false);
+  const schemaBtn =
+    selectedSchemaIds.length === 1
+      ? (schemaEntries.find((s) => s.id === selectedSchemaIds[0])?.label ?? '1 schema')
+      : `${selectedSchemaIds.length} schemas${combined ? ' · combined' : ''}`;
+
+  return (
+    <div className="flex flex-col sm:flex-row gap-2">
+      {/* Customer */}
+      <Select value={customerId} onValueChange={setCustomer}>
+        <SelectTrigger className="w-44" aria-label="Customer">
+          <SelectValue placeholder="Customer" />
+        </SelectTrigger>
+        <SelectContent>
+          {customers.map((c) => (
+            <SelectItem key={c.id} value={c.id}>
+              {c.label}
+            </SelectItem>
+          ))}
+        </SelectContent>
+      </Select>
+
+      {/* Schema multi-select */}
+      <Popover open={open} onOpenChange={setOpen}>
+        <PopoverTrigger asChild>
+          <Button variant="outline" size="sm" className="w-52 justify-between font-normal">
+            <span className="truncate">{schemaBtn}</span>
+            <span className="text-muted-foreground text-xs ml-1">▾</span>
+          </Button>
+        </PopoverTrigger>
+        <SheetlessSchemaMenu
+          schemaEntries={schemaEntries}
+          selectedSchemaIds={selectedSchemaIds}
+          toggleSchema={toggleSchema}
+          combineAll={combineAll}
+        />
+      </Popover>
+    </div>
   );
 }
 
 function CatalogPicker() {
-  const {
-    domains,
-    selectedDomain,
-    setSelectedDomain,
-    productsInDomain,
-    selectedProduct,
-    setSelectedProduct,
-  } = useProduct();
+  const { domains, selectedDomain, setSelectedDomain, productsInDomain, selectedProduct, setSelectedProduct } =
+    useProduct();
   return (
     <div className="flex flex-col sm:flex-row gap-2">
-      <SchemaSelector />
-      <Select value={selectedDomain.name} onValueChange={setSelectedDomain}>
-        <SelectTrigger className="w-52" aria-label="Domain">
-          <SelectValue placeholder="Domain" />
-        </SelectTrigger>
-        <SelectContent>
-          {domains.map((d) => (
-            <SelectItem key={d.name} value={d.name}>
-              {d.label}
-            </SelectItem>
-          ))}
-        </SelectContent>
-      </Select>
-      <Select value={selectedProduct.product_name} onValueChange={setSelectedProduct}>
-        <SelectTrigger className="w-64" aria-label="Data product">
-          <SelectValue placeholder="Data product" />
-        </SelectTrigger>
-        <SelectContent>
-          {productsInDomain.map((p) => (
-            <SelectItem key={p.product_name} value={p.product_name}>
-              {p.display_name}
-              {p.live ? ' ●' : ''}
-            </SelectItem>
-          ))}
-        </SelectContent>
-      </Select>
+      <CustomerSchemaPicker />
+      {selectedDomain && (
+        <Select value={selectedDomain.name} onValueChange={setSelectedDomain}>
+          <SelectTrigger className="w-52" aria-label="Domain">
+            <SelectValue placeholder="Domain" />
+          </SelectTrigger>
+          <SelectContent>
+            {domains.map((d) => (
+              <SelectItem key={d.name} value={d.name}>
+                {d.label}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+      )}
+      {selectedProduct && (
+        <Select value={selectedProduct.product_name} onValueChange={setSelectedProduct}>
+          <SelectTrigger className="w-64" aria-label="Data product">
+            <SelectValue placeholder="Data product" />
+          </SelectTrigger>
+          <SelectContent>
+            {productsInDomain.map((p) => (
+              <SelectItem key={p.product_name} value={p.product_name}>
+                {p.display_name}
+                {p.live ? ' ●' : ''}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+      )}
     </div>
   );
 }

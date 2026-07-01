@@ -17,7 +17,7 @@ import {
   TabsTrigger,
   TabsContent,
 } from '@databricks/appkit-ui/react';
-import { X, Database, KeyRound, Link2, Info, Activity } from 'lucide-react';
+import { X, Database, KeyRound, Link2, Info, Activity, Layers } from 'lucide-react';
 import { useNavigate } from 'react-router';
 import { useProduct } from '../lib/product';
 import { Badge } from '@databricks/appkit-ui/react';
@@ -357,6 +357,16 @@ function Inspector({
         {!node && <p className="text-sm text-muted-foreground">No node selected.</p>}
         {node && (
           <>
+            {node.conformed && node.conformedSources && (
+              <div className="rounded-md border border-amber-300/60 bg-amber-50/60 dark:bg-amber-950/20 p-2 text-xs">
+                <Badge variant="default" className="gap-1 mb-1">
+                  <Layers className="h-3 w-3" /> conformed dimension
+                </Badge>
+                <div className="text-muted-foreground">
+                  Shared across: {node.conformedSources.join(', ')} (columns unioned).
+                </div>
+              </div>
+            )}
             {node.detail && (
               <p className="text-sm text-muted-foreground break-words">{node.detail}</p>
             )}

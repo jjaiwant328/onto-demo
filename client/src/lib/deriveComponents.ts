@@ -489,7 +489,16 @@ const SERVING_VIEWS_LIVE = [
   'jai_store_efficiency_opportunities',
 ];
 
-export function buildEnterpriseGraph(catalog: Catalog, schema: Schema): EnterpriseGraph {
+export function buildEnterpriseGraph(
+  catalog: Catalog,
+  schema: Schema,
+  conformedTables?: Record<string, string[]>
+): EnterpriseGraph {
+  // index conformed provenance by short table name (enterprise nodes key on it)
+  const conformedByShort = new Map<string, string[]>();
+  for (const [key, sources] of Object.entries(conformedTables ?? {})) {
+    conformedByShort.set(shortName(key), sources);
+  }
   const nodes: Record<string, UnifiedNode> = {};
   const edges: UnifiedEdge[] = [];
   let e = 0;
@@ -583,14 +592,21 @@ export function buildEnterpriseGraph(catalog: Catalog, schema: Schema): Enterpri
         if (!nodes[sid]) {
           const usedAsFact = tableIsFact.get(shortName(t)) === true;
           const kind = usedAsFact ? 'fact' : 'dim';
+          const conformedSources = conformedByShort.get(shortName(t));
           nodes[sid] = {
             id: sid,
             label: shortName(t),
             kind,
-            kindLabel: ENTERPRISE_KIND_LABEL[kind],
+            kindLabel: conformedSources
+              ? `${ENTERPRISE_KIND_LABEL[kind]} · conformed`
+              : ENTERPRISE_KIND_LABEL[kind],
             color: ENTERPRISE_KIND_COLOR[kind],
-            detail: `${t} · ${(schema[t] ?? []).length} columns`,
+            detail: conformedSources
+              ? `${t} · ${(schema[t] ?? []).length} columns · conformed shared dimension across ${conformedSources.join(', ')}`
+              : `${t} · ${(schema[t] ?? []).length} columns`,
             source: t,
+            conformed: Boolean(conformedSources),
+            conformedSources,
             openIn: 'ontology-studio',
             columns: (schema[t] ?? []).map((c) => ({
               name: c.name,

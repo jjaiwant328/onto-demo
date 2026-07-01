@@ -27,22 +27,39 @@ Adding a product to `client/src/data/catalog.json` is all that's needed to light
 The 24 products span domains: `store_operations_labor`, `fuel`,
 `merchandise_inventory`, `sales_pos`, `finance_accounting`, `customer_marketing`.
 
-### Switching schemas (named registry)
+### Customer → Schema(s), with combine
 
-A header **Schema** dropdown selects the active schema; picking one regenerates the
-whole app (domains → products → components → enterprise graph → contracts) and the
-choice is persisted for the session (localStorage; default on load = Retailer):
+The data model is **Customer → Schema(s)**. Customers are always isolated (data is
+never mixed across customers). The header has a **Customer** dropdown and, within the
+selected customer, a **multi-select Schema picker**: choose **1** schema to view it
+alone, or **2+** (or "Combine all") for a **Combined** view. Any choice regenerates
+the whole app (domains → products → components → enterprise graph → contracts);
+`{customerId, selectedSchemaIds}` is persisted (localStorage; default = Retailer / its
+one schema, which keeps the live flagship).
 
-- **Retailer (fc_entdata_gold)** — bundled `schema.json` + the **curated**
-  `catalog.json`; keeps the **live flagship** `jai_store_traffic_labor_efficiency`
-  (real warehouse KPIs). Unchanged from the base app.
-- **QSR Supply Chain (qsrscdoprod_primary)** — bundled `schema.qsr.json` (278 tables
-  across bronze/silver/sc_non_dx_sources/sqs_pipeline_health/snapshots/top8) with a
-  catalog **generated** via the usual pipeline (`buildCatalog` heuristic + optional
-  LLM polish). Schema-derived (no live product) — the app SP has no access to
-  `qsrscdoprod_primary`, so Business View shows the schema-derived preview (no
-  warehouse calls) and every other section renders from `deriveProduct`.
-- Any **uploaded / live-connection** schema (below) appears as a transient third entry.
+Built-in customers:
+- **Retailer** → one schema `fc_entdata_gold` (bundled `schema.json`). When that single
+  schema is selected it uses the **curated** `catalog.json` + the **live flagship**
+  `jai_store_traffic_labor_efficiency` (real warehouse KPIs) — unchanged behavior.
+- **QSR** → one schema "QSR Supply Chain" (bundled `schema.qsr.json`, 278 tables),
+  catalog **generated** via the usual pipeline (schema-derived; no live product).
+
+Uploaded / live-connection schemas (below) are **assigned to a customer** (existing or
+"New customer…") in the Load-schema popover, and become additional selectable schema
+entries under that customer.
+
+**Combine + shared-dimension conformance** (`client/src/lib/combineSchemas.ts`): when
+2+ schemas are selected, `combineSchemas` merges them into one `Schema`, **conforming
+dimension tables** shared across schemas — two dims conform when their normalized base
+name matches (lowercased; strip leading `dim_`/`stg_`/`int_`, trailing `_dim`) AND they
+share ≥1 key column of the same name. A conformed dim becomes a SINGLE node whose columns
+are the UNION (dedupe by name, keep first type), carrying `conformed: true` +
+`sources: [schema labels]`. Facts are never merged; name collisions without shared keys
+are disambiguated by source. The combined schema feeds the usual `buildCatalog`, so a
+conformed shared dim (e.g. `dim_store`, `dim_calendar`, `dim_item`) links products/domains
+that came from different source schemas in the enterprise graph. A combined view shows a
+"Combined N schemas · M conformed shared dimensions (…)" note, and conformed dimension
+nodes get a "conformed — shared across X, Y" badge in the graph inspector.
 
 ### Loading a new schema (regenerate the whole catalog)
 
@@ -178,10 +195,11 @@ client/                      React 19 + Vite + Tailwind frontend
                              buildEnterpriseGraph(catalog, schema) -> the full map
     lib/catalogGen.ts        parseDescribeCsv() + buildCatalog() (heuristic generation)
     lib/schemaFilter.ts      filterBusinessSchema() — auto-drop pipeline/test/DQ schemas
+    lib/combineSchemas.ts    combineSchemas() — merge + conform shared dims (combine view)
     lib/contract.ts          deriveContract(product, components) -> ontos DataContract
     lib/actions.ts           action types + deterministic builder + in-session queue ctx
     lib/summary.ts           componentsSummary() — compact LLM grounding context
-    lib/format.ts            KPI display formatters
+    lib/format.ts            KPI formatters (coerce string→number; comma + 3 decimals)
     lib/graphData.ts         Shared graph node/edge types + kind colors/labels
     lib/cytoscape.d.ts       Ambient types for the CDN cytoscape global
     components/SchemaLoader.tsx   Upload CSV / Live connection schema loaders

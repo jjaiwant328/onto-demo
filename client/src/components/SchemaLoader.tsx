@@ -7,7 +7,6 @@
 import { useRef, useState, useEffect } from 'react';
 import {
   Button,
-  Badge,
   Popover,
   PopoverContent,
   PopoverTrigger,
@@ -24,29 +23,27 @@ import {
   Input,
   Label,
 } from '@databricks/appkit-ui/react';
-import { Upload, RotateCcw, Sparkles, Loader2, Database, Plug, Filter } from 'lucide-react';
+import { Upload, RotateCcw, Loader2, Database, Plug, Filter, Users } from 'lucide-react';
 import { useProduct } from '../lib/product';
-import { parseDescribeCsv, buildCatalog } from '../lib/catalogGen';
+import { parseDescribeCsv } from '../lib/catalogGen';
 import { filterBusinessSchema } from '../lib/schemaFilter';
-import type { Catalog, Schema } from '../lib/deriveComponents';
+import type { Schema } from '../lib/deriveComponents';
+
+const NEW_CUSTOMER = '__new__';
 
 export function SchemaLoader() {
-  const { catalogSource, applyGeneratedCatalog, resetToDefault } = useProduct();
+  const { customers, customerId, addSchema, resetToDefault } = useProduct();
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState<string | null>(null);
   const [filterNote, setFilterNote] = useState<string | null>(null);
-  const [useLlm, setUseLlm] = useState(false);
   const [includeSystem, setIncludeSystem] = useState(false); // filter ON by default
-  const [llmAvailable, setLlmAvailable] = useState<boolean | null>(null);
+  // customer assignment for the loaded schema
+  const [targetCustomer, setTargetCustomer] = useState<string>(customerId);
+  const [newCustomerName, setNewCustomerName] = useState('');
+  const [schemaLabel, setSchemaLabel] = useState('');
+  const [pendingFollow, setPendingFollow] = useState(false);
 
-  useEffect(() => {
-    fetch('/api/llm-status')
-      .then((r) => r.json())
-      .then((d) => setLlmAvailable(Boolean(d?.available)))
-      .catch(() => setLlmAvailable(false));
-  }, []);
-
-  // shared: filter noise schemas → heuristic + optional LLM → apply.
+  // shared: filter noise schemas → assign to a customer (provider generates the catalog).
   const applySchema = async (rawSchema: Schema, label: string) => {
     if (Object.keys(rawSchema).length === 0) throw new Error('No tables found.');
 
@@ -65,58 +62,57 @@ export function SchemaLoader() {
       setFilterNote(includeSystem ? 'Filter off — all schemas included.' : 'No noise schemas detected.');
     }
 
-    let catalog: Catalog = buildCatalog(schema);
-    let source: 'uploaded' | 'uploaded+llm' = 'uploaded';
-    if (useLlm && llmAvailable) {
-      setStatus('Refining with Foundation Model…');
-      try {
-        const summary = schemaSummary(schema);
-        const resp = await fetch('/api/generate-catalog', {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ draft: catalog, summary }),
-        });
-        const data = await resp.json();
-        if (data?.llm && data?.catalog?.domains?.length) {
-          catalog = sanitizeCatalog(data.catalog, schema);
-          source = 'uploaded+llm';
-        }
-      } catch {
-        /* graceful fallback to heuristic */
-      }
-    }
-    applyGeneratedCatalog(catalog, schema, source);
-    const products = catalog.domains.reduce((n, d) => n + d.products.length, 0);
+    const isNew = targetCustomer === NEW_CUSTOMER;
+    const custName = isNew ? newCustomerName.trim() || 'New customer' : targetCustomer;
+    // default label = the detected UC schema names, so entries are distinguishable
+    const ucSchemas = Array.from(new Set(Object.keys(schema).map((k) => k.split('.')[0]))).slice(0, 3);
+    const entryLabel = schemaLabel.trim() || ucSchemas.join(', ') || `${label} schema`;
+    const uid = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
+    const entry = {
+      id: `sch_${entryLabel.toLowerCase().replace(/[^a-z0-9]+/g, '_')}_${uid}`,
+      label: entryLabel,
+      schema,
+    };
+    addSchema(custName, entry, isNew);
+    const custLabel = isNew ? custName : customers.find((c) => c.id === custName)?.label ?? custName;
     setStatus(
-      `${label}: ${tableCount} business tables → ${catalog.domains.length} domains, ${products} products` +
-        (source === 'uploaded+llm' ? ' (LLM-refined)' : ' (heuristic)')
+      `Added "${entryLabel}" (${tableCount} business tables) to customer "${custLabel}". The catalog will regenerate; select 2+ schemas to combine.`
     );
+    setSchemaLabel('');
+    setNewCustomerName('');
+    // After a load the provider makes the target customer active. Reset the
+    // picker to follow it so the NEXT upload appends to the SAME customer
+    // (fixes: a second "New customer…" upload creating a duplicate customer).
+    setPendingFollow(true);
   };
+
+  // once a load lands, point the picker at the now-active customer
+  useEffect(() => {
+    if (pendingFollow) {
+      setTargetCustomer(customerId);
+      setPendingFollow(false);
+    }
+  }, [customerId, pendingFollow]);
 
   return (
     <Popover>
       <PopoverTrigger asChild>
         <Button variant="outline" size="sm" className="gap-1.5">
           <Database className="h-4 w-4" />
-          Schema
-          {catalogSource !== 'default' && (
-            <Badge variant="secondary" className="ml-1">
-              {catalogSource === 'uploaded+llm' ? 'custom+AI' : 'custom'}
-            </Badge>
-          )}
+          Load schema
         </Button>
       </PopoverTrigger>
-      <PopoverContent className="w-[420px]" align="end">
+      <PopoverContent className="w-[440px]" align="end">
         <div className="space-y-3">
           <div className="flex items-center justify-between">
-            <div className="text-sm font-semibold">Load a schema</div>
+            <div className="text-sm font-semibold">Load a schema into a customer</div>
             <Button
               size="sm"
               variant="outline"
               className="gap-1.5"
               onClick={() => {
                 resetToDefault();
-                setStatus('Reset to bundled default catalog');
+                setStatus('Reset to Retailer (default).');
               }}
               disabled={busy}
             >
@@ -124,20 +120,39 @@ export function SchemaLoader() {
             </Button>
           </div>
 
-          <label
-            className={`flex items-center gap-2 text-xs ${
-              llmAvailable ? 'cursor-pointer' : 'opacity-50 cursor-not-allowed'
-            }`}
-          >
-            <Checkbox
-              checked={useLlm && !!llmAvailable}
-              disabled={!llmAvailable}
-              onCheckedChange={(v) => setUseLlm(Boolean(v))}
+          {/* customer assignment */}
+          <div className="space-y-1">
+            <Label className="text-xs flex items-center gap-1.5">
+              <Users className="h-3.5 w-3.5" /> Assign to customer
+            </Label>
+            <Select value={targetCustomer} onValueChange={setTargetCustomer}>
+              <SelectTrigger className="w-full">
+                <SelectValue placeholder="Customer" />
+              </SelectTrigger>
+              <SelectContent>
+                {customers.map((c) => (
+                  <SelectItem key={c.id} value={c.id}>
+                    {c.label}
+                  </SelectItem>
+                ))}
+                <SelectItem value={NEW_CUSTOMER}>New customer…</SelectItem>
+              </SelectContent>
+            </Select>
+            {targetCustomer === NEW_CUSTOMER && (
+              <Input
+                className="text-xs"
+                placeholder="New customer name"
+                value={newCustomerName}
+                onChange={(e) => setNewCustomerName(e.target.value)}
+              />
+            )}
+            <Input
+              className="text-xs"
+              placeholder="Schema label (optional, e.g. 'QSR bronze')"
+              value={schemaLabel}
+              onChange={(e) => setSchemaLabel(e.target.value)}
             />
-            <Sparkles className="h-3.5 w-3.5" />
-            Refine with Foundation Model
-            {llmAvailable === false && <span className="text-muted-foreground">(no endpoint)</span>}
-          </label>
+          </div>
 
           <label className="flex items-center gap-2 text-xs cursor-pointer">
             <Checkbox
@@ -390,31 +405,4 @@ function LiveTab({
       </Button>
     </div>
   );
-}
-
-function schemaSummary(schema: Record<string, { name: string; type: string }[]>): string {
-  return Object.entries(schema)
-    .map(([t, cols]) => `${t}: ${cols.slice(0, 12).map((c) => `${c.name}:${c.type}`).join(', ')}`)
-    .join('\n')
-    .slice(0, 12000);
-}
-
-function sanitizeCatalog(catalog: Catalog, schema: Record<string, unknown>): Catalog {
-  const has = (t: string) => Object.prototype.hasOwnProperty.call(schema, t);
-  const domains = catalog.domains
-    .map((d) => ({
-      ...d,
-      products: d.products
-        .map((p) => ({
-          ...p,
-          fact_tables: (p.fact_tables ?? []).filter(has),
-          dim_tables: (p.dim_tables ?? []).filter(has),
-          kpis: Array.isArray(p.kpis) && p.kpis.length ? p.kpis : ['record_count'],
-          maturity: p.maturity ?? 'incubating',
-        }))
-        .filter((p) => p.fact_tables.length > 0)
-        .slice(0, 4),
-    }))
-    .filter((d) => d.products.length > 0);
-  return { domains: domains.length ? domains : catalog.domains };
 }

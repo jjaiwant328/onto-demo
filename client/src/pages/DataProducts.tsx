@@ -17,7 +17,7 @@ import {
   TableHeader,
   TableRow,
 } from '@databricks/appkit-ui/react';
-import { CheckCircle2, FileText, FileDown } from 'lucide-react';
+import { CheckCircle2, FileText, FileDown, Layers } from 'lucide-react';
 import { useNavigate } from 'react-router';
 import { useProduct } from '../lib/product';
 
@@ -30,20 +30,43 @@ function maturityVariant(m: string): 'default' | 'secondary' | 'outline' {
 
 export function DataProducts() {
   const navigate = useNavigate();
-  const { domains, selectedDomain, setSelectedDomain, selectedProduct, setSelectedProduct } =
-    useProduct();
+  const {
+    domains,
+    selectedDomain,
+    setSelectedDomain,
+    selectedProduct,
+    setSelectedProduct,
+    customers,
+    customerId,
+    combined,
+    conformance,
+    selectedSchemaIds,
+  } = useProduct();
+  const customerLabel = customers.find((c) => c.id === customerId)?.label ?? customerId;
 
   return (
     <div className="space-y-6 max-w-6xl">
       <div>
         <h2 className="text-2xl font-bold text-foreground">Data Products</h2>
         <p className="text-muted-foreground">
-          A domain → data-product catalog. {domains.length} domains ·{' '}
+          Customer <span className="font-medium">{customerLabel}</span> · {domains.length} domains ·{' '}
           {domains.reduce((n, d) => n + d.products.length, 0)} products. Selecting a product derives
-          its ontology, lineage, and KPIs at runtime from the live schema. One product
-          (<span className="font-medium">Store Traffic &amp; Labor Efficiency</span>) is fully live
-          on governed serving views.
+          its ontology, lineage, and KPIs at runtime from the schema.
         </p>
+        {combined && conformance && (
+          <div className="mt-2 flex items-start gap-2 rounded-md border border-amber-300/60 bg-amber-50/60 dark:bg-amber-950/20 p-2 text-sm">
+            <Layers className="h-4 w-4 mt-0.5 text-amber-600 shrink-0" />
+            <span className="text-muted-foreground">
+              <span className="font-medium text-foreground">Combined {selectedSchemaIds.length} schemas</span> ·{' '}
+              {conformance.count} conformed shared dimension
+              {conformance.count === 1 ? '' : 's'}
+              {conformance.sharedNames.length
+                ? ` (${conformance.sharedNames.slice(0, 6).join(', ')}${conformance.sharedNames.length > 6 ? ', …' : ''})`
+                : ''}
+              . Conformed dims link products from different source schemas.
+            </span>
+          </div>
+        )}
       </div>
 
       {/* domains */}
