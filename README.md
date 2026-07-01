@@ -57,6 +57,21 @@ tables/columns not in the schema). **Reset to default** restores the bundled
 `catalog.json`/`schema.json` (the flagship live product works on the default catalog).
 Both options support wildcards (`*` or `%`).
 
+**Schema noise filter (automatic, reversible).** On BOTH load paths, right after the
+schema is parsed/introspected and before `buildCatalog`, `filterBusinessSchema`
+(`client/src/lib/schemaFilter.ts`) drops **pipeline / test / DQ / framework** schemas
+by case-insensitive name patterns — `dbt`, `dq`/`data_quality`, `*_test(s)`,
+`information_schema`/`sys`/`system`, `artifacts`/`results`/`elementary`,
+`quarantine`/`utils`/`framework`/`e2e` (plus minimal table-level noise: `dbt_*`,
+`*_dbt_results`, `elementary_*`). It is **conservative** — generic operational tokens
+(`pipeline`, `health`, `snapshot`, `source`, `sc_`) are never treated as noise, so
+medallion + source layers (bronze/silver/gold/raw/staging/…) are always kept. So
+uploading a full multi-thousand-table export auto-scopes to the business layers. It's
+**transparent** (a "Filtered N pipeline/test/DQ schemas: …" note lists what was dropped)
+and **reversible** (an "Include system/pipeline schemas" checkbox re-runs with the filter
+off). Default = filter ON. The two bundled schemas are unaffected (`schema.qsr.json` is
+pre-scoped; `schema.json` has no noise).
+
 **Option 1 — script → CSV → upload.** Generate a `describe_table_extended.csv`
 (`catalog, schema, table, column_name, data_type, comment`) with the included script,
 then upload it via Schema → **Upload CSV**:
@@ -162,6 +177,7 @@ client/                      React 19 + Vite + Tailwind frontend
     lib/deriveComponents.ts  THE SKILL: deriveProduct(product, schema) -> components;
                              buildEnterpriseGraph(catalog, schema) -> the full map
     lib/catalogGen.ts        parseDescribeCsv() + buildCatalog() (heuristic generation)
+    lib/schemaFilter.ts      filterBusinessSchema() — auto-drop pipeline/test/DQ schemas
     lib/contract.ts          deriveContract(product, components) -> ontos DataContract
     lib/actions.ts           action types + deterministic builder + in-session queue ctx
     lib/summary.ts           componentsSummary() — compact LLM grounding context

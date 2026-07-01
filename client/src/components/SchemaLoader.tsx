@@ -24,16 +24,19 @@ import {
   Input,
   Label,
 } from '@databricks/appkit-ui/react';
-import { Upload, RotateCcw, Sparkles, Loader2, Database, Plug } from 'lucide-react';
+import { Upload, RotateCcw, Sparkles, Loader2, Database, Plug, Filter } from 'lucide-react';
 import { useProduct } from '../lib/product';
 import { parseDescribeCsv, buildCatalog } from '../lib/catalogGen';
+import { filterBusinessSchema } from '../lib/schemaFilter';
 import type { Catalog, Schema } from '../lib/deriveComponents';
 
 export function SchemaLoader() {
   const { catalogSource, applyGeneratedCatalog, resetToDefault } = useProduct();
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState<string | null>(null);
+  const [filterNote, setFilterNote] = useState<string | null>(null);
   const [useLlm, setUseLlm] = useState(false);
+  const [includeSystem, setIncludeSystem] = useState(false); // filter ON by default
   const [llmAvailable, setLlmAvailable] = useState<boolean | null>(null);
 
   useEffect(() => {
@@ -43,10 +46,25 @@ export function SchemaLoader() {
       .catch(() => setLlmAvailable(false));
   }, []);
 
-  // shared: run a schema map through heuristic + optional LLM, then apply
-  const applySchema = async (schema: Schema, label: string) => {
+  // shared: filter noise schemas → heuristic + optional LLM → apply.
+  const applySchema = async (rawSchema: Schema, label: string) => {
+    if (Object.keys(rawSchema).length === 0) throw new Error('No tables found.');
+
+    // Skill: auto-drop pipeline/test/DQ/framework schemas (unless overridden).
+    const { schema, excluded, droppedSchemas } = filterBusinessSchema(rawSchema, {
+      disable: includeSystem,
+    });
     const tableCount = Object.keys(schema).length;
-    if (tableCount === 0) throw new Error('No tables found.');
+    if (excluded.length > 0) {
+      const droppedTables = excluded.reduce((n, e) => n + e.tableCount, 0);
+      const names = droppedSchemas.slice(0, 6).join(', ') + (droppedSchemas.length > 6 ? ', …' : '');
+      setFilterNote(
+        `Filtered ${excluded.length} pipeline/test/DQ schema(s) (${droppedTables} tables): ${names}`
+      );
+    } else {
+      setFilterNote(includeSystem ? 'Filter off — all schemas included.' : 'No noise schemas detected.');
+    }
+
     let catalog: Catalog = buildCatalog(schema);
     let source: 'uploaded' | 'uploaded+llm' = 'uploaded';
     if (useLlm && llmAvailable) {
@@ -70,7 +88,7 @@ export function SchemaLoader() {
     applyGeneratedCatalog(catalog, schema, source);
     const products = catalog.domains.reduce((n, d) => n + d.products.length, 0);
     setStatus(
-      `${label}: ${tableCount} tables → ${catalog.domains.length} domains, ${products} products` +
+      `${label}: ${tableCount} business tables → ${catalog.domains.length} domains, ${products} products` +
         (source === 'uploaded+llm' ? ' (LLM-refined)' : ' (heuristic)')
     );
   };
@@ -121,6 +139,16 @@ export function SchemaLoader() {
             {llmAvailable === false && <span className="text-muted-foreground">(no endpoint)</span>}
           </label>
 
+          <label className="flex items-center gap-2 text-xs cursor-pointer">
+            <Checkbox
+              checked={includeSystem}
+              onCheckedChange={(v) => setIncludeSystem(Boolean(v))}
+            />
+            <Filter className="h-3.5 w-3.5" />
+            Include system/pipeline schemas
+            <span className="text-muted-foreground">(off = auto-drop dbt/test/DQ)</span>
+          </label>
+
           <Tabs defaultValue="upload">
             <TabsList className="w-full">
               <TabsTrigger value="upload" className="flex-1 gap-1.5">
@@ -150,7 +178,17 @@ export function SchemaLoader() {
             </TabsContent>
           </Tabs>
 
-          {status && <div className="text-xs text-muted-foreground border-t pt-2">{status}</div>}
+          {(status || filterNote) && (
+            <div className="text-xs text-muted-foreground border-t pt-2 space-y-1">
+              {status && <div>{status}</div>}
+              {filterNote && (
+                <div className="flex items-start gap-1.5">
+                  <Filter className="h-3 w-3 mt-0.5 shrink-0" />
+                  <span>{filterNote}</span>
+                </div>
+              )}
+            </div>
+          )}
         </div>
       </PopoverContent>
     </Popover>
