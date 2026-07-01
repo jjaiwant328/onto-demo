@@ -27,10 +27,27 @@ Adding a product to `client/src/data/catalog.json` is all that's needed to light
 The 24 products span domains: `store_operations_labor`, `fuel`,
 `merchandise_inventory`, `sales_pos`, `finance_accounting`, `customer_marketing`.
 
+### Switching schemas (named registry)
+
+A header **Schema** dropdown selects the active schema; picking one regenerates the
+whole app (domains → products → components → enterprise graph → contracts) and the
+choice is persisted for the session (localStorage; default on load = Retailer):
+
+- **Retailer (fc_entdata_gold)** — bundled `schema.json` + the **curated**
+  `catalog.json`; keeps the **live flagship** `jai_store_traffic_labor_efficiency`
+  (real warehouse KPIs). Unchanged from the base app.
+- **QSR Supply Chain (qsrscdoprod_primary)** — bundled `schema.qsr.json` (278 tables
+  across bronze/silver/sc_non_dx_sources/sqs_pipeline_health/snapshots/top8) with a
+  catalog **generated** via the usual pipeline (`buildCatalog` heuristic + optional
+  LLM polish). Schema-derived (no live product) — the app SP has no access to
+  `qsrscdoprod_primary`, so Business View shows the schema-derived preview (no
+  warehouse calls) and every other section renders from `deriveProduct`.
+- Any **uploaded / live-connection** schema (below) appears as a transient third entry.
+
 ### Loading a new schema (regenerate the whole catalog)
 
-The header **Schema** button loads a schema two ways; either runs the **same
-hybrid pipeline** and regenerates the catalog **session-scoped** (not persisted):
+The header **Schema** button (the upload popover) loads a schema two ways; either
+runs the **same hybrid pipeline** and regenerates the catalog **session-scoped**:
 heuristic grouping (always, offline, client-side — keyword-bucket domains, fact-like
 anchors, joinable dims, ≤4 products/domain, derived names/outcomes/KPIs) + optional
 **LLM polish** (the "Refine with Foundation Model" checkbox → `POST /api/generate-catalog`
@@ -153,8 +170,9 @@ client/                      React 19 + Vite + Tailwind frontend
     lib/cytoscape.d.ts       Ambient types for the CDN cytoscape global
     components/SchemaLoader.tsx   Upload CSV / Live connection schema loaders
     components/Copilot.tsx        Ontology Copilot chat panel (Sheet)
-    data/catalog.json        default 6 domains × 4 products (one product live: true)
-    data/schema.json         98 fc_entdata_gold tables (columns) — drives derivation
+    data/catalog.json        curated Retailer catalog (one product live: true)
+    data/schema.json         98 fc_entdata_gold tables (Retailer) — drives derivation
+    data/schema.qsr.json     278 qsrscdoprod_primary tables (QSR Supply Chain)
     data/ontology.json       Curated ontology artifacts (flagship reference)
     data/model.json          Curated ER model (flagship reference)
     pages/                   DataProducts, OntologyStudio (+ LiveValidation),

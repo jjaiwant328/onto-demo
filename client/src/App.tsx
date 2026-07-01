@@ -88,6 +88,24 @@ function NavLinks({
   );
 }
 
+function SchemaSelector() {
+  const { schemaOptions, activeSchemaId, selectSchema } = useProduct();
+  return (
+    <Select value={activeSchemaId} onValueChange={selectSchema}>
+      <SelectTrigger className="w-56" aria-label="Schema">
+        <SelectValue placeholder="Schema" />
+      </SelectTrigger>
+      <SelectContent>
+        {schemaOptions.map((s) => (
+          <SelectItem key={s.id} value={s.id}>
+            {s.label}
+          </SelectItem>
+        ))}
+      </SelectContent>
+    </Select>
+  );
+}
+
 function CatalogPicker() {
   const {
     domains,
@@ -99,6 +117,7 @@ function CatalogPicker() {
   } = useProduct();
   return (
     <div className="flex flex-col sm:flex-row gap-2">
+      <SchemaSelector />
       <Select value={selectedDomain.name} onValueChange={setSelectedDomain}>
         <SelectTrigger className="w-52" aria-label="Domain">
           <SelectValue placeholder="Domain" />
