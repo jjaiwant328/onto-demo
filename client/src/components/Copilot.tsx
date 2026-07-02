@@ -30,7 +30,7 @@ type Msg = {
 
 export function Copilot() {
   const navigate = useNavigate();
-  const { selectedProduct, components } = useProduct();
+  const { selectedProduct, components, isolationKey } = useProduct();
   const { addAction } = useActions();
   const [open, setOpen] = useState(false);
   const [llmAvailable, setLlmAvailable] = useState<boolean | null>(null);
@@ -49,6 +49,12 @@ export function Copilot() {
   useEffect(() => {
     scrollEnd.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages, busy]);
+
+  // reset the conversation when the active customer/schema changes (isolation):
+  // no customer's Copilot context/history leaks into another.
+  useEffect(() => {
+    setMessages([]);
+  }, [isolationKey]);
 
   const send = async () => {
     const q = input.trim();
@@ -101,7 +107,12 @@ export function Copilot() {
 
   return (
     <Sheet open={open} onOpenChange={setOpen}>
-      <Button variant="outline" size="sm" className="gap-1.5" onClick={() => setOpen(true)}>
+      <Button
+        variant="outline"
+        size="sm"
+        className="w-full justify-start gap-1.5"
+        onClick={() => setOpen(true)}
+      >
         <Sparkles className="h-4 w-4" /> Copilot
       </Button>
       <SheetContent side="right" className="w-[420px] sm:max-w-[420px] flex flex-col">

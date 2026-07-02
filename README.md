@@ -8,9 +8,46 @@ The deployed app is a **Databricks AppKit** (Node.js + React) application. The
 original Python/Streamlit implementation is preserved under
 [`legacy_streamlit_app/`](./legacy_streamlit_app/).
 
+## App shell: left control panel + top section tabs
+
+All selection controls live in a persistent **left sidebar**, grouped as
+**Data source** (Load schema · Customer · Schemas) and **Scope** (Domain · Product),
+with the **Copilot** launcher and a **Reset** affordance below. The **seven section
+tabs** run across the top of the main content area; the routed page renders to the
+right and reflects the left selection. On mobile the sidebar collapses into a Sheet.
+
+**Customer isolation is airtight.** Every page derives from the active
+customer → schema(s) via context memos keyed on the selection signature
+(`customerId | sortedSchemaIds`). Switching customer recomputes the catalog,
+components, enterprise graph, highlight, contract, and actions from scratch, and
+the session-scoped panels reset on the same key: the **Action Center queue** and
+the **Copilot conversation** are cleared so no customer's state leaks into another
+(`isolationKey` in `client/src/lib/product.tsx`). Live warehouse queries
+(Business View / Action Center exceptions) are gated behind `components.live`, so
+only Retailer's curated flagship ever hits `jai_ontos.demo_schema`; every other
+customer shows a schema-derived preview with no warehouse call.
+
+**Root cause of the recurring "Retailer↔QSR connected" report:** the persisted
+selection was being clobbered on mount — the `[sig]` persist effect wrote the
+initial Retailer default to localStorage *before* the restore effect read it, so
+the customer reverted to Retailer on reload/remount and pages appeared to show the
+wrong customer. Fixed with a `restoredRef` gate: the persist effect only writes
+after restore completes, so the chosen customer/schema survives navigation and
+full reloads.
+
+### Session catalog edits: delete / combine domains
+
+The left Domain control can **delete** the selected domain (drops its products from
+Data Products / graph / contracts everywhere) and **combine** 2+ domains into one
+(union of products, de-duped). These edit the *active* generated catalog in session
+only — keyed to the current dataset signature, so switching customer/schema or
+clicking **Reset** discards them and the catalog recomputes. The curated Retailer
+catalog is edited on a working copy; the bundled `catalog.json` is never mutated
+(`applyDomainEdits` / `deleteDomain` / `combineDomains` in `product.tsx`).
+
 ## Catalog: domains → products, derived at runtime
 
-The header has two cascading selectors — **Domain** → **Data product**. Picking a
+The left panel has two cascading selectors — **Domain** → **Data product**. Picking a
 product runs the reusable "skill" `deriveProduct(product, schema)`
 (`client/src/lib/deriveComponents.ts`), which turns ANY catalog entry into the
 components every section needs — entities, column mappings (key/measure/attribute),
@@ -30,8 +67,8 @@ The 24 products span domains: `store_operations_labor`, `fuel`,
 ### Customer → Schema(s), with combine
 
 The data model is **Customer → Schema(s)**. Customers are always isolated (data is
-never mixed across customers). The header has a **Customer** dropdown and, within the
-selected customer, a **multi-select Schema picker**: choose **1** schema to view it
+never mixed across customers). The left panel has a **Customer** dropdown and, within the
+selected customer, a **multi-select Schema list** (with per-entry delete): choose **1** schema to view it
 alone, or **2+** (or "Combine all") for a **Combined** view. Any choice regenerates
 the whole app (domains → products → components → enterprise graph → contracts);
 `{customerId, selectedSchemaIds}` is persisted (localStorage; default = Retailer / its
@@ -207,10 +244,12 @@ The flagship's live KPIs are always **recomputed from base sums in SQL**
 client/                      React 19 + Vite + Tailwind frontend
   index.html                 Loads Cytoscape.js from CDN (window.cytoscape)
   src/
-    App.tsx                  Layout, 6-section router, Domain + Product selectors
+    App.tsx                  Left control panel (Data source / Scope groups) + top
+                             section tabs; Customer/Schema/Domain/Product controls,
+                             domain delete+combine, Copilot, Reset
     components/SchemaLoader.tsx  Upload describe-CSV → regenerate catalog (+LLM, +reset)
     lib/product.tsx          Active-catalog context: domains/products + deriveProduct()
-                             + enterprise map + load/reset controls
+                             + enterprise map + load/reset + isolationKey + domain edits
     lib/deriveComponents.ts  THE SKILL: deriveProduct(product, schema) -> components;
                              buildEnterpriseGraph(catalog, schema) -> the full map
     lib/catalogGen.ts        parseDescribeCsv() + buildCatalog() (heuristic generation)

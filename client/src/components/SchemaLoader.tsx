@@ -127,12 +127,12 @@ export function SchemaLoader() {
   return (
     <Popover>
       <PopoverTrigger asChild>
-        <Button variant="outline" size="sm" className="gap-1.5">
+        <Button variant="outline" size="sm" className="w-full justify-start gap-1.5">
           <Database className="h-4 w-4" />
           Load schema
         </Button>
       </PopoverTrigger>
-      <PopoverContent className="w-[460px]" align="end">
+      <PopoverContent className="w-[460px]" align="start">
         <div className="space-y-3">
           <div className="flex items-center justify-between">
             <div className="text-sm font-semibold">Load a schema into a customer</div>

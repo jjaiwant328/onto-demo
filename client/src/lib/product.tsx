@@ -5,7 +5,7 @@
 // The active dataset feeds the usual pipeline (buildCatalog → deriveProduct →
 // enterprise graph → contracts). Retailer's single bundled schema keeps its
 // CURATED catalog + live flagship; everything else is schema-derived.
-import { createContext, useContext, useMemo, useState, useCallback, useEffect } from 'react';
+import { createContext, useContext, useMemo, useState, useCallback, useEffect, useRef } from 'react';
 import type { ReactNode } from 'react';
 import catalogJson from '../data/catalog.json';
 import schemaJson from '../data/schema.json';
@@ -122,9 +122,18 @@ export type ProductContextValue = {
   selectedProduct: CatalogProduct;
   setSelectedProduct: (name: string) => void;
   components: DerivedComponents;
+  // session-level catalog editing (domains) — edits the ACTIVE catalog only,
+  // never the bundled JSON. Keyed to the current dataset signature so switching
+  // customer/schema discards edits and recomputes from scratch (isolation).
+  deleteDomain: (name: string) => void;
+  combineDomains: (names: string[], label?: string) => void;
   // enterprise map + highlight
   enterpriseGraph: EnterpriseGraph;
   enterpriseHighlight: Set<string>;
+  // a monotonically-bumped token that changes whenever the active customer or
+  // schema selection changes; session-scoped panels (Action queue, Copilot
+  // conversation) reset on it so no customer's state leaks into another.
+  isolationKey: string;
 };
 
 const ProductContext = createContext<ProductContextValue | null>(null);
@@ -161,6 +170,12 @@ export function ProductProvider({ children }: { children: ReactNode }) {
 
   const [domainName, setDomainName] = useState<string>(DEFAULT_DOMAIN);
   const [productName, setProductName] = useState<string>(DEFAULT_PRODUCT);
+
+  // Guards the persist write so it never overwrites a stored selection before
+  // the restore effect has run (both fire on mount; the [sig] persist effect
+  // would otherwise clobber the saved customer with the initial Retailer default
+  // — the root cause of "customer reverts to Retailer").
+  const restoredRef = useRef(false);
 
   const customer = useMemo(
     () => customers.find((c) => c.id === customerId) ?? customers[0],
@@ -203,8 +218,25 @@ export function ProductProvider({ children }: { children: ReactNode }) {
     return built;
   }, [isCuratedSingle, customer, schema]);
 
-  const catalog =
+  const baseCatalog =
     !isCuratedSingle && llmCatalog && llmCatalog.sig === sig ? llmCatalog.catalog : heuristicCatalog;
+
+  // ---- session domain edits (delete / combine) applied on top of baseCatalog ----
+  // Stored as an ordered list of operations, scoped to the current dataset `sig`
+  // so switching customer/schema drops them (isolation) and recomputes cleanly.
+  type DomainEdit =
+    | { kind: 'delete'; names: string[] }
+    | { kind: 'combine'; names: string[]; label?: string };
+  const [domainEdits, setDomainEdits] = useState<{ sig: string; edits: DomainEdit[] }>({
+    sig,
+    edits: [],
+  });
+  const activeEdits = domainEdits.sig === sig ? domainEdits.edits : [];
+
+  const catalog = useMemo(
+    () => applyDomainEdits(baseCatalog, activeEdits),
+    [baseCatalog, activeEdits]
+  );
 
   const catalogSource: CatalogSource = isCuratedSingle
     ? 'curated'
@@ -238,6 +270,28 @@ export function ProductProvider({ children }: { children: ReactNode }) {
     setProductName(name);
   };
 
+  // append a session domain edit (scoped to the current dataset signature)
+  const pushDomainEdit = useCallback(
+    (edit: DomainEdit) => {
+      setDomainEdits((prev) => {
+        const edits = prev.sig === sig ? [...prev.edits, edit] : [edit];
+        return { sig, edits };
+      });
+    },
+    [sig]
+  );
+  const deleteDomain = useCallback(
+    (name: string) => pushDomainEdit({ kind: 'delete', names: [name] }),
+    [pushDomainEdit]
+  );
+  const combineDomains = useCallback(
+    (names: string[], label?: string) => {
+      if (names.length < 2) return;
+      pushDomainEdit({ kind: 'combine', names, label });
+    },
+    [pushDomainEdit]
+  );
+
   // point selection at the first domain/product of the active catalog
   const focusFirst = useCallback((c: Catalog, preferDomain?: string, preferProduct?: string) => {
     const d0 = (preferDomain && c.domains.find((d) => d.name === preferDomain)) || c.domains[0];
@@ -254,10 +308,14 @@ export function ProductProvider({ children }: { children: ReactNode }) {
       isCuratedSingle ? DEFAULT_DOMAIN : undefined,
       isCuratedSingle ? DEFAULT_PRODUCT : undefined
     );
-    try {
-      localStorage.setItem(LS_KEY, JSON.stringify({ customerId, selectedSchemaIds }));
-    } catch {
-      /* ignore */
+    // only persist AFTER restore has completed (see restoredRef) so the initial
+    // default never clobbers a stored non-default customer/schema selection
+    if (restoredRef.current) {
+      try {
+        localStorage.setItem(LS_KEY, JSON.stringify({ customerId, selectedSchemaIds }));
+      } catch {
+        /* ignore */
+      }
     }
     if (isCuratedSingle) return; // curated catalog — no generation
     // best-effort LLM polish of the generated/combined catalog (graceful fallback)
@@ -286,6 +344,16 @@ export function ProductProvider({ children }: { children: ReactNode }) {
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sig]);
+
+  // after a session domain edit removes/renames the selected domain, re-focus
+  useEffect(() => {
+    if (!domains.some((d) => d.name === domainName)) {
+      const d0 = domains[0];
+      setDomainName(d0?.name ?? '');
+      setProductName(d0?.products[0]?.product_name ?? '');
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [catalog]);
 
   // ---- selectors ----
   const setCustomer = useCallback(
@@ -404,6 +472,10 @@ export function ProductProvider({ children }: { children: ReactNode }) {
     setCustomers(builtinCustomers());
     setCustomerId('retailer');
     setSelectedSchemaIds(['fc_entdata_gold']);
+    // clear any in-session domain edits (delete/combine) so the catalog recomputes
+    setDomainEdits({ sig: 'retailer|fc_entdata_gold', edits: [] });
+    setDomainName(DEFAULT_DOMAIN);
+    setProductName(DEFAULT_PRODUCT);
   }, []);
 
   // ---- durable schema store (Delta index + Volume content) ----
@@ -557,6 +629,9 @@ export function ProductProvider({ children }: { children: ReactNode }) {
       }
     } catch {
       /* ignore */
+    } finally {
+      // restore is complete — the persist effect may now write freely
+      restoredRef.current = true;
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -606,8 +681,11 @@ export function ProductProvider({ children }: { children: ReactNode }) {
     selectedProduct,
     setSelectedProduct,
     components,
+    deleteDomain,
+    combineDomains,
     enterpriseGraph,
     enterpriseHighlight,
+    isolationKey: sig,
   };
 
   return <ProductContext.Provider value={value}>{children}</ProductContext.Provider>;
@@ -617,6 +695,51 @@ export function useProduct(): ProductContextValue {
   const ctx = useContext(ProductContext);
   if (!ctx) throw new Error('useProduct must be used within ProductProvider');
   return ctx;
+}
+
+// apply session domain edits (delete / combine) to a catalog, returning a NEW
+// catalog. Never mutates the input (so the bundled/curated JSON is untouched).
+type DomainEditOp =
+  | { kind: 'delete'; names: string[] }
+  | { kind: 'combine'; names: string[]; label?: string };
+function applyDomainEdits(catalog: Catalog, edits: DomainEditOp[]): Catalog {
+  if (!edits.length) return catalog;
+  let domains = catalog.domains.map((d) => ({ ...d, products: [...d.products] }));
+  for (const edit of edits) {
+    if (edit.kind === 'delete') {
+      const drop = new Set(edit.names);
+      domains = domains.filter((d) => !drop.has(d.name));
+    } else {
+      const merge = edit.names;
+      const members = domains.filter((d) => merge.includes(d.name));
+      if (members.length < 2) continue;
+      // union products, de-dupe by product_name; place merged domain at the
+      // position of the first member; drop the others.
+      const seen = new Set<string>();
+      const products: CatalogProduct[] = [];
+      for (const m of members) {
+        for (const p of m.products) {
+          if (seen.has(p.product_name)) continue;
+          seen.add(p.product_name);
+          products.push(p);
+        }
+      }
+      const first = members[0];
+      const mergedName = `${first.name}__merged`;
+      const mergedLabel = edit.label || members.map((m) => m.label).join(' + ');
+      const merged: CatalogDomain = {
+        name: mergedName,
+        label: mergedLabel,
+        description: `Merged domain: ${members.map((m) => m.label).join(', ')}`,
+        products,
+      };
+      const firstIdx = domains.findIndex((d) => d.name === first.name);
+      const rest = new Set(merge);
+      domains = domains.filter((d) => !rest.has(d.name));
+      domains.splice(Math.max(0, firstIdx), 0, merged);
+    }
+  }
+  return { domains: domains.length ? domains : catalog.domains };
 }
 
 // keep only domains/products that reference tables present in the schema
