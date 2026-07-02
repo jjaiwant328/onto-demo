@@ -44,9 +44,13 @@ Built-in customers:
 - **QSR** → one schema "QSR Supply Chain" (bundled `schema.qsr.json`, 278 tables),
   catalog **generated** via the usual pipeline (schema-derived; no live product).
 
-Uploaded / live-connection schemas (below) are **assigned to a customer** (existing or
-"New customer…") in the Load-schema popover, and become additional selectable schema
-entries under that customer.
+Uploaded / live-connection schemas (below) are **assigned to a customer** in the
+Load-schema popover, which **defaults to "New customer…"** so an upload never silently
+pollutes a built-in customer (Retailer/QSR). To append to an existing customer, pick it
+explicitly. The popover also has per-customer schema management: each schema entry has a
+**Remove** control (the bundled entry of a built-in customer is not removable; appended
+ones are), user-created customers can be **Deleted**, and **"Reset customers"** clears
+persisted state and restores exactly Retailer + QSR with their bundled schemas.
 
 **Combine + shared-dimension conformance** (`client/src/lib/combineSchemas.ts`): when
 2+ schemas are selected, `combineSchemas` merges them into one `Schema`, **conforming

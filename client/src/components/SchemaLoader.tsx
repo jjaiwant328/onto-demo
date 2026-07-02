@@ -23,7 +23,7 @@ import {
   Input,
   Label,
 } from '@databricks/appkit-ui/react';
-import { Upload, RotateCcw, Loader2, Database, Plug, Filter, Users } from 'lucide-react';
+import { Upload, RotateCcw, Loader2, Database, Plug, Filter, Users, Trash2 } from 'lucide-react';
 import { useProduct } from '../lib/product';
 import { parseDescribeCsv } from '../lib/catalogGen';
 import { filterBusinessSchema } from '../lib/schemaFilter';
@@ -32,16 +32,27 @@ import type { Schema } from '../lib/deriveComponents';
 const NEW_CUSTOMER = '__new__';
 
 export function SchemaLoader() {
-  const { customers, customerId, addSchema, resetToDefault } = useProduct();
+  const {
+    customers,
+    customerId,
+    addSchema,
+    resetCustomers,
+    isBundledSchema,
+    removeSchema,
+    removeCustomer,
+  } = useProduct();
+  const activeCustomer = customers.find((c) => c.id === customerId);
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState<string | null>(null);
   const [filterNote, setFilterNote] = useState<string | null>(null);
   const [includeSystem, setIncludeSystem] = useState(false); // filter ON by default
-  // customer assignment for the loaded schema
-  const [targetCustomer, setTargetCustomer] = useState<string>(customerId);
+  // customer assignment for the loaded schema.
+  // DEFAULT to "New customer…" so an upload NEVER silently appends to a built-in
+  // (Retailer/QSR) — the user must explicitly pick an existing customer to append.
+  const [targetCustomer, setTargetCustomer] = useState<string>(NEW_CUSTOMER);
   const [newCustomerName, setNewCustomerName] = useState('');
   const [schemaLabel, setSchemaLabel] = useState('');
-  const [pendingFollow, setPendingFollow] = useState(false);
+  const [pendingFollowNew, setPendingFollowNew] = useState(false);
 
   // shared: filter noise schemas → assign to a customer (provider generates the catalog).
   const applySchema = async (rawSchema: Schema, label: string) => {
@@ -80,19 +91,19 @@ export function SchemaLoader() {
     );
     setSchemaLabel('');
     setNewCustomerName('');
-    // After a load the provider makes the target customer active. Reset the
-    // picker to follow it so the NEXT upload appends to the SAME customer
-    // (fixes: a second "New customer…" upload creating a duplicate customer).
-    setPendingFollow(true);
+    // For a NEW customer, follow it so a second upload can be appended to the
+    // SAME new customer (the provider makes it active). For an EXISTING customer,
+    // reset back to "New customer…" so the next upload doesn't silently append.
+    setPendingFollowNew(isNew);
   };
 
-  // once a load lands, point the picker at the now-active customer
+  // after creating a NEW customer, point the picker at it (provider activates it)
   useEffect(() => {
-    if (pendingFollow) {
+    if (pendingFollowNew) {
       setTargetCustomer(customerId);
-      setPendingFollow(false);
+      setPendingFollowNew(false);
     }
-  }, [customerId, pendingFollow]);
+  }, [customerId, pendingFollowNew]);
 
   return (
     <Popover>
@@ -102,7 +113,7 @@ export function SchemaLoader() {
           Load schema
         </Button>
       </PopoverTrigger>
-      <PopoverContent className="w-[440px]" align="end">
+      <PopoverContent className="w-[460px]" align="end">
         <div className="space-y-3">
           <div className="flex items-center justify-between">
             <div className="text-sm font-semibold">Load a schema into a customer</div>
@@ -111,14 +122,73 @@ export function SchemaLoader() {
               variant="outline"
               className="gap-1.5"
               onClick={() => {
-                resetToDefault();
-                setStatus('Reset to Retailer (default).');
+                resetCustomers();
+                setStatus('Reset customers to defaults (Retailer + QSR).');
+                setFilterNote(null);
+                setTargetCustomer(NEW_CUSTOMER);
               }}
               disabled={busy}
+              title="Clear all uploaded customers/schemas and restore Retailer + QSR"
             >
-              <RotateCcw className="h-4 w-4" /> Reset
+              <RotateCcw className="h-4 w-4" /> Reset customers
             </Button>
           </div>
+
+          {/* Manage the active customer's schemas (remove appended; delete user customer) */}
+          {activeCustomer && (
+            <div className="rounded-md border p-2 space-y-1.5">
+              <div className="flex items-center justify-between">
+                <span className="text-xs font-medium flex items-center gap-1.5">
+                  <Users className="h-3.5 w-3.5" /> {activeCustomer.label} — schemas (
+                  {activeCustomer.schemas.length})
+                </span>
+                {!activeCustomer.builtin && (
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    className="h-6 gap-1 text-xs text-destructive"
+                    onClick={() => {
+                      removeCustomer(activeCustomer.id);
+                      setStatus(`Deleted customer "${activeCustomer.label}".`);
+                    }}
+                  >
+                    <Trash2 className="h-3 w-3" /> Delete customer
+                  </Button>
+                )}
+              </div>
+              <div className="flex flex-col gap-0.5">
+                {activeCustomer.schemas.map((s) => {
+                  const bundled = isBundledSchema(activeCustomer.id, s.id);
+                  return (
+                    <div
+                      key={s.id}
+                      className="flex items-center justify-between text-xs rounded px-1.5 py-1 hover:bg-muted"
+                    >
+                      <span className="truncate">
+                        {s.label}
+                        {bundled && <span className="text-muted-foreground"> · bundled</span>}
+                      </span>
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        className="h-6 w-6 p-0"
+                        disabled={bundled}
+                        title={bundled ? 'Bundled schema — not removable' : 'Remove schema'}
+                        onClick={() => {
+                          removeSchema(activeCustomer.id, s.id);
+                          setStatus(`Removed schema "${s.label}" from "${activeCustomer.label}".`);
+                        }}
+                      >
+                        <Trash2
+                          className={`h-3.5 w-3.5 ${bundled ? 'opacity-30' : 'text-destructive'}`}
+                        />
+                      </Button>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
 
           {/* customer assignment */}
           <div className="space-y-1">

@@ -38,6 +38,10 @@ export type Customer = {
   id: string;
   label: string;
   schemas: SchemaEntry[];
+  // built-in (non-removable) schema ids for this customer (the bundled ones)
+  bundledSchemaIds?: string[];
+  // whether this customer is a built-in (Retailer/QSR) — user-created ones are deletable
+  builtin?: boolean;
   // when this customer's curated schema is the sole selection, use the curated
   // catalog (keeps the live flagship) instead of generating one
   curatedSchemaId?: string;
@@ -59,6 +63,11 @@ export type ProductContextValue = {
   catalogSource: CatalogSource;
   // add an uploaded/live schema to a customer (existing or new)
   addSchema: (customerLabelOrId: string, entry: SchemaEntry, isNewCustomer: boolean) => void;
+  // customer management
+  isBundledSchema: (customerId: string, schemaId: string) => boolean;
+  removeSchema: (customerId: string, schemaId: string) => void;
+  removeCustomer: (customerId: string) => void;
+  resetCustomers: () => void;
   resetToDefault: () => void;
   schema: Schema;
   catalog: Catalog;
@@ -77,12 +86,14 @@ export type ProductContextValue = {
 
 const ProductContext = createContext<ProductContextValue | null>(null);
 
-// built-in customers (each starts with one bundled schema entry)
+// built-in customers (each starts with one bundled, non-removable schema entry)
 function builtinCustomers(): Customer[] {
   return [
     {
       id: 'retailer',
       label: 'Retailer',
+      builtin: true,
+      bundledSchemaIds: ['fc_entdata_gold'],
       curatedSchemaId: 'fc_entdata_gold',
       curatedCatalog: DEFAULT_CATALOG,
       schemas: [{ id: 'fc_entdata_gold', label: 'fc_entdata_gold', schema: DEFAULT_SCHEMA }],
@@ -90,6 +101,8 @@ function builtinCustomers(): Customer[] {
     {
       id: 'qsr',
       label: 'QSR',
+      builtin: true,
+      bundledSchemaIds: ['qsr_scd'],
       schemas: [{ id: 'qsr_scd', label: 'QSR Supply Chain', schema: QSR_SCHEMA }],
     },
   ];
@@ -284,6 +297,67 @@ export function ProductProvider({ children }: { children: ReactNode }) {
     }
   }, []);
 
+  // ---- customer management (remove schema / customer, reset all) ----
+  const isBundledSchema = useCallback(
+    (cid: string, sid: string) => {
+      const c = customers.find((x) => x.id === cid);
+      return Boolean(c?.bundledSchemaIds?.includes(sid));
+    },
+    [customers]
+  );
+
+  const removeSchema = useCallback(
+    (cid: string, sid: string) => {
+      const c = customers.find((x) => x.id === cid);
+      if (!c) return;
+      if (c.bundledSchemaIds?.includes(sid)) return; // bundled schema is not removable
+      const remaining = c.schemas.filter((s) => s.id !== sid);
+      // built-in customer must always keep at least its bundled schema
+      if (remaining.length === 0 && c.builtin) return;
+      if (remaining.length === 0 && !c.builtin) {
+        // user-created customer with no schemas left → delete it, fall back to Retailer
+        setCustomers((prev) => prev.filter((x) => x.id !== cid));
+        setCustomerId('retailer');
+        setSelectedSchemaIds(['fc_entdata_gold']);
+        return;
+      }
+      setCustomers((prev) =>
+        prev.map((x) => (x.id === cid ? { ...x, schemas: remaining } : x))
+      );
+      // if the removed schema was selected, drop it from the selection
+      setSelectedSchemaIds((prev) => {
+        const next = prev.filter((id) => id !== sid);
+        return next.length ? next : [remaining[0].id];
+      });
+    },
+    [customers]
+  );
+
+  const removeCustomer = useCallback(
+    (cid: string) => {
+      const c = customers.find((x) => x.id === cid);
+      if (!c || c.builtin) return; // built-ins are not deletable
+      setCustomers((prev) => prev.filter((x) => x.id !== cid));
+      if (customerId === cid) {
+        setCustomerId('retailer');
+        setSelectedSchemaIds(['fc_entdata_gold']);
+      }
+    },
+    [customers, customerId]
+  );
+
+  // clear persisted state and restore exactly Retailer + QSR with bundled schemas
+  const resetCustomers = useCallback(() => {
+    try {
+      localStorage.removeItem(LS_KEY);
+    } catch {
+      /* ignore */
+    }
+    setCustomers(builtinCustomers());
+    setCustomerId('retailer');
+    setSelectedSchemaIds(['fc_entdata_gold']);
+  }, []);
+
   // restore persisted selection on first load (default = Retailer / its schema)
   useEffect(() => {
     try {
@@ -332,6 +406,10 @@ export function ProductProvider({ children }: { children: ReactNode }) {
     conformance,
     catalogSource,
     addSchema,
+    isBundledSchema,
+    removeSchema,
+    removeCustomer,
+    resetCustomers,
     resetToDefault,
     schema,
     catalog,
