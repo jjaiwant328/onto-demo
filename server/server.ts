@@ -1,4 +1,5 @@
-import { createApp, analytics, server, serving } from '@databricks/appkit';
+import { createApp, analytics, server, serving, getWorkspaceClient } from '@databricks/appkit';
+import { randomUUID } from 'node:crypto';
 
 // The serving plugin is wired to a Foundation Model endpoint (alias "llm",
 // endpoint name from DATABRICKS_SERVING_ENDPOINT_NAME). It powers the optional
@@ -28,11 +29,171 @@ createApp({
       return s.replace(/\*/g, '%'); // wildcard: * or % both → %
     };
     const safeIdent = (v: string): string => v.replace(/[^a-zA-Z0-9_]/g, '');
+    const sqlStr = (v: unknown): string => `'${String(v ?? '').replace(/'/g, "''")}'`;
+
+    // ---- SP-authenticated Databricks REST (host + bearer via the SDK config) ----
+    // Works locally (profile) and on the Apps runtime (injected SP creds).
+    let cachedHost: string | null = null;
+    const authFetch = async (
+      path: string,
+      init: { method?: string; headers?: Record<string, string>; rawBody?: string } = {}
+    ): Promise<Response> => {
+      const w = getWorkspaceClient({});
+      await w.config.ensureResolved?.();
+      if (!cachedHost) cachedHost = w.config.host ?? process.env.DATABRICKS_HOST ?? '';
+      const headers = new Headers(init.headers ?? {});
+      await w.config.authenticate(headers);
+      const host = cachedHost.startsWith('http') ? cachedHost : `https://${cachedHost}`;
+      return fetch(`${host}${path}`, { method: init.method, headers, body: init.rawBody });
+    };
+    const VOLUME_BASE = '/Volumes/jai_ontos/demo_schema/onto_artifacts';
+    const SAVED_TABLE = 'jai_ontos.demo_schema.jai_saved_schemas';
+    // Files API: PUT/GET/DELETE a volume file
+    const volumePut = (volPath: string, body: string) =>
+      authFetch(`/api/2.0/fs/files${volPath}?overwrite=true`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        rawBody: body,
+      });
+    const volumeGet = (volPath: string) => authFetch(`/api/2.0/fs/files${volPath}`, { method: 'GET' });
+    const volumeDelete = (volPath: string) =>
+      authFetch(`/api/2.0/fs/files${volPath}`, { method: 'DELETE' });
 
     appkit.server.extend((app) => {
       // Tells the client whether the LLM-polish path is available.
       app.get('/api/llm-status', (_req, res) => {
         res.json({ available: hasLlm });
+      });
+
+      // ---- durable schema store: Volume = content, Delta = index ----
+      const INLINE_MAX = 150 * 1024; // inline schema_json in Delta only if small
+
+      // Save a schema: raw JSON → volume; metadata row → Delta.
+      app.post('/api/save-schema', async (req, res) => {
+        const b = (req.body ?? {}) as {
+          customer?: string;
+          schemaName?: string;
+          source?: string;
+          catalogRef?: string;
+          schema?: Record<string, unknown>;
+        };
+        const customer = (b.customer ?? '').trim();
+        const schemaName = (b.schemaName ?? '').trim();
+        if (!customer || !schemaName || !b.schema || typeof b.schema !== 'object') {
+          res.status(400).json({ error: 'customer, schemaName and schema are required' });
+          return;
+        }
+        try {
+          const schemaId = `sch_${Date.now().toString(36)}_${randomUUID().slice(0, 8)}`;
+          const json = JSON.stringify(b.schema);
+          const tableCount = Object.keys(b.schema).length;
+          const safeCustomer = customer.replace(/[^a-zA-Z0-9_-]/g, '_') || 'customer';
+          const volPath = `${VOLUME_BASE}/${safeCustomer}/${schemaId}.json`;
+
+          // 1) write content to the volume
+          const put = await volumePut(volPath, json);
+          if (!put.ok) {
+            res.json({
+              ok: false,
+              error: `Volume write failed (${put.status}): ${humanizeSqlError(await put.text())}`,
+            });
+            return;
+          }
+
+          // 2) whoami (created_by) — best-effort
+          let createdBy = 'app-service-principal';
+          try {
+            const me = await authFetch('/api/2.0/preview/scim/v2/Me', { method: 'GET' });
+            if (me.ok) createdBy = ((await me.json()) as { userName?: string })?.userName ?? createdBy;
+          } catch {
+            /* ignore */
+          }
+
+          // 3) index row in Delta (inline JSON only if small)
+          const inline = json.length <= INLINE_MAX ? sqlStr(json) : 'NULL';
+          await runSql(
+            `INSERT INTO ${SAVED_TABLE} ` +
+              `(schema_id, customer, schema_name, source, catalog_ref, table_count, created_by, created_at, volume_path, schema_json) ` +
+              `VALUES (${sqlStr(schemaId)}, ${sqlStr(customer)}, ${sqlStr(schemaName)}, ${sqlStr(
+                b.source ?? 'upload'
+              )}, ${sqlStr(b.catalogRef ?? '')}, ${tableCount}, ${sqlStr(createdBy)}, current_timestamp(), ${sqlStr(volPath)}, ${inline})`
+          );
+          res.json({ ok: true, schema_id: schemaId, volume_path: volPath, table_count: tableCount });
+        } catch (err) {
+          res.json({ ok: false, error: humanizeSqlError(err) });
+        }
+      });
+
+      // List saved-schema metadata (no blob).
+      app.get('/api/saved-schemas', async (_req, res) => {
+        try {
+          const rows = await runSql(
+            `SELECT schema_id, customer, schema_name, source, catalog_ref, table_count, created_by, ` +
+              `cast(created_at as string) as created_at, volume_path FROM ${SAVED_TABLE} ORDER BY created_at DESC`
+          );
+          res.json({ schemas: rows });
+        } catch (err) {
+          res.status(200).json({ schemas: [], error: humanizeSqlError(err) });
+        }
+      });
+
+      // Fetch a saved schema's full content (volume file, or inline schema_json).
+      app.get('/api/saved-schema/:id', async (req, res) => {
+        const id = safeIdent(String(req.params.id));
+        try {
+          const rows = await runSql(
+            `SELECT volume_path, schema_json FROM ${SAVED_TABLE} WHERE schema_id = ${sqlStr(id)} LIMIT 1`
+          );
+          if (rows.length === 0) {
+            res.status(404).json({ error: 'not found' });
+            return;
+          }
+          const inlineJson = rows[0].schema_json;
+          if (inlineJson != null && inlineJson !== '') {
+            // analytics may return the column already-parsed (object) or as a string
+            const parsed =
+              typeof inlineJson === 'string' ? JSON.parse(inlineJson) : inlineJson;
+            if (parsed && typeof parsed === 'object' && Object.keys(parsed).length > 0) {
+              res.json({ schema: parsed });
+              return;
+            }
+          }
+          const volPath = String(rows[0].volume_path ?? '');
+          const dl = await volumeGet(volPath);
+          if (!dl.ok) {
+            res.json({ error: `Volume read failed (${dl.status})` });
+            return;
+          }
+          res.json({ schema: JSON.parse(await dl.text()) });
+        } catch (err) {
+          res.status(200).json({ error: humanizeSqlError(err) });
+        }
+      });
+
+      // Delete a saved schema (Delta row + volume file).
+      app.post('/api/delete-saved-schema', async (req, res) => {
+        const id = safeIdent(String((req.body ?? {}).schema_id ?? ''));
+        if (!id) {
+          res.status(400).json({ error: 'schema_id required' });
+          return;
+        }
+        try {
+          const rows = await runSql(
+            `SELECT volume_path FROM ${SAVED_TABLE} WHERE schema_id = ${sqlStr(id)} LIMIT 1`
+          );
+          const volPath = rows[0]?.volume_path ? String(rows[0].volume_path) : '';
+          await runSql(`DELETE FROM ${SAVED_TABLE} WHERE schema_id = ${sqlStr(id)}`);
+          if (volPath) {
+            try {
+              await volumeDelete(volPath);
+            } catch {
+              /* row is gone; volume file orphan is harmless */
+            }
+          }
+          res.json({ ok: true });
+        } catch (err) {
+          res.json({ ok: false, error: humanizeSqlError(err) });
+        }
       });
 
       // List catalogs the app SP can see.

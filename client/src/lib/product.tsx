@@ -31,6 +31,29 @@ const DEFAULT_DOMAIN = 'store_operations_labor';
 const DEFAULT_PRODUCT = 'jai_store_traffic_labor_efficiency';
 const LS_KEY = 'rt_onto_selection';
 
+// Fallback catalog for an empty/loading schema so downstream never sees an
+// undefined domain/product (guards the lazy-load window for saved schemas).
+const PLACEHOLDER_CATALOG: Catalog = {
+  domains: [
+    {
+      name: 'loading',
+      label: 'Loading…',
+      description: 'Loading schema…',
+      products: [
+        {
+          product_name: 'loading',
+          display_name: 'Loading…',
+          business_outcome: 'Loading schema content…',
+          fact_tables: [],
+          dim_tables: [],
+          kpis: [],
+          maturity: 'incubating',
+        },
+      ],
+    },
+  ],
+};
+
 export type CatalogSource = 'curated' | 'generated' | 'generated+llm' | 'combined' | 'combined+llm';
 
 // customer registry entry
@@ -46,6 +69,19 @@ export type Customer = {
   // catalog (keeps the live flagship) instead of generating one
   curatedSchemaId?: string;
   curatedCatalog?: Catalog;
+};
+
+// saved-schema index row (from /api/saved-schemas)
+export type SavedSchemaMeta = {
+  schema_id: string;
+  customer: string;
+  schema_name: string;
+  source: string;
+  catalog_ref?: string;
+  table_count?: number;
+  created_by?: string;
+  created_at?: string;
+  volume_path?: string;
 };
 
 export type ProductContextValue = {
@@ -69,6 +105,13 @@ export type ProductContextValue = {
   removeCustomer: (customerId: string) => void;
   resetCustomers: () => void;
   resetToDefault: () => void;
+  // durable schema store (Delta + Volume)
+  savedSchemas: SavedSchemaMeta[];
+  refreshSavedSchemas: () => Promise<void>;
+  saveSchema: (
+    args: { customer: string; schemaName: string; source: string; catalogRef?: string; schema: Schema }
+  ) => Promise<{ ok: boolean; error?: string }>;
+  deleteSavedSchema: (schemaId: string) => Promise<void>;
   schema: Schema;
   catalog: Catalog;
   // product selection
@@ -152,7 +195,12 @@ export function ProductProvider({ children }: { children: ReactNode }) {
 
   const heuristicCatalog = useMemo(() => {
     if (isCuratedSingle) return customer.curatedCatalog as Catalog;
-    return buildCatalog(schema);
+    const built = buildCatalog(schema);
+    // Empty schema (e.g. a saved entry whose content is still lazy-loading, or an
+    // empty selection) yields 0 domains — synthesize a placeholder so every section
+    // has a defined domain/product and never crashes on undefined.fact_tables.
+    if (built.domains.length === 0) return PLACEHOLDER_CATALOG;
+    return built;
   }, [isCuratedSingle, customer, schema]);
 
   const catalog =
@@ -358,6 +406,140 @@ export function ProductProvider({ children }: { children: ReactNode }) {
     setSelectedSchemaIds(['fc_entdata_gold']);
   }, []);
 
+  // ---- durable schema store (Delta index + Volume content) ----
+  const [savedSchemas, setSavedSchemas] = useState<SavedSchemaMeta[]>([]);
+
+  // merge saved-schema index rows into the customer registry as (lazy) entries.
+  // A saved schema belongs to a user customer keyed by its `customer` label.
+  const mergeSaved = useCallback((rows: SavedSchemaMeta[]) => {
+    setCustomers((prev) => {
+      const next = prev.map((c) => ({ ...c, schemas: [...c.schemas] }));
+      const byLabel = new Map(next.map((c) => [c.label.toLowerCase(), c] as const));
+      for (const r of rows) {
+        const entryId = `saved:${r.schema_id}`;
+        // built-ins never receive saved schemas (isolation); use/create a user customer
+        let cust = byLabel.get(r.customer.toLowerCase());
+        if (cust && cust.builtin) cust = undefined;
+        if (!cust) {
+          cust = {
+            id: `cust_${r.customer.toLowerCase().replace(/[^a-z0-9]+/g, '_')}`,
+            label: r.customer,
+            schemas: [],
+          };
+          next.push(cust);
+          byLabel.set(r.customer.toLowerCase(), cust);
+        }
+        if (!cust.schemas.some((s) => s.id === entryId)) {
+          // lazy entry: empty schema until first selected (content in the volume)
+          cust.schemas.push({
+            id: entryId,
+            label: `${r.schema_name} · saved`,
+            schema: {},
+            savedId: r.schema_id,
+          });
+        }
+      }
+      return next;
+    });
+  }, []);
+
+  const refreshSavedSchemas = useCallback(async () => {
+    try {
+      const resp = await fetch('/api/saved-schemas');
+      const data = await resp.json();
+      const rows: SavedSchemaMeta[] = Array.isArray(data?.schemas) ? data.schemas : [];
+      setSavedSchemas(rows);
+      mergeSaved(rows);
+    } catch {
+      /* store unavailable — app still works without it */
+    }
+  }, [mergeSaved]);
+
+  const saveSchema = useCallback(
+    async (args: {
+      customer: string;
+      schemaName: string;
+      source: string;
+      catalogRef?: string;
+      schema: Schema;
+    }) => {
+      try {
+        const resp = await fetch('/api/save-schema', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify(args),
+        });
+        const data = await resp.json();
+        if (!data?.ok) return { ok: false, error: data?.error ?? 'save failed' };
+        await refreshSavedSchemas();
+        return { ok: true };
+      } catch (err) {
+        return { ok: false, error: err instanceof Error ? err.message : String(err) };
+      }
+    },
+    [refreshSavedSchemas]
+  );
+
+  const deleteSavedSchema = useCallback(
+    async (schemaId: string) => {
+      try {
+        await fetch('/api/delete-saved-schema', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ schema_id: schemaId }),
+        });
+      } catch {
+        /* ignore */
+      }
+      const entryId = `saved:${schemaId}`;
+      setCustomers((prev) =>
+        prev
+          .map((c) => ({ ...c, schemas: c.schemas.filter((s) => s.id !== entryId) }))
+          // drop user customers left empty
+          .filter((c) => c.builtin || c.schemas.length > 0)
+      );
+      setSelectedSchemaIds((prev) => prev.filter((id) => id !== entryId));
+      setSavedSchemas((prev) => prev.filter((s) => s.schema_id !== schemaId));
+    },
+    []
+  );
+
+  // lazily fetch content for a selected saved entry that hasn't loaded yet
+  useEffect(() => {
+    const lazy = customer.schemas.filter(
+      (s) => s.savedId && selectedSchemaIds.includes(s.id) && Object.keys(s.schema).length === 0
+    );
+    if (lazy.length === 0) return;
+    let cancelled = false;
+    (async () => {
+      for (const entry of lazy) {
+        try {
+          const resp = await fetch(`/api/saved-schema/${entry.savedId}`);
+          const data = await resp.json();
+          if (cancelled || !data?.schema) continue;
+          setCustomers((prev) =>
+            prev.map((c) =>
+              c.id === customer.id
+                ? { ...c, schemas: c.schemas.map((s) => (s.id === entry.id ? { ...s, schema: data.schema } : s)) }
+                : c
+            )
+          );
+        } catch {
+          /* leave empty; section will render an empty catalog gracefully */
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [customer, selectedSchemaIds]);
+
+  // load saved schemas once on startup
+  useEffect(() => {
+    void refreshSavedSchemas();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   // restore persisted selection on first load (default = Retailer / its schema)
   useEffect(() => {
     try {
@@ -411,6 +593,10 @@ export function ProductProvider({ children }: { children: ReactNode }) {
     removeCustomer,
     resetCustomers,
     resetToDefault,
+    savedSchemas,
+    refreshSavedSchemas,
+    saveSchema,
+    deleteSavedSchema,
     schema,
     catalog,
     domains,

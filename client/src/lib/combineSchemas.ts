@@ -10,6 +10,9 @@ export type SchemaEntry = {
   id: string;
   label: string;
   schema: Schema;
+  // set for entries backed by the durable store (Volume + Delta); content is
+  // lazily loaded from /api/saved-schema/:savedId on first selection
+  savedId?: string;
 };
 
 // Which conformed table id → the source schema labels it was merged from.

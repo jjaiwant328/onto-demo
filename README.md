@@ -52,6 +52,22 @@ explicitly. The popover also has per-customer schema management: each schema ent
 ones are), user-created customers can be **Deleted**, and **"Reset customers"** clears
 persisted state and restores exactly Retailer + QSR with their bundled schemas.
 
+**Durable schema store (Delta index + UC Volume).** Checking **"Store schema"** in the
+Load-schema popover persists a loaded schema so it survives reloads/sessions/users
+(the whole point of live-connect). Design: the raw schema JSON is the source of truth in
+the **Volume** `/Volumes/jai_ontos/demo_schema/onto_artifacts/<customer>/<schema_id>.json`
+(written via the Files REST API with the app-SP token), and a metadata row is indexed in
+the **Delta** table `jai_ontos.demo_schema.jai_saved_schemas` (via `appkit.analytics`);
+`schema_json` is inlined in Delta only when small (<150KB), otherwise read from the volume
+(avoids giant SQL for large exports like QSR ~680KB). On startup the app calls
+`GET /api/saved-schemas` and merges saved schemas into the customer registry under their
+`customer` (creating a user customer if needed); selecting one lazily loads its content
+via `GET /api/saved-schema/:id`. A **"Saved schemas"** list offers Load + Remove (Remove
+deletes the Delta row + volume file via `POST /api/delete-saved-schema`). Saving respects
+isolation — a saved schema belongs to exactly one customer and never targets a built-in.
+Endpoints: `POST /api/save-schema`, `GET /api/saved-schemas`, `GET /api/saved-schema/:id`,
+`POST /api/delete-saved-schema`.
+
 **Combine + shared-dimension conformance** (`client/src/lib/combineSchemas.ts`): when
 2+ schemas are selected, `combineSchemas` merges them into one `Schema`, **conforming
 dimension tables** shared across schemas — two dims conform when their normalized base

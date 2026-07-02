@@ -23,7 +23,7 @@ import {
   Input,
   Label,
 } from '@databricks/appkit-ui/react';
-import { Upload, RotateCcw, Loader2, Database, Plug, Filter, Users, Trash2 } from 'lucide-react';
+import { Upload, RotateCcw, Loader2, Database, Plug, Filter, Users, Trash2, Save } from 'lucide-react';
 import { useProduct } from '../lib/product';
 import { parseDescribeCsv } from '../lib/catalogGen';
 import { filterBusinessSchema } from '../lib/schemaFilter';
@@ -40,12 +40,18 @@ export function SchemaLoader() {
     isBundledSchema,
     removeSchema,
     removeCustomer,
+    savedSchemas,
+    saveSchema,
+    deleteSavedSchema,
+    setCustomer,
+    toggleSchema,
   } = useProduct();
   const activeCustomer = customers.find((c) => c.id === customerId);
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState<string | null>(null);
   const [filterNote, setFilterNote] = useState<string | null>(null);
   const [includeSystem, setIncludeSystem] = useState(false); // filter ON by default
+  const [storeOnLoad, setStoreOnLoad] = useState(false); // persist to the durable store
   // customer assignment for the loaded schema.
   // DEFAULT to "New customer…" so an upload NEVER silently appends to a built-in
   // (Retailer/QSR) — the user must explicitly pick an existing customer to append.
@@ -86,8 +92,21 @@ export function SchemaLoader() {
     };
     addSchema(custName, entry, isNew);
     const custLabel = isNew ? custName : customers.find((c) => c.id === custName)?.label ?? custName;
+    let storeNote = '';
+    if (storeOnLoad) {
+      setStatus(`Storing "${entryLabel}" to the durable schema store…`);
+      const r = await saveSchema({
+        customer: custLabel,
+        schemaName: entryLabel,
+        source: label.toLowerCase(),
+        schema,
+      });
+      storeNote = r.ok
+        ? ' · stored durably (survives reloads)'
+        : ` · store failed: ${r.error ?? 'unknown'}`;
+    }
     setStatus(
-      `Added "${entryLabel}" (${tableCount} business tables) to customer "${custLabel}". The catalog will regenerate; select 2+ schemas to combine.`
+      `Added "${entryLabel}" (${tableCount} business tables) to customer "${custLabel}".${storeNote}`
     );
     setSchemaLabel('');
     setNewCustomerName('');
@@ -234,6 +253,12 @@ export function SchemaLoader() {
             <span className="text-muted-foreground">(off = auto-drop dbt/test/DQ)</span>
           </label>
 
+          <label className="flex items-center gap-2 text-xs cursor-pointer">
+            <Checkbox checked={storeOnLoad} onCheckedChange={(v) => setStoreOnLoad(Boolean(v))} />
+            <Save className="h-3.5 w-3.5" />
+            Store schema (persist to Delta + Volume — survives reloads)
+          </label>
+
           <Tabs defaultValue="upload">
             <TabsList className="w-full">
               <TabsTrigger value="upload" className="flex-1 gap-1.5">
@@ -272,6 +297,66 @@ export function SchemaLoader() {
                   <span>{filterNote}</span>
                 </div>
               )}
+            </div>
+          )}
+
+          {/* durable schema store — persists across reloads/sessions/users */}
+          {savedSchemas.length > 0 && (
+            <div className="border-t pt-2 space-y-1">
+              <div className="text-xs font-medium flex items-center gap-1.5">
+                <Save className="h-3.5 w-3.5" /> Saved schemas ({savedSchemas.length})
+              </div>
+              <div className="flex flex-col gap-0.5 max-h-40 overflow-auto">
+                {savedSchemas.map((s) => (
+                  <div
+                    key={s.schema_id}
+                    className="flex items-center justify-between text-xs rounded px-1.5 py-1 hover:bg-muted"
+                  >
+                    <div className="min-w-0">
+                      <div className="truncate font-medium">
+                        {s.schema_name}{' '}
+                        <span className="text-muted-foreground font-normal">· {s.customer}</span>
+                      </div>
+                      <div className="text-[11px] text-muted-foreground truncate">
+                        {s.source} · {s.table_count ?? '?'} tables · {s.created_by ?? '—'}
+                        {s.created_at ? ` · ${String(s.created_at).slice(0, 16)}` : ''}
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-1 shrink-0">
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        className="h-6 px-2 text-xs"
+                        onClick={() => {
+                          // select the owning customer + its saved entry (content lazy-loads)
+                          const cust = customers.find(
+                            (c) => c.label.toLowerCase() === s.customer.toLowerCase() && !c.builtin
+                          );
+                          if (cust) {
+                            setCustomer(cust.id);
+                            toggleSchema(`saved:${s.schema_id}`);
+                            setStatus(`Loaded saved schema "${s.schema_name}".`);
+                          }
+                        }}
+                      >
+                        Load
+                      </Button>
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        className="h-6 w-6 p-0"
+                        title="Remove from store (deletes Delta row + volume file)"
+                        onClick={() => {
+                          void deleteSavedSchema(s.schema_id);
+                          setStatus(`Removed saved schema "${s.schema_name}".`);
+                        }}
+                      >
+                        <Trash2 className="h-3.5 w-3.5 text-destructive" />
+                      </Button>
+                    </div>
+                  </div>
+                ))}
+              </div>
             </div>
           )}
         </div>
