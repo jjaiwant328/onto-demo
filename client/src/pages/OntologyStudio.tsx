@@ -22,6 +22,7 @@ import {
 import { CheckCircle2, XCircle, AlertTriangle, Info } from 'lucide-react';
 import { useProduct } from '../lib/product';
 import { LiveValidation } from './LiveValidation';
+import { CatalogLoadingSkeleton } from '../components/LoadingSkeleton';
 
 const ROLE_VARIANT: Record<string, 'default' | 'secondary' | 'outline'> = {
   key: 'default',
@@ -30,7 +31,7 @@ const ROLE_VARIANT: Record<string, 'default' | 'secondary' | 'outline'> = {
 };
 
 export function OntologyStudio() {
-  const { components, selectedProduct } = useProduct();
+  const { components, selectedProduct, catalogLoading, rebuilding, activeSourceCatalog } = useProduct();
   const { classes, mappings, live } = components;
 
   const roles = useMemo<string[]>(
@@ -42,6 +43,9 @@ export function OntologyStudio() {
   const effectiveRoles = activeRoles.filter((r) => roles.includes(r));
   const shownRoles = effectiveRoles.length ? effectiveRoles : roles;
   const filteredMappings = mappings.filter((m) => shownRoles.includes(m.role));
+
+  if (catalogLoading) return <CatalogLoadingSkeleton label="Generating ontology…" />;
+  if (rebuilding) return <CatalogLoadingSkeleton label="Rebuilding…" />;
 
   return (
     <div className="space-y-6 max-w-6xl">
@@ -158,7 +162,11 @@ export function OntologyStudio() {
             // Keyed so the hook-bearing live component remounts per live product.
             <LiveValidation key={selectedProduct.product_name} />
           ) : (
-            <SchemaDerivedNotice tableCount={classes.length} columnCount={mappings.length} />
+            <SchemaDerivedNotice
+              tableCount={classes.length}
+              columnCount={mappings.length}
+              sourceCatalog={activeSourceCatalog}
+            />
           )}
         </CardContent>
       </Card>
@@ -169,18 +177,27 @@ export function OntologyStudio() {
 function SchemaDerivedNotice({
   tableCount,
   columnCount,
+  sourceCatalog,
 }: {
   tableCount: number;
   columnCount: number;
+  sourceCatalog?: string | null;
 }) {
   return (
     <div className="space-y-3">
       <div className="flex items-start gap-2 rounded-md bg-muted/50 p-3 text-sm">
         <Info className="h-4 w-4 mt-0.5 text-muted-foreground shrink-0" />
         <span className="text-muted-foreground">
-          This product's components are <span className="font-medium">schema-derived</span> from the
-          live <code>fc_entdata_gold</code> catalog (no governed serving layer yet). The mappings
-          above reflect the real source tables; build the serving views + contract to make it live.
+          This product's components are <span className="font-medium">schema-derived</span> from{' '}
+          {sourceCatalog ? (
+            <>
+              the live <code>{sourceCatalog}</code> catalog
+            </>
+          ) : (
+            'the source catalog'
+          )}{' '}
+          (no governed serving layer yet). The mappings above reflect the real source tables; build
+          the serving views + contract to make it live.
         </span>
       </div>
       <Table>

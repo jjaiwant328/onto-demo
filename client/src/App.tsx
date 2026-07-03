@@ -16,10 +16,26 @@ import {
   PopoverContent,
   Checkbox,
   Badge,
+  Switch,
+  Tooltip,
+  TooltipTrigger,
+  TooltipContent,
+  TooltipProvider,
   useIsMobile,
 } from '@databricks/appkit-ui/react';
-import { Menu, Store, Layers, Trash2, GitMerge, Database as DatabaseIcon, Target, RotateCcw } from 'lucide-react';
-import { ProductProvider, useProduct } from './lib/product';
+import {
+  Menu,
+  Store,
+  Layers,
+  Trash2,
+  GitMerge,
+  Split,
+  Database as DatabaseIcon,
+  Target,
+  RotateCcw,
+  Loader2,
+} from 'lucide-react';
+import { ProductProvider, useProduct, ALL_SCOPE } from './lib/product';
 import { ActionsContext, type ActionItem } from './lib/actions';
 import { DataProducts } from './pages/DataProducts';
 import { OntologyStudio } from './pages/OntologyStudio';
@@ -29,6 +45,7 @@ import { GraphExplorer } from './pages/GraphExplorer';
 import { DataContract } from './pages/DataContract';
 import { ActionCenter } from './pages/ActionCenter';
 import { PrintProduct } from './pages/PrintProduct';
+import { PrintActions } from './pages/PrintActions';
 import { SchemaLoader } from './components/SchemaLoader';
 import { Copilot } from './components/Copilot';
 
@@ -115,7 +132,6 @@ function PanelGroup({
 // Schemas multi-select list (checkbox + trash), inline in the sidebar.
 function SchemaList() {
   const {
-    customerId,
     schemaEntries,
     selectedSchemaIds,
     toggleSchema,
@@ -140,7 +156,7 @@ function SchemaList() {
       </div>
       <div className="flex flex-col gap-0.5 max-h-48 overflow-auto p-1">
         {schemaEntries.map((s) => {
-          const bundled = isBundledSchema(customerId, s.id);
+          const bundled = isBundledSchema(s.id);
           return (
             <div
               key={s.id}
@@ -158,7 +174,7 @@ function SchemaList() {
                 className="h-6 w-6 p-0 shrink-0"
                 disabled={bundled}
                 title={bundled ? 'Bundled schema — not removable' : 'Delete schema'}
-                onClick={() => removeSchema(customerId, s.id)}
+                onClick={() => removeSchema(s.id)}
               >
                 <Trash2 className={`h-3.5 w-3.5 ${bundled ? 'opacity-30' : 'text-destructive'}`} />
               </Button>
@@ -173,9 +189,18 @@ function SchemaList() {
   );
 }
 
-// Domain control: dropdown + delete-current + combine (2+ domains).
+// Domain control: dropdown + delete-current + combine (2+ domains) + un-merge.
 function DomainControl() {
-  const { domains, selectedDomain, setSelectedDomain, deleteDomain, combineDomains } = useProduct();
+  const {
+    domains,
+    domainScope,
+    domainScopeAll,
+    selectedDomain,
+    setSelectedDomain,
+    deleteDomain,
+    combineDomains,
+    unmergeDomain,
+  } = useProduct();
   const [combineOpen, setCombineOpen] = useState(false);
   const [toMerge, setToMerge] = useState<string[]>([]);
 
@@ -187,30 +212,50 @@ function DomainControl() {
   const toggleMerge = (name: string) =>
     setToMerge((prev) => (prev.includes(name) ? prev.filter((n) => n !== name) : [...prev, name]));
 
+  // un-merge is offered only when the effective domain is itself a merge
+  const isMerged = !domainScopeAll && Boolean(selectedDomain?.mergedFrom?.length);
+
   return (
     <div className="space-y-1.5">
-      <div className="flex gap-1.5">
-        {selectedDomain && (
-          <Select value={selectedDomain.name} onValueChange={setSelectedDomain}>
-            <SelectTrigger className="flex-1 h-9" aria-label="Domain">
-              <SelectValue placeholder="Domain" />
-            </SelectTrigger>
-            <SelectContent>
-              {domains.map((d) => (
-                <SelectItem key={d.name} value={d.name}>
-                  {d.label}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
+      <div className="flex items-center gap-1.5">
+        <Select value={domainScope} onValueChange={setSelectedDomain}>
+          <SelectTrigger className="flex-1 min-w-0 h-9" aria-label="Domain">
+            <SelectValue placeholder="Domain" className="truncate" />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value={ALL_SCOPE}>All domains</SelectItem>
+            {domains.map((d) => (
+              <SelectItem key={d.name} value={d.name}>
+                <span className="flex items-center gap-1.5">
+                  <span className="truncate">{d.label}</span>
+                  {d.dataAvailable && (
+                    <Badge variant="secondary" className="gap-1 text-[10px] px-1 py-0">
+                      <DatabaseIcon className="h-2.5 w-2.5" /> Data Avlbl
+                    </Badge>
+                  )}
+                </span>
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+        {isMerged && (
+          <Button
+            variant="outline"
+            size="icon"
+            className="h-9 w-9 shrink-0"
+            title="Un-merge — restore the original domains"
+            onClick={() => selectedDomain && unmergeDomain(selectedDomain.name)}
+          >
+            <Split className="h-4 w-4" />
+          </Button>
         )}
         <Button
           variant="outline"
           size="icon"
           className="h-9 w-9 shrink-0"
-          disabled={!selectedDomain || domains.length <= 1}
-          title="Delete this domain from the active catalog"
-          onClick={() => selectedDomain && deleteDomain(selectedDomain.name)}
+          disabled={domainScopeAll || !selectedDomain || domains.length <= 1}
+          title={domainScopeAll ? 'Pick a single domain to delete it' : 'Delete this domain from the active catalog'}
+          onClick={() => !domainScopeAll && selectedDomain && deleteDomain(selectedDomain.name)}
         >
           <Trash2 className="h-4 w-4 text-destructive" />
         </Button>
@@ -268,37 +313,13 @@ function DomainControl() {
 
 // The persistent left control panel content (shared by desktop rail + mobile sheet).
 function ControlPanel() {
-  const {
-    customers,
-    customerId,
-    setCustomer,
-    productsInDomain,
-    selectedProduct,
-    setSelectedProduct,
-    resetCustomers,
-  } = useProduct();
+  const { productsInDomain, productScope, setSelectedProduct, resetSchemas, catalogLoading, llmRefining } =
+    useProduct();
 
   return (
     <div className="flex flex-col gap-5">
       <PanelGroup icon={<DatabaseIcon className="h-3.5 w-3.5" />} title="Data source">
         <SchemaLoader />
-        <div className="space-y-1">
-          <label className="text-xs text-muted-foreground" htmlFor="customer-select">
-            Customer
-          </label>
-          <Select value={customerId} onValueChange={setCustomer}>
-            <SelectTrigger id="customer-select" className="w-full h-9" aria-label="Customer">
-              <SelectValue placeholder="Customer" />
-            </SelectTrigger>
-            <SelectContent>
-              {customers.map((c) => (
-                <SelectItem key={c.id} value={c.id}>
-                  {c.label}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-        </div>
         <div className="space-y-1">
           <span className="text-xs text-muted-foreground">Schemas</span>
           <SchemaList />
@@ -306,30 +327,44 @@ function ControlPanel() {
       </PanelGroup>
 
       <PanelGroup icon={<Target className="h-3.5 w-3.5" />} title="Scope">
+        {/* schema-switch / catalog-regeneration indicators */}
+        {(catalogLoading || llmRefining) && (
+          <div className="flex flex-wrap items-center gap-2">
+            {catalogLoading && (
+              <span className="flex items-center gap-1.5 text-xs text-muted-foreground">
+                <Loader2 className="h-3.5 w-3.5 animate-spin" /> Generating catalog…
+              </span>
+            )}
+            {llmRefining && (
+              <Badge variant="outline" className="gap-1 text-[11px] font-normal animate-pulse">
+                <Loader2 className="h-3 w-3 animate-spin" /> AI refining labels…
+              </Badge>
+            )}
+          </div>
+        )}
         <div className="space-y-1">
           <span className="text-xs text-muted-foreground">Domain</span>
           <DomainControl />
         </div>
-        {selectedProduct && (
-          <div className="space-y-1">
-            <label className="text-xs text-muted-foreground" htmlFor="product-select">
-              Product
-            </label>
-            <Select value={selectedProduct.product_name} onValueChange={setSelectedProduct}>
-              <SelectTrigger id="product-select" className="w-full h-9" aria-label="Data product">
-                <SelectValue placeholder="Data product" />
-              </SelectTrigger>
-              <SelectContent>
-                {productsInDomain.map((p) => (
-                  <SelectItem key={p.product_name} value={p.product_name}>
-                    {p.display_name}
-                    {p.live ? ' ●' : ''}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </div>
-        )}
+        <div className="space-y-1 min-w-0">
+          <label className="text-xs text-muted-foreground" htmlFor="product-select">
+            Product
+          </label>
+          <Select value={productScope} onValueChange={setSelectedProduct}>
+            <SelectTrigger id="product-select" className="w-full h-9" aria-label="Data product">
+              <SelectValue placeholder="Data product" className="truncate" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value={ALL_SCOPE}>All products</SelectItem>
+              {productsInDomain.map((p) => (
+                <SelectItem key={p.product_name} value={p.product_name}>
+                  {p.display_name}
+                  {p.live ? ' ●' : ''}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </div>
       </PanelGroup>
 
       <div className="space-y-2 border-t pt-4">
@@ -338,13 +373,40 @@ function ControlPanel() {
           variant="ghost"
           size="sm"
           className="w-full gap-1.5 text-muted-foreground"
-          onClick={resetCustomers}
-          title="Clear state and restore Retailer + QSR"
+          onClick={resetSchemas}
+          title="Clear state and restore the built-in schemas"
         >
           <RotateCcw className="h-3.5 w-3.5" /> Reset
         </Button>
       </div>
     </div>
+  );
+}
+
+// Toggle (top-right of the content area): when ON, in-section interactions
+// (Graph Explorer node travel, Data Products row clicks) update the left-panel
+// scope; OFF (default) = view-only. Persisted via context.
+function ScopeSyncToggle() {
+  const { syncScopeFromSections, setSyncScopeFromSections } = useProduct();
+  return (
+    <TooltipProvider>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <label className="flex items-center gap-2 text-xs text-muted-foreground cursor-pointer whitespace-nowrap">
+            <Switch
+              checked={syncScopeFromSections}
+              onCheckedChange={setSyncScopeFromSections}
+              aria-label="Selections update scope"
+            />
+            <span className="hidden sm:inline">Selections update scope</span>
+          </label>
+        </TooltipTrigger>
+        <TooltipContent>
+          When on, clicking a product in a section (Data Products rows, Graph Explorer nodes) updates
+          the left-panel Domain/Product scope. Off = view-only.
+        </TooltipContent>
+      </Tooltip>
+    </TooltipProvider>
   );
 }
 
@@ -365,7 +427,7 @@ function Layout() {
               <Menu className="h-5 w-5" />
               <span className="sr-only">Open controls</span>
             </Button>
-            <SheetContent side="left" className="w-[320px] overflow-y-auto">
+            <SheetContent side="left" className="w-[340px] sm:w-[380px] overflow-y-auto">
               <SheetHeader>
                 <SheetTitle>Controls</SheetTitle>
               </SheetHeader>
@@ -377,7 +439,7 @@ function Layout() {
         </div>
         <div className="flex items-center gap-2">
           <Store className="h-5 w-5 text-primary" />
-          <h1 className="text-lg font-semibold text-foreground">RT_onto_demo</h1>
+          <h1 className="text-lg font-semibold text-foreground">Ontology-demo</h1>
           <Badge variant="outline" className="hidden sm:inline-flex">
             AppKit
           </Badge>
@@ -386,14 +448,19 @@ function Layout() {
 
       <div className="flex-1 flex min-h-0">
         {/* persistent left control panel (desktop) */}
-        <aside className="hidden md:block w-72 shrink-0 border-r overflow-y-auto p-4">
+        <aside className="hidden md:block w-80 lg:w-96 shrink-0 border-r overflow-y-auto p-4">
           <ControlPanel />
         </aside>
 
-        {/* main content: top section tabs + routed page */}
+        {/* main content: top section tabs + scope-sync toggle + routed page */}
         <div className="flex-1 flex flex-col min-w-0">
-          <div className="border-b px-4 md:px-6 py-2 overflow-x-auto">
-            <NavLinks className="flex gap-1 min-w-max" linkClass={navLinkClass} />
+          <div className="border-b px-4 md:px-6 py-2 flex items-center gap-4">
+            <div className="overflow-x-auto">
+              <NavLinks className="flex gap-1 min-w-max" linkClass={navLinkClass} />
+            </div>
+            <div className="ml-auto shrink-0">
+              <ScopeSyncToggle />
+            </div>
           </div>
           <main className="flex-1 p-4 md:p-6 overflow-y-auto">
             <Outlet />
@@ -424,7 +491,8 @@ const router = createBrowserRouter([
       { path: '*', element: <Navigate to="/data-products" replace /> },
     ],
   },
-  // standalone print route (no app chrome) for clean PDF export
+  // standalone print routes (no app chrome) for clean PDF export
+  { path: '/print/actions', element: <PrintActions /> },
   { path: '/print/:productName', element: <PrintProduct /> },
 ]);
 

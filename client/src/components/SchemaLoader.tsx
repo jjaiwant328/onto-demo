@@ -3,7 +3,8 @@
 //   • Upload CSV      — a describe_table_extended.csv
 //   • Live connection — introspect information_schema via the attached warehouse,
 //                       with catalog/schema dropdowns AND wildcard patterns.
-// "Reset to default" restores the bundled catalog.
+// Schemas are the top-level unit (no customer layer): a loaded schema is added to
+// the flat registry and selected. "Reset" restores the bundled schemas.
 import { useRef, useState, useEffect } from 'react';
 import {
   Button,
@@ -23,44 +24,34 @@ import {
   Input,
   Label,
 } from '@databricks/appkit-ui/react';
-import { Upload, RotateCcw, Loader2, Database, Plug, Filter, Users, Trash2, Save } from 'lucide-react';
+import { Upload, RotateCcw, Loader2, Database, Plug, Filter, Trash2, Save } from 'lucide-react';
 import { useProduct } from '../lib/product';
 import { parseDescribeCsv } from '../lib/catalogGen';
 import { filterBusinessSchema } from '../lib/schemaFilter';
 import type { Schema } from '../lib/deriveComponents';
 
-const NEW_CUSTOMER = '__new__';
-
 export function SchemaLoader() {
   const {
-    customers,
-    customerId,
+    schemaEntries,
     addSchema,
-    resetCustomers,
+    resetSchemas,
     isBundledSchema,
     removeSchema,
-    removeCustomer,
     savedSchemas,
     saveSchema,
     deleteSavedSchema,
-    setCustomer,
-    toggleSchema,
+    setSelectedSchemas,
   } = useProduct();
-  const activeCustomer = customers.find((c) => c.id === customerId);
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState<string | null>(null);
   const [filterNote, setFilterNote] = useState<string | null>(null);
   const [includeSystem, setIncludeSystem] = useState(false); // filter ON by default
   const [storeOnLoad, setStoreOnLoad] = useState(false); // persist to the durable store
-  // customer assignment for the loaded schema.
-  // DEFAULT to "New customer…" so an upload NEVER silently appends to a built-in
-  // (Retailer/QSR) — the user must explicitly pick an existing customer to append.
-  const [targetCustomer, setTargetCustomer] = useState<string>(NEW_CUSTOMER);
-  const [newCustomerName, setNewCustomerName] = useState('');
   const [schemaLabel, setSchemaLabel] = useState('');
-  const [pendingFollowNew, setPendingFollowNew] = useState(false);
+  // optional grouping label saved to the store's `customer` field
+  const [groupLabel, setGroupLabel] = useState('');
 
-  // shared: filter noise schemas → assign to a customer (provider generates the catalog).
+  // shared: filter noise schemas → add to the flat registry + select it.
   const applySchema = async (rawSchema: Schema, label: string) => {
     if (Object.keys(rawSchema).length === 0) throw new Error('No tables found.');
 
@@ -79,8 +70,6 @@ export function SchemaLoader() {
       setFilterNote(includeSystem ? 'Filter off — all schemas included.' : 'No noise schemas detected.');
     }
 
-    const isNew = targetCustomer === NEW_CUSTOMER;
-    const custName = isNew ? newCustomerName.trim() || 'New customer' : targetCustomer;
     // default label = the detected UC schema names, so entries are distinguishable
     const ucSchemas = Array.from(new Set(Object.keys(schema).map((k) => k.split('.')[0]))).slice(0, 3);
     const entryLabel = schemaLabel.trim() || ucSchemas.join(', ') || `${label} schema`;
@@ -90,13 +79,12 @@ export function SchemaLoader() {
       label: entryLabel,
       schema,
     };
-    addSchema(custName, entry, isNew);
-    const custLabel = isNew ? custName : customers.find((c) => c.id === custName)?.label ?? custName;
+    addSchema(entry);
     let storeNote = '';
     if (storeOnLoad) {
       setStatus(`Storing "${entryLabel}" to the durable schema store…`);
       const r = await saveSchema({
-        customer: custLabel,
+        customer: groupLabel.trim() || entryLabel,
         schemaName: entryLabel,
         source: label.toLowerCase(),
         schema,
@@ -105,24 +93,10 @@ export function SchemaLoader() {
         ? ' · stored durably (survives reloads)'
         : ` · store failed: ${r.error ?? 'unknown'}`;
     }
-    setStatus(
-      `Added "${entryLabel}" (${tableCount} business tables) to customer "${custLabel}".${storeNote}`
-    );
+    setStatus(`Added "${entryLabel}" (${tableCount} business tables) and selected it.${storeNote}`);
     setSchemaLabel('');
-    setNewCustomerName('');
-    // For a NEW customer, follow it so a second upload can be appended to the
-    // SAME new customer (the provider makes it active). For an EXISTING customer,
-    // reset back to "New customer…" so the next upload doesn't silently append.
-    setPendingFollowNew(isNew);
+    setGroupLabel('');
   };
-
-  // after creating a NEW customer, point the picker at it (provider activates it)
-  useEffect(() => {
-    if (pendingFollowNew) {
-      setTargetCustomer(customerId);
-      setPendingFollowNew(false);
-    }
-  }, [customerId, pendingFollowNew]);
 
   return (
     <Popover>
@@ -135,111 +109,73 @@ export function SchemaLoader() {
       <PopoverContent className="w-[460px]" align="start">
         <div className="space-y-3">
           <div className="flex items-center justify-between">
-            <div className="text-sm font-semibold">Load a schema into a customer</div>
+            <div className="text-sm font-semibold">Load a schema</div>
             <Button
               size="sm"
               variant="outline"
               className="gap-1.5"
               onClick={() => {
-                resetCustomers();
-                setStatus('Reset customers to defaults (Retailer + QSR).');
+                resetSchemas();
+                setStatus('Reset to the built-in schemas.');
                 setFilterNote(null);
-                setTargetCustomer(NEW_CUSTOMER);
               }}
               disabled={busy}
-              title="Clear all uploaded customers/schemas and restore Retailer + QSR"
+              title="Clear all loaded schemas and restore the built-in schemas"
             >
-              <RotateCcw className="h-4 w-4" /> Reset customers
+              <RotateCcw className="h-4 w-4" /> Reset
             </Button>
           </div>
 
-          {/* Manage the active customer's schemas (remove appended; delete user customer) */}
-          {activeCustomer && (
-            <div className="rounded-md border p-2 space-y-1.5">
-              <div className="flex items-center justify-between">
-                <span className="text-xs font-medium flex items-center gap-1.5">
-                  <Users className="h-3.5 w-3.5" /> {activeCustomer.label} — schemas (
-                  {activeCustomer.schemas.length})
-                </span>
-                {!activeCustomer.builtin && (
-                  <Button
-                    size="sm"
-                    variant="ghost"
-                    className="h-6 gap-1 text-xs text-destructive"
-                    onClick={() => {
-                      removeCustomer(activeCustomer.id);
-                      setStatus(`Deleted customer "${activeCustomer.label}".`);
-                    }}
+          {/* Manage the registry (remove loaded schemas; bundled protected) */}
+          <div className="rounded-md border p-2 space-y-1.5">
+            <span className="text-xs font-medium">Schemas ({schemaEntries.length})</span>
+            <div className="flex flex-col gap-0.5">
+              {schemaEntries.map((s) => {
+                const bundled = isBundledSchema(s.id);
+                return (
+                  <div
+                    key={s.id}
+                    className="flex items-center justify-between text-xs rounded px-1.5 py-1 hover:bg-muted"
                   >
-                    <Trash2 className="h-3 w-3" /> Delete customer
-                  </Button>
-                )}
-              </div>
-              <div className="flex flex-col gap-0.5">
-                {activeCustomer.schemas.map((s) => {
-                  const bundled = isBundledSchema(activeCustomer.id, s.id);
-                  return (
-                    <div
-                      key={s.id}
-                      className="flex items-center justify-between text-xs rounded px-1.5 py-1 hover:bg-muted"
+                    <span className="truncate">
+                      {s.label}
+                      {bundled && <span className="text-muted-foreground"> · bundled</span>}
+                    </span>
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      className="h-6 w-6 p-0"
+                      disabled={bundled}
+                      title={bundled ? 'Bundled schema — not removable' : 'Remove schema'}
+                      onClick={() => {
+                        removeSchema(s.id);
+                        setStatus(`Removed schema "${s.label}".`);
+                      }}
                     >
-                      <span className="truncate">
-                        {s.label}
-                        {bundled && <span className="text-muted-foreground"> · bundled</span>}
-                      </span>
-                      <Button
-                        size="sm"
-                        variant="ghost"
-                        className="h-6 w-6 p-0"
-                        disabled={bundled}
-                        title={bundled ? 'Bundled schema — not removable' : 'Remove schema'}
-                        onClick={() => {
-                          removeSchema(activeCustomer.id, s.id);
-                          setStatus(`Removed schema "${s.label}" from "${activeCustomer.label}".`);
-                        }}
-                      >
-                        <Trash2
-                          className={`h-3.5 w-3.5 ${bundled ? 'opacity-30' : 'text-destructive'}`}
-                        />
-                      </Button>
-                    </div>
-                  );
-                })}
-              </div>
+                      <Trash2
+                        className={`h-3.5 w-3.5 ${bundled ? 'opacity-30' : 'text-destructive'}`}
+                      />
+                    </Button>
+                  </div>
+                );
+              })}
             </div>
-          )}
+          </div>
 
-          {/* customer assignment */}
+          {/* labels for the loaded schema */}
           <div className="space-y-1">
-            <Label className="text-xs flex items-center gap-1.5">
-              <Users className="h-3.5 w-3.5" /> Assign to customer
-            </Label>
-            <Select value={targetCustomer} onValueChange={setTargetCustomer}>
-              <SelectTrigger className="w-full">
-                <SelectValue placeholder="Customer" />
-              </SelectTrigger>
-              <SelectContent>
-                {customers.map((c) => (
-                  <SelectItem key={c.id} value={c.id}>
-                    {c.label}
-                  </SelectItem>
-                ))}
-                <SelectItem value={NEW_CUSTOMER}>New customer…</SelectItem>
-              </SelectContent>
-            </Select>
-            {targetCustomer === NEW_CUSTOMER && (
-              <Input
-                className="text-xs"
-                placeholder="New customer name"
-                value={newCustomerName}
-                onChange={(e) => setNewCustomerName(e.target.value)}
-              />
-            )}
+            <Label className="text-xs">Schema label (optional)</Label>
             <Input
               className="text-xs"
-              placeholder="Schema label (optional, e.g. 'QSR bronze')"
+              placeholder="e.g. 'QSR bronze' (defaults to detected UC schema)"
               value={schemaLabel}
               onChange={(e) => setSchemaLabel(e.target.value)}
+            />
+            <Input
+              className="text-xs"
+              placeholder="Group label for the durable store (optional)"
+              value={groupLabel}
+              onChange={(e) => setGroupLabel(e.target.value)}
             />
           </div>
 
@@ -328,15 +264,9 @@ export function SchemaLoader() {
                         variant="ghost"
                         className="h-6 px-2 text-xs"
                         onClick={() => {
-                          // select the owning customer + its saved entry (content lazy-loads)
-                          const cust = customers.find(
-                            (c) => c.label.toLowerCase() === s.customer.toLowerCase() && !c.builtin
-                          );
-                          if (cust) {
-                            setCustomer(cust.id);
-                            toggleSchema(`saved:${s.schema_id}`);
-                            setStatus(`Loaded saved schema "${s.schema_name}".`);
-                          }
+                          // select the saved entry alone (content lazy-loads from the volume)
+                          setSelectedSchemas([`saved:${s.schema_id}`]);
+                          setStatus(`Loaded saved schema "${s.schema_name}".`);
                         }}
                       >
                         Load

@@ -93,13 +93,43 @@ const FLAGSHIP_CONTRACT: DataContract = {
   },
 };
 
+// Extract the source "catalog" from the product's tables. Tables are keyed like
+// `<catalog_or_schema>.<...>.<table>`; the leading segment is the best available
+// catalog/namespace for the active schema. Falls back to a caller-provided value
+// or a generic placeholder — never a hardcoded Retailer catalog.
+function sourceCatalogOf(components: DerivedComponents, fallback?: string): string | null {
+  const anchor =
+    components.tables.find((t) => t.role === 'fact')?.table ??
+    components.tables[0]?.table ??
+    '';
+  const parts = anchor.split('.');
+  if (parts.length >= 2 && parts[0]) return parts[0]; // catalog/namespace-qualified
+  return fallback ?? null;
+}
+
 export function deriveContract(
   product: CatalogProduct,
-  components: DerivedComponents
+  components: DerivedComponents,
+  opts?: { sourceCatalog?: string }
 ): DataContract {
   if (product.live && product.product_name === FLAGSHIP_CONTRACT.product) {
     return FLAGSHIP_CONTRACT;
   }
+
+  // active source catalog/namespace (derived from the real source tables)
+  const srcCatalog = sourceCatalogOf(components, opts?.sourceCatalog);
+  // anchor short-name for the planned serving object (jai_<anchor>)
+  const anchorTable =
+    components.tables.find((t) => t.role === 'fact')?.table ??
+    components.tables[0]?.table ??
+    product.product_name;
+  const anchorShort = shortTable(anchorTable).replace(/^jai_/, '');
+  // planned governed target under the active catalog (never hardcode jai_ontos)
+  const targetCatalog = srcCatalog ?? '<catalog>';
+  const plannedServing = `${targetCatalog}.governed.jai_${anchorShort} (planned)`;
+  const sourceCatalogPhrase = srcCatalog
+    ? `the live ${srcCatalog} catalog`
+    : 'the source catalog';
 
   // schema = union of the product's fact-table columns (the serving grain),
   // taken from the derived mappings/tables.
@@ -162,7 +192,7 @@ export function deriveContract(
     name: `${product.product_name}_contract`,
     product: product.product_name,
     status: 'defined',
-    serving_object: `jai_ontos.demo_schema.${product.product_name} (planned)`,
+    serving_object: plannedServing,
     grain,
     live: false,
     schema,
@@ -176,10 +206,10 @@ export function deriveContract(
       excluded: 'customer PII; cross-domain measures not in the listed sources',
     },
     assumptions: [
-      'Schema-derived from the live fc_entdata_gold catalog — not yet materialized as a governed serving view.',
+      `Schema-derived from ${sourceCatalogPhrase} — not yet materialized as a governed serving view.`,
       'Keys/measures inferred heuristically from column names + types.',
       'Quality checks are candidate rules to confirm with the data owner.',
     ],
-    lineage: { sources, serving: `jai_ontos.demo_schema.${product.product_name} (planned)` },
+    lineage: { sources, serving: plannedServing },
   };
 }

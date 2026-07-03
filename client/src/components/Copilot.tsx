@@ -4,7 +4,7 @@
 // snapshot. If the response includes a structured action, an "Add to action queue"
 // button pushes it into the Action Center (shared `actions` context). Gated on
 // /api/llm-status — disabled with an explanation when the LLM is unavailable.
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router';
 import {
   Button,
@@ -15,11 +15,13 @@ import {
   ScrollArea,
   Input,
   Badge,
+  Checkbox,
 } from '@databricks/appkit-ui/react';
-import { Sparkles, Send, Plus, Bot } from 'lucide-react';
+import { Sparkles, Send, Plus, Bot, Database } from 'lucide-react';
 import { useProduct } from '../lib/product';
 import { useActions, type ActionItem } from '../lib/actions';
 import { componentsSummary } from '../lib/summary';
+import { isDemoProduct } from '../../../shared/demoDomains';
 
 type Msg = {
   role: 'user' | 'assistant';
@@ -32,6 +34,8 @@ export function Copilot() {
   const navigate = useNavigate();
   const { selectedProduct, components, isolationKey } = useProduct();
   const { addAction } = useActions();
+  const dataAvailable = Boolean(selectedProduct.dataAvailable) && isDemoProduct(selectedProduct.product_name);
+  const [useData, setUseData] = useState(true); // grounds on real backing data when available
   const [open, setOpen] = useState(false);
   const [llmAvailable, setLlmAvailable] = useState<boolean | null>(null);
   const [input, setInput] = useState('');
@@ -56,8 +60,40 @@ export function Copilot() {
     setMessages([]);
   }, [isolationKey]);
 
-  const send = async () => {
-    const q = input.trim();
+  // context-sensitive example questions, derived deterministically from the
+  // ACTIVE product's components (no extra LLM call). Recomputes on selection.
+  const suggestions = useMemo(() => {
+    const name = selectedProduct?.display_name ?? 'this product';
+    const factShort = components.tables.find((t) => t.role === 'fact')?.label;
+    const dimShort = components.tables.find((t) => t.role === 'dim')?.label;
+    const anchorTable = components.tables.find((t) => t.role === 'fact') ?? components.tables[0];
+    const measure = components.measures[0]?.measure ?? components.kpis[0];
+    const chips: string[] = [];
+    // for data-backed products, lead with data-questions against the real rows
+    if (dataAvailable) {
+      const dataChip: Record<string, string> = {
+        dq_test_failures: 'Which DQ tests are failing and how bad?',
+        table_freshness: 'Which tables are stale and by how long?',
+        pipeline_health: 'Which pipelines are failing and retrying?',
+        forecast_accuracy: 'Which items have the worst forecast accuracy?',
+        inventory_stockout_risk: 'Which items are at stockout risk?',
+        purchase_order_fulfillment: 'Which purchase orders are late?',
+      };
+      const q = dataChip[selectedProduct.product_name];
+      if (q) chips.push(q);
+      chips.push(`Summarize the exceptions in ${name}.`);
+    }
+    chips.push(`Summarize the ${name} data product.`);
+    if (measure) chips.push(`What does ${measure} measure and how is it calculated?`);
+    chips.push(`Which tables feed ${name}?`);
+    if (anchorTable) chips.push(`Which columns are in ${anchorTable.label ?? anchorTable.table}?`);
+    else if (dimShort) chips.push(`What are the key dimensions of ${dimShort}?`);
+    else if (factShort) chips.push(`What are the key dimensions of ${factShort}?`);
+    return chips.slice(0, 4);
+  }, [selectedProduct, components, dataAvailable]);
+
+  const send = async (question?: string) => {
+    const q = (question ?? input).trim();
     if (!q || busy) return;
     setInput('');
     const history = messages.map((m) => ({ role: m.role, content: m.content }));
@@ -71,6 +107,7 @@ export function Copilot() {
           question: q,
           product: selectedProduct.product_name,
           live: components.live,
+          useData: dataAvailable && useData,
           productContext: componentsSummary(components),
           history,
         }),
@@ -119,23 +156,68 @@ export function Copilot() {
         <SheetHeader>
           <SheetTitle className="flex items-center gap-2">
             <Bot className="h-4 w-4" /> Ontology Copilot
+            {dataAvailable && (
+              <Badge variant="default" className="gap-1">
+                <Database className="h-3 w-3" /> Data Avlbl
+              </Badge>
+            )}
             {llmAvailable === false && <Badge variant="outline">unavailable</Badge>}
           </SheetTitle>
         </SheetHeader>
 
-        <div className="text-xs text-muted-foreground border-b pb-2">
+        {/* input + suggestion chips pinned at the TOP of the panel body */}
+        {llmAvailable === false ? (
+          <div className="text-xs text-muted-foreground border-b pb-2">
+            The Foundation Model endpoint isn't configured for this deployment, so the Copilot is
+            disabled. The ontology, contract, and graph views still work without it.
+          </div>
+        ) : (
+          <div className="space-y-2 border-b pb-3">
+            <div className="flex gap-2">
+              <Input
+                placeholder="Ask about this product…"
+                value={input}
+                onChange={(e) => setInput(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') send();
+                }}
+                disabled={busy || llmAvailable === null}
+              />
+              <Button size="icon" onClick={() => send()} disabled={busy || !input.trim()} aria-label="Send">
+                <Send className="h-4 w-4" />
+              </Button>
+            </div>
+            {dataAvailable && (
+              <label className="flex items-center gap-2 text-xs text-muted-foreground cursor-pointer">
+                <Checkbox checked={useData} onCheckedChange={(v) => setUseData(Boolean(v))} />
+                Use Data Avlbl (ground answers on the real backing data)
+              </label>
+            )}
+            <div className="flex flex-wrap gap-1.5">
+              {suggestions.map((s) => (
+                <button
+                  key={s}
+                  type="button"
+                  disabled={busy}
+                  onClick={() => send(s)}
+                  className="rounded-full border px-2.5 py-1 text-[11px] text-muted-foreground hover:bg-muted hover:text-foreground disabled:opacity-50 transition-colors text-left"
+                >
+                  {s}
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+
+        <div className="text-xs text-muted-foreground pt-2">
           Grounded in <span className="font-medium">{selectedProduct.display_name}</span>'s ontology,
           measures, and {components.live ? 'a live data snapshot' : 'schema-derived components'}.
         </div>
 
-        <ScrollArea className="flex-1 -mx-2 px-2">
+        {/* bounded, scrollable conversation (min-h-0 lets the flex child shrink so
+            the ScrollArea actually scrolls instead of growing the panel) */}
+        <ScrollArea className="flex-1 min-h-0 max-h-[calc(100vh-16rem)] -mx-2 px-2">
           <div className="space-y-3 py-3">
-            {messages.length === 0 && (
-              <div className="text-sm text-muted-foreground">
-                Ask about this product — e.g. “Which KPI flags overstaffed stores and how is it
-                computed?” or “What should we do about the worst labor-cost store?”
-              </div>
-            )}
             {messages.map((m, i) => (
               <div key={i} className={m.role === 'user' ? 'text-right' : ''}>
                 <div
@@ -178,31 +260,14 @@ export function Copilot() {
               </div>
             ))}
             {busy && <div className="text-sm text-muted-foreground">Thinking…</div>}
+            {messages.length === 0 && !busy && (
+              <div className="text-sm text-muted-foreground">
+                Ask about this product using the box above, or tap a suggestion.
+              </div>
+            )}
             <div ref={scrollEnd} />
           </div>
         </ScrollArea>
-
-        {llmAvailable === false ? (
-          <div className="text-xs text-muted-foreground border-t pt-2">
-            The Foundation Model endpoint isn't configured for this deployment, so the Copilot is
-            disabled. The ontology, contract, and graph views still work without it.
-          </div>
-        ) : (
-          <div className="flex gap-2 border-t pt-2">
-            <Input
-              placeholder="Ask about this product…"
-              value={input}
-              onChange={(e) => setInput(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter') send();
-              }}
-              disabled={busy || llmAvailable === null}
-            />
-            <Button size="icon" onClick={send} disabled={busy || !input.trim()} aria-label="Send">
-              <Send className="h-4 w-4" />
-            </Button>
-          </div>
-        )}
       </SheetContent>
     </Sheet>
   );

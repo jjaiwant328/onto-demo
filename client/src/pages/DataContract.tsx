@@ -23,10 +23,10 @@ import { deriveContract } from '../lib/contract';
 
 export function DataContract() {
   const navigate = useNavigate();
-  const { selectedProduct, components } = useProduct();
+  const { selectedProduct, components, activeSourceCatalog } = useProduct();
   const contract = useMemo(
-    () => deriveContract(selectedProduct, components),
-    [selectedProduct, components]
+    () => deriveContract(selectedProduct, components, { sourceCatalog: activeSourceCatalog ?? undefined }),
+    [selectedProduct, components, activeSourceCatalog]
   );
 
   return (

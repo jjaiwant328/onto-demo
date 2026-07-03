@@ -23,12 +23,20 @@ export type CatalogProduct = {
   kpis: string[];
   live?: boolean;
   maturity: string;
+  // data-backed demo product: real backing table + exception data in the serving
+  // schema. Surfaced as a "Data Avlbl" badge and enables the "Use Data Avlbl" path.
+  dataAvailable?: boolean;
 };
 export type CatalogDomain = {
   name: string;
   label: string;
   description: string;
   products: CatalogProduct[];
+  // when this domain is a session merge of others, the original domain names
+  // (used to offer an "un-merge" that restores the constituents from the base).
+  mergedFrom?: string[];
+  // true for the injected data-backed demo domains
+  dataAvailable?: boolean;
 };
 export type Catalog = { domains: CatalogDomain[] };
 
@@ -516,10 +524,16 @@ export function buildEnterpriseGraph(
     (nodeDomains.get(id) ?? nodeDomains.set(id, new Set()).get(id)!).add(domainName);
   };
 
-  // 1. enterprise root
+  // 1. enterprise root — derive the label from the ACTIVE schema (never hardcode
+  // a specific schema name, or a non-Retailer selection appears to leak Retailer).
+  const rootPrefix = (() => {
+    const firstTable = Object.keys(schema)[0] ?? '';
+    const ucSchema = firstTable.includes('.') ? firstTable.split('.')[0] : firstTable;
+    return ucSchema || 'Active';
+  })();
   nodes[ENTERPRISE_ROOT_ID] = {
     id: ENTERPRISE_ROOT_ID,
-    label: 'fc_entdata_gold Enterprise',
+    label: `${rootPrefix} Enterprise`,
     kind: 'enterprise',
     kindLabel: ENTERPRISE_KIND_LABEL.enterprise,
     color: ENTERPRISE_KIND_COLOR.enterprise,

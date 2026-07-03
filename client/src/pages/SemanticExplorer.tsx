@@ -1,5 +1,6 @@
 // Semantic Explorer — lineage relationships (FK edges) + measures/KPIs + an
-// entity → property drill-down, all derived for the selected product.
+// entity → property drill-down, aggregated across the active SCOPE (all/domain/
+// product) so it reflects the left-panel selection, not just one product.
 import { useMemo, useState } from 'react';
 import {
   Card,
@@ -23,13 +24,60 @@ import {
   SelectItem,
   SelectTrigger,
   SelectValue,
+  Tooltip,
+  TooltipTrigger,
+  TooltipContent,
+  TooltipProvider,
 } from '@databricks/appkit-ui/react';
-import { ArrowRight } from 'lucide-react';
+import { ArrowRight, Info } from 'lucide-react';
 import { useProduct } from '../lib/product';
+import { deriveProduct } from '../lib/deriveComponents';
+import { CatalogLoadingSkeleton } from '../components/LoadingSkeleton';
 
 export function SemanticExplorer() {
-  const { components, selectedProduct } = useProduct();
-  const { relationships, measures, mappings } = components;
+  const {
+    components,
+    selectedProduct,
+    catalogLoading,
+    rebuilding,
+    scopedProducts,
+    schema,
+    domainScopeAll,
+    productScopeAll,
+    selectedDomain,
+  } = useProduct();
+
+  // aggregate relationships + measures + mappings across the SCOPED products
+  // (all → every product; a domain → its products; a single product → just it).
+  const { relationships, measures, mappings, scopeLabel } = useMemo(() => {
+    const products = scopedProducts.length ? scopedProducts : [selectedProduct];
+    const perProduct = products.map((p) => deriveProduct(p, schema));
+    const relKey = (r: (typeof perProduct)[number]['relationships'][number]) =>
+      `${r.from.join(',')}|${r.predicate}|${r.to}`;
+    const relMap = new Map<string, (typeof perProduct)[number]['relationships'][number]>();
+    const measMap = new Map<string, (typeof perProduct)[number]['measures'][number]>();
+    const mapMap = new Map<string, (typeof perProduct)[number]['mappings'][number]>();
+    for (const c of perProduct) {
+      for (const r of c.relationships) if (!relMap.has(relKey(r))) relMap.set(relKey(r), r);
+      for (const m of c.measures) if (!measMap.has(m.measure)) measMap.set(m.measure, m);
+      for (const m of c.mappings) {
+        const k = `${m.class}.${m.property}`;
+        if (!mapMap.has(k)) mapMap.set(k, m);
+      }
+    }
+    const label = productScopeAll
+      ? domainScopeAll
+        ? 'all domains'
+        : (selectedDomain?.label ?? 'the selected domain')
+      : selectedProduct.display_name;
+    return {
+      relationships: [...relMap.values()],
+      measures: [...measMap.values()],
+      mappings: [...mapMap.values()],
+      scopeLabel: label,
+    };
+    // fall back to single-product components when scope is empty
+  }, [scopedProducts, selectedProduct, schema, domainScopeAll, productScopeAll, selectedDomain]);
 
   const classes = useMemo(
     () => Array.from(new Set(mappings.map((m) => m.class))),
@@ -39,13 +87,34 @@ export function SemanticExplorer() {
   const effectiveClass = classes.includes(activeClass) ? activeClass : (classes[0] ?? '');
   const classProps = mappings.filter((m) => m.class === effectiveClass);
 
+  if (catalogLoading) return <CatalogLoadingSkeleton label="Generating semantics…" />;
+  if (rebuilding) return <CatalogLoadingSkeleton label="Rebuilding…" />;
+  // keep components referenced (single-product baseline / live flag) without warnings
+  void components;
+
   return (
     <div className="space-y-6 max-w-6xl">
       <div>
-        <h2 className="text-2xl font-bold text-foreground">Semantic Explorer</h2>
+        <h2 className="text-2xl font-bold text-foreground flex items-center gap-2">
+          Semantic Explorer
+          <TooltipProvider>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <button type="button" aria-label="How this is populated" className="text-muted-foreground">
+                  <Info className="h-4 w-4" />
+                </button>
+              </TooltipTrigger>
+              <TooltipContent className="max-w-xs">
+                Populated from the selected scope's components: <b>relationships</b> = shared-key / FK
+                edges inferred between the products' tables; <b>measures</b> = numeric fact columns +
+                declared KPIs. Aggregated (de-duped) across the scoped products.
+              </TooltipContent>
+            </Tooltip>
+          </TooltipProvider>
+        </h2>
         <p className="text-muted-foreground">
-          Relationships and measures for{' '}
-          <span className="font-medium">{selectedProduct.display_name}</span>.
+          Relationships and measures for <span className="font-medium">{scopeLabel}</span> (
+          {relationships.length} relationships · {measures.length} measures).
         </p>
       </div>
 

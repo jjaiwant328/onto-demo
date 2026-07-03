@@ -354,7 +354,7 @@ function LiveBusinessView() {
 // Non-live products: no warehouse query, no fabricated data. Show the derived
 // KPI definitions and the real fact-table column shapes, with a clear notice.
 function SchemaDerivedBusinessView() {
-  const { components, selectedProduct } = useProduct();
+  const { components, selectedProduct, activeSourceCatalog } = useProduct();
   const factTables = components.tables.filter((t) => t.role === 'fact');
 
   return (
@@ -369,8 +369,9 @@ function SchemaDerivedBusinessView() {
         <span className="text-muted-foreground">
           <span className="font-medium text-foreground">Schema-derived preview</span> — no live
           serving layer for this product yet. The KPI definitions and fact-table shapes below are
-          derived from the live <code>fc_entdata_gold</code> schema; build the serving views to light
-          up live metrics, charts, and filters (as on the flagship product).
+          derived from {activeSourceCatalog ? <>the live <code>{activeSourceCatalog}</code> schema</> : 'the source schema'};
+          build the serving views to light up live metrics, charts, and filters (as on the flagship
+          product).
         </span>
       </div>
 

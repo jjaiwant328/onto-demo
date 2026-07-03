@@ -21,6 +21,7 @@ import { X, Database, KeyRound, Link2, Info, Activity, Layers } from 'lucide-rea
 import { useNavigate } from 'react-router';
 import { useProduct } from '../lib/product';
 import { Badge } from '@databricks/appkit-ui/react';
+import { CatalogLoadingSkeleton } from '../components/LoadingSkeleton';
 import { CytoscapeCanvas } from './CytoscapeCanvas';
 import { TravelCanvas } from './TravelCanvas';
 import { ONTO_KIND_COLOR, type InspectorNode } from '../lib/graphData';
@@ -156,8 +157,16 @@ const LEGEND = (Object.keys(ENTERPRISE_KIND_LABEL) as (keyof typeof ENTERPRISE_K
 
 export function GraphExplorer() {
   const navigate = useNavigate();
-  const { components, selectedProduct, enterpriseGraph, enterpriseHighlight, setSelectedProduct } =
-    useProduct();
+  const {
+    components,
+    selectedProduct,
+    enterpriseGraph,
+    enterpriseHighlight,
+    setSelectedProduct,
+    syncScopeFromSections,
+    catalogLoading,
+    rebuilding,
+  } = useProduct();
   const ontoData = components.ontologyGraph;
   const productKey = selectedProduct.product_name;
 
@@ -168,8 +177,9 @@ export function GraphExplorer() {
   const [trail, setTrail] = useState<string[]>([]);
 
   const travelTo = (id: string) => {
-    // clicking a domain/product node also syncs the header selectors
-    if (id.startsWith('prod:')) setSelectedProduct(id.slice('prod:'.length));
+    // when the "Selections update scope" toggle is ON, clicking a product node
+    // also updates the left-panel scope; OFF (default) = view-only travel.
+    if (syncScopeFromSections && id.startsWith('prod:')) setSelectedProduct(id.slice('prod:'.length));
     if (id === focusId) return;
     setTrail((t) => (focusId ? [...t, focusId] : t));
     setFocusId(id);
@@ -202,6 +212,9 @@ export function GraphExplorer() {
     : selOntoId
       ? (ontoData.nodes[selOntoId] ?? null)
       : null;
+
+  if (catalogLoading) return <CatalogLoadingSkeleton label="Generating graph…" />;
+  if (rebuilding) return <CatalogLoadingSkeleton label="Rebuilding…" />;
 
   return (
     <div className="space-y-3 max-w-[1600px]">

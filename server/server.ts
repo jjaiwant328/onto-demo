@@ -1,5 +1,12 @@
 import { createApp, analytics, server, serving, getWorkspaceClient } from '@databricks/appkit';
 import { randomUUID } from 'node:crypto';
+import {
+  demoExceptionSql,
+  demoAggregateSql,
+  demoSnapshotSql,
+  isDemoProduct,
+  DEMO_PRODUCTS,
+} from '../shared/demoDomains';
 
 // The serving plugin is wired to a Foundation Model endpoint (alias "llm",
 // endpoint name from DATABRICKS_SERVING_ENDPOINT_NAME). It powers the optional
@@ -418,9 +425,79 @@ createApp({
         res.json({ actions: [], llm: false, mode, reason: 'model returned no usable JSON' });
       });
 
+      // ---- Data-backed exceptions for a "Data Avlbl" product (AGGREGATED) ----
+      // Body: { product }  → computes SUMMARY STATS + a few representative rows,
+      // then asks the LLM for a HANDFUL (~3-5) of high-level AGGREGATE actions
+      // (each carrying the underlying counts). Row detail is returned for expand.
+      app.post('/api/data-exceptions', async (req, res) => {
+        const b = (req.body ?? {}) as { product?: string };
+        const product = (b.product ?? '').trim();
+        const meta = DEMO_PRODUCTS[product];
+        const aggSql = demoAggregateSql(product);
+        const rowSql = demoExceptionSql(product, 8); // a few representative examples
+        if (!meta || !aggSql || !rowSql) {
+          res.status(400).json({ actions: [], reason: 'not a data-backed product', rows: [], stats: null });
+          return;
+        }
+        let stats: Record<string, unknown> = {};
+        let rows: Record<string, unknown>[] = [];
+        try {
+          const [aggRows, exRows] = await Promise.all([runSql(aggSql), runSql(rowSql)]);
+          stats = aggRows[0] ?? {};
+          rows = exRows;
+        } catch (err) {
+          res.json({ actions: [], rows: [], stats: null, llm: false, reason: `query failed: ${String(err)}` });
+          return;
+        }
+        const total = Number(stats.failed_tests ?? stats.stale_tables ?? stats.failed_runs ?? stats.high_mape_items ?? stats.at_risk_items ?? stats.late_pos ?? rows.length) || 0;
+        if (total === 0 && rows.length === 0) {
+          res.json({ actions: [], rows: [], stats, llm: hasLlm, reason: 'no exceptions found' });
+          return;
+        }
+        if (!hasLlm) {
+          // deterministic fallback: ONE aggregate action from the config framing
+          res.json({
+            actions: [
+              {
+                id: `dx-${product}-agg`,
+                priority: 'HIGH',
+                issue: `${total} exception(s) — ${meta.issue}`,
+                root_cause: 'Aggregate of data-backed exception rows.',
+                recommended_action: meta.action_hint,
+                confidence: 0.6,
+                stats,
+              },
+            ],
+            rows,
+            stats,
+            llm: false,
+          });
+          return;
+        }
+        const prompt =
+          `You are an ops analyst for the data product "${meta.display_name}" ` +
+          `(domain: ${meta.domainLabel}). Below are AGGREGATE stats over the real exception rows ` +
+          `(${meta.issue}) plus a few representative examples. Produce a SHORT list of 3-5 HIGH-LEVEL ` +
+          `AGGREGATE actions (NOT one per row) — each should summarize a group with its counts, e.g. ` +
+          `"12 DQ tests failing (4 critical) across 5 tables — triage critical failures". Return ONLY a ` +
+          `JSON array; each item: {id, priority ("HIGH"|"MEDIUM"|"LOW"), issue, root_cause, ` +
+          `recommended_action, confidence (0..1)}. Put the concrete counts in "issue". Bucket priority ` +
+          `by severity/impact. Keep root_cause and recommended_action to one sentence each. A good ` +
+          `action looks like: ${meta.action_hint}\n\nAGGREGATE STATS:\n${JSON.stringify(stats)}\n\n` +
+          `REPRESENTATIVE ROWS:\n${JSON.stringify(rows).slice(0, 12000)}`;
+        const content = await llmComplete(prompt, 2000);
+        const json = extractJsonArray(content ?? '');
+        if (json) {
+          res.json({ actions: json.slice(0, 6), rows, stats, llm: true, product });
+          return;
+        }
+        res.json({ actions: [], rows, stats, llm: false, reason: 'model returned no usable JSON' });
+      });
+
       // ---- Feature 2: Ontology Copilot ----
-      // Body: { question, productContext, history?, product?, live? }
-      // → { answer, action? }. For live products may attach a kpi_summary snapshot.
+      // Body: { question, productContext, history?, product?, live?, useData? }
+      // → { answer, action? }. For live products may attach a kpi_summary snapshot;
+      //    for data-backed products with useData, attaches a real exception snapshot.
       app.post('/api/copilot', async (req, res) => {
         const b = (req.body ?? {}) as {
           question?: string;
@@ -428,6 +505,7 @@ createApp({
           history?: { role: string; content: string }[];
           product?: string;
           live?: boolean;
+          useData?: boolean;
         };
         const question = (b.question ?? '').trim();
         if (!question) {
@@ -454,6 +532,19 @@ createApp({
             /* ignore snapshot failures */
           }
         }
+        // data-backed snapshot for a "Data Avlbl" product when the toggle is on
+        if (b.useData && isDemoProduct(b.product)) {
+          const snap = demoSnapshotSql(b.product!, 10);
+          if (snap) {
+            try {
+              const [countRows, topRows] = await Promise.all([runSql(snap.count), runSql(snap.top)]);
+              const count = (countRows[0]?.exception_count ?? countRows[0]?.EXCEPTION_COUNT ?? '?');
+              snapshot += `\n\nDATA AVLBL SNAPSHOT (${count} exception rows total; top rows):\n${JSON.stringify(topRows).slice(0, 8000)}`;
+            } catch {
+              /* ignore snapshot failures */
+            }
+          }
+        }
 
         const hist = (b.history ?? [])
           .slice(-6)
@@ -478,6 +569,147 @@ createApp({
         // strip the fenced json from the visible answer
         const answer = content.replace(/```(?:json)?\s*[\s\S]*?```/g, '').trim() || content;
         res.json({ answer, action: action && action.recommended_action ? action : undefined });
+      });
+
+      // ---- Feature 3: action log / tracker (persisted to jai_action_log) ----
+      const ACTION_LOG_TABLE = 'jai_ontos.demo_schema.jai_action_log';
+      const whoami = async (): Promise<string> => {
+        try {
+          const me = await authFetch('/api/2.0/preview/scim/v2/Me', { method: 'GET' });
+          if (me.ok) return ((await me.json()) as { userName?: string })?.userName ?? 'unknown';
+        } catch {
+          /* ignore */
+        }
+        return 'unknown';
+      };
+
+      // POST /api/log-action — insert a decided action into the log.
+      app.post('/api/log-action', async (req, res) => {
+        const b = (req.body ?? {}) as Record<string, unknown>;
+        const decision = String(b.decision ?? '');
+        if (!['approved', 'modified', 'rejected'].includes(decision)) {
+          res.status(400).json({ ok: false, error: 'decision must be approved|modified|rejected' });
+          return;
+        }
+        const decidedBy = await whoami();
+        const actionId = `act_${Date.now().toString(36)}_${randomUUID().slice(0, 8)}`;
+        const conf = typeof b.confidence === 'number' ? (b.confidence as number) : Number(b.confidence) || 0;
+        try {
+          await runSql(
+            `INSERT INTO ${ACTION_LOG_TABLE} ` +
+              `(action_id, created_at, updated_at, schema_label, domain, product, source, priority, ` +
+              `issue, root_cause, recommended_action, confidence, decision, track_status, decided_by, ` +
+              `decided_at, ref_entity, notes) VALUES (` +
+              `${sqlStr(actionId)}, current_timestamp(), current_timestamp(), ` +
+              `${sqlStr(b.schema_label)}, ${sqlStr(b.domain)}, ${sqlStr(b.product)}, ${sqlStr(b.source)}, ` +
+              `${sqlStr(b.priority)}, ${sqlStr(b.issue)}, ${sqlStr(b.root_cause)}, ` +
+              `${sqlStr(b.recommended_action)}, ${conf}, ${sqlStr(decision)}, 'open', ` +
+              `${sqlStr(decidedBy)}, current_timestamp(), ${sqlStr(b.ref_entity)}, ${sqlStr(b.notes)})`
+          );
+          res.json({ ok: true, action_id: actionId, decided_by: decidedBy });
+        } catch (err) {
+          res.json({ ok: false, error: String(err) });
+        }
+      });
+
+      // GET /api/action-log — list logged actions (optional ?product= &status=).
+      app.get('/api/action-log', async (req, res) => {
+        const product = (req.query.product as string | undefined)?.trim();
+        const status = (req.query.status as string | undefined)?.trim();
+        const where: string[] = [];
+        if (product) where.push(`product = ${sqlStr(product)}`);
+        if (status) where.push(`track_status = ${sqlStr(status)}`);
+        const clause = where.length ? ` WHERE ${where.join(' AND ')}` : '';
+        try {
+          const rows = await runSql(
+            `SELECT action_id, cast(created_at as string) AS created_at, ` +
+              `cast(updated_at as string) AS updated_at, schema_label, domain, product, source, ` +
+              `priority, issue, root_cause, recommended_action, confidence, decision, track_status, ` +
+              `decided_by, cast(decided_at as string) AS decided_at, ref_entity, notes ` +
+              `FROM ${ACTION_LOG_TABLE}${clause} ORDER BY created_at DESC LIMIT 500`
+          );
+          res.json({ actions: rows });
+        } catch (err) {
+          res.json({ actions: [], error: String(err) });
+        }
+      });
+
+      // POST /api/update-action-status — advance open→in_progress→done.
+      app.post('/api/update-action-status', async (req, res) => {
+        const b = (req.body ?? {}) as { action_id?: string; track_status?: string };
+        const id = (b.action_id ?? '').trim();
+        const st = (b.track_status ?? '').trim();
+        if (!id || !['open', 'in_progress', 'done'].includes(st)) {
+          res.status(400).json({ ok: false, error: 'action_id + track_status(open|in_progress|done) required' });
+          return;
+        }
+        try {
+          await runSql(
+            `UPDATE ${ACTION_LOG_TABLE} SET track_status = ${sqlStr(st)}, ` +
+              `updated_at = current_timestamp() WHERE action_id = ${sqlStr(id)}`
+          );
+          res.json({ ok: true });
+        } catch (err) {
+          res.json({ ok: false, error: String(err) });
+        }
+      });
+
+      // ---- Feature 4: product links (Genie Space / AI-BI dashboard) ----
+      const PRODUCT_LINKS_TABLE = 'jai_ontos.demo_schema.jai_product_links';
+
+      // POST /api/attach-link — attach a Genie/dashboard URL to a product.
+      app.post('/api/attach-link', async (req, res) => {
+        const b = (req.body ?? {}) as Record<string, unknown>;
+        const linkType = String(b.link_type ?? '');
+        const url = String(b.url ?? '').trim();
+        if (!['genie', 'dashboard'].includes(linkType) || !url) {
+          res.status(400).json({ ok: false, error: 'link_type(genie|dashboard) + url required' });
+          return;
+        }
+        const createdBy = await whoami();
+        const linkId = `lnk_${Date.now().toString(36)}_${randomUUID().slice(0, 8)}`;
+        try {
+          await runSql(
+            `INSERT INTO ${PRODUCT_LINKS_TABLE} ` +
+              `(link_id, schema_label, domain, product, link_type, url, label, created_by, created_at) VALUES (` +
+              `${sqlStr(linkId)}, ${sqlStr(b.schema_label)}, ${sqlStr(b.domain)}, ${sqlStr(b.product)}, ` +
+              `${sqlStr(linkType)}, ${sqlStr(url)}, ${sqlStr(b.label)}, ${sqlStr(createdBy)}, current_timestamp())`
+          );
+          res.json({ ok: true, link_id: linkId, created_by: createdBy });
+        } catch (err) {
+          res.json({ ok: false, error: String(err) });
+        }
+      });
+
+      // GET /api/product-links — list links (optional ?product=).
+      app.get('/api/product-links', async (req, res) => {
+        const product = (req.query.product as string | undefined)?.trim();
+        const clause = product ? ` WHERE product = ${sqlStr(product)}` : '';
+        try {
+          const rows = await runSql(
+            `SELECT link_id, schema_label, domain, product, link_type, url, label, created_by, ` +
+              `cast(created_at as string) AS created_at FROM ${PRODUCT_LINKS_TABLE}${clause} ` +
+              `ORDER BY created_at DESC LIMIT 500`
+          );
+          res.json({ links: rows });
+        } catch (err) {
+          res.json({ links: [], error: String(err) });
+        }
+      });
+
+      // POST /api/delete-link — remove a link.
+      app.post('/api/delete-link', async (req, res) => {
+        const id = String((req.body as { link_id?: string })?.link_id ?? '').trim();
+        if (!id) {
+          res.status(400).json({ ok: false, error: 'link_id required' });
+          return;
+        }
+        try {
+          await runSql(`DELETE FROM ${PRODUCT_LINKS_TABLE} WHERE link_id = ${sqlStr(id)}`);
+          res.json({ ok: true });
+        } catch (err) {
+          res.json({ ok: false, error: String(err) });
+        }
       });
     });
   },

@@ -4,7 +4,8 @@
 //    root-cause / recommended-action / confidence (deterministic fallback if LLM down).
 //  • Scenario signals (hybrid): a small form → LLM-prioritized, clearly-labeled actions.
 //  • Lifecycle (in-session only): Approve / Modify / Reject + a SIMULATED trail.
-import { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
+import { useNavigate } from 'react-router';
 import {
   Card,
   CardContent,
@@ -22,47 +23,496 @@ import {
   SelectTrigger,
   SelectValue,
   Skeleton,
+  Checkbox,
+  Tabs,
+  TabsList,
+  TabsTrigger,
+  TabsContent,
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
   useAnalyticsQuery,
 } from '@databricks/appkit-ui/react';
 import { sql } from '@databricks/appkit-ui/js';
-import { CheckCircle2, XCircle, Pencil, Zap, AlertTriangle, Info } from 'lucide-react';
+import { CheckCircle2, XCircle, Pencil, Zap, AlertTriangle, Info, Database, Loader2, FileDown, MessageSquare } from 'lucide-react';
 import { useProduct } from '../lib/product';
+import { fetchProductLinks, attachLink, deleteLink, type ProductLink } from '../lib/productLinks';
 import { useActions, buildExceptionActions, mergeLlmActions, simulatedTrail, type ActionItem, type OpportunityRow } from '../lib/actions';
 import { componentsSummary } from '../lib/summary';
+import {
+  logAction,
+  fetchActionLog,
+  updateActionStatus,
+  type LogContext,
+  type LoggedAction,
+} from '../lib/actionLog';
 
 export function ActionCenter() {
-  const { selectedProduct, components } = useProduct();
+  const navigate = useNavigate();
+  const {
+    selectedProduct,
+    selectedDomain,
+    components,
+    isolationKey,
+    domainScope,
+    productScope,
+    schemaEntries,
+    selectedSchemaIds,
+  } = useProduct();
   const { queue, setQueue, addAction } = useActions();
   const live = components.live;
+  const dataAvailable = Boolean(selectedProduct.dataAvailable);
+
+  const schemaLabel =
+    selectedSchemaIds.length === 1
+      ? (schemaEntries.find((s) => s.id === selectedSchemaIds[0])?.label ?? '1 schema')
+      : `${selectedSchemaIds.length} schemas`;
+  const logCtx: LogContext = {
+    schema_label: schemaLabel,
+    domain: selectedDomain?.label ?? '',
+    product: selectedProduct.display_name,
+  };
+
+  // Reset the Action Center whenever the SCOPE (schema/domain/product) changes so
+  // no previous product's generated actions/analysis linger. Keyed like the
+  // isolation reset, but also on domain/product scope. Remount panels via the key.
+  const scopeSig = `${isolationKey}|${domainScope}|${productScope}|${selectedProduct.product_name}`;
+  useEffect(() => {
+    setQueue([]);
+  }, [scopeSig, setQueue]);
 
   return (
     <div className="space-y-6 max-w-5xl">
-      <div>
-        <h2 className="text-2xl font-bold text-foreground">Action Center</h2>
-        <p className="text-muted-foreground">
-          Prescriptive actions for {selectedProduct.display_name} — exceptions from the live serving
-          layer and scenario-driven signals. Approvals are simulated in-session (no external writes).
-        </p>
+      <div className="flex items-start justify-between gap-4">
+        <div>
+          <h2 className="text-2xl font-bold text-foreground flex items-center gap-2">
+            Action Center
+            {dataAvailable && (
+              <Badge variant="default" className="gap-1">
+                <Database className="h-3 w-3" /> Data Avlbl
+              </Badge>
+            )}
+          </h2>
+          <p className="text-muted-foreground">
+            Prescriptive actions for {selectedProduct.display_name} — exceptions from the live serving
+            layer and scenario-driven signals. Approve/Modify/Reject are recorded to the action log.
+          </p>
+        </div>
+        <Button variant="outline" size="sm" className="gap-1.5 shrink-0" onClick={() => navigate('/print/actions')}>
+          <FileDown className="h-4 w-4" /> Export actions
+        </Button>
       </div>
 
-      <QueueSummary queue={queue} />
+      <Tabs defaultValue="actions">
+        <TabsList>
+          <TabsTrigger value="actions">Actions</TabsTrigger>
+          <TabsTrigger value="log">Action Log</TabsTrigger>
+        </TabsList>
 
-      {live ? (
-        <ExceptionsPanel onSeed={setQueue} queue={queue} />
-      ) : (
-        <div className="flex items-start gap-2 rounded-md bg-muted/50 p-3 text-sm">
-          <Info className="h-4 w-4 mt-0.5 text-muted-foreground shrink-0" />
-          <span className="text-muted-foreground">
-            This product is schema-derived (no live serving layer), so there are no live exceptions.
-            Use the scenario signals below to generate a prioritized action plan.
-          </span>
-        </div>
-      )}
+        <TabsContent value="actions" className="space-y-6 mt-4">
+          <QueueSummary queue={queue} />
 
-      <ScenarioPanel onActions={(items) => items.forEach(addAction)} />
+          {dataAvailable && (
+            <FurtherAnalysisPanel
+              key={`fa-${scopeSig}`}
+              product={selectedProduct.display_name}
+              schemaLabel={schemaLabel}
+              domain={selectedDomain?.label ?? ''}
+              backingTables={selectedProduct.fact_tables ?? []}
+            />
+          )}
 
-      <QueueList queue={queue} setQueue={setQueue} />
+          {dataAvailable ? (
+            <DataExceptionsPanel key={scopeSig} onSeed={setQueue} queue={queue} />
+          ) : live ? (
+            <ExceptionsPanel key={scopeSig} onSeed={setQueue} queue={queue} />
+          ) : (
+            <div className="flex items-start gap-2 rounded-md bg-muted/50 p-3 text-sm">
+              <Info className="h-4 w-4 mt-0.5 text-muted-foreground shrink-0" />
+              <span className="text-muted-foreground">
+                This product is schema-derived (no live serving layer), so there are no live
+                exceptions. Use the scenario signals below to generate a prioritized action plan.
+              </span>
+            </div>
+          )}
+
+          <ScenarioPanel onActions={(items) => items.forEach(addAction)} />
+
+          <QueueList queue={queue} setQueue={setQueue} logCtx={logCtx} />
+        </TabsContent>
+
+        <TabsContent value="log" className="mt-4">
+          <ActionLogTracker product={selectedProduct.display_name} />
+        </TabsContent>
+      </Tabs>
     </div>
+  );
+}
+
+// Action Log tracker — lists logged actions with decision + track_status and
+// controls to advance open → in_progress → done.
+function ActionLogTracker({ product }: { product: string }) {
+  const [rows, setRows] = useState<LoggedAction[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [scopeToProduct, setScopeToProduct] = useState(true);
+
+  const load = React.useCallback(async () => {
+    setLoading(true);
+    const data = await fetchActionLog(scopeToProduct ? product : undefined);
+    setRows(data);
+    setLoading(false);
+  }, [product, scopeToProduct]);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  const advance = async (r: LoggedAction) => {
+    const next: LoggedAction['track_status'] =
+      r.track_status === 'open' ? 'in_progress' : r.track_status === 'in_progress' ? 'done' : 'done';
+    const ok = await updateActionStatus(r.action_id, next as 'open' | 'in_progress' | 'done');
+    if (ok) void load();
+  };
+
+  return (
+    <Card className="shadow-sm">
+      <CardHeader>
+        <div className="flex items-center justify-between gap-3">
+          <div>
+            <CardTitle className="text-base">Action log</CardTitle>
+            <CardDescription>Persisted decisions from jai_action_log — newest first.</CardDescription>
+          </div>
+          <div className="flex items-center gap-3">
+            <label className="flex items-center gap-1.5 text-xs cursor-pointer">
+              <Checkbox checked={scopeToProduct} onCheckedChange={(v) => setScopeToProduct(Boolean(v))} />
+              This product only
+            </label>
+            <Button size="sm" variant="outline" onClick={() => void load()} disabled={loading}>
+              {loading ? <Loader2 className="h-4 w-4 animate-spin" /> : 'Refresh'}
+            </Button>
+          </div>
+        </div>
+      </CardHeader>
+      <CardContent>
+        {rows.length === 0 ? (
+          <p className="text-sm text-muted-foreground">
+            No logged actions yet. Approve/Modify/Reject an action to record it here.
+          </p>
+        ) : (
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead>Issue</TableHead>
+                <TableHead>Product</TableHead>
+                <TableHead>Decision</TableHead>
+                <TableHead>Track</TableHead>
+                <TableHead>By</TableHead>
+                <TableHead />
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {rows.map((r) => (
+                <TableRow key={r.action_id}>
+                  <TableCell className="max-w-[280px]">
+                    <div className="font-medium truncate">{r.issue}</div>
+                    <div className="text-xs text-muted-foreground truncate">{r.recommended_action}</div>
+                  </TableCell>
+                  <TableCell className="text-xs">{r.product}</TableCell>
+                  <TableCell>
+                    <Badge variant={r.decision === 'rejected' ? 'outline' : 'default'}>{r.decision}</Badge>
+                  </TableCell>
+                  <TableCell>
+                    <Badge variant="secondary">{r.track_status}</Badge>
+                  </TableCell>
+                  <TableCell className="text-xs text-muted-foreground">{r.decided_by}</TableCell>
+                  <TableCell>
+                    {r.track_status !== 'done' && (
+                      <Button size="sm" variant="ghost" className="text-xs" onClick={() => advance(r)}>
+                        {r.track_status === 'open' ? 'Start' : 'Complete'}
+                      </Button>
+                    )}
+                  </TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
+// Data-backed exceptions: for a "Data Avlbl" product, a "Use Data Avlbl" toggle
+// runs the product's exception SQL against the backing schema (server-side) and
+// LLM-enriches each real row into a prioritized action.
+type DataExResult = {
+  actions: Record<string, unknown>[];
+  stats: Record<string, unknown> | null;
+  rows: Record<string, unknown>[];
+  llm?: boolean;
+  note?: string;
+};
+
+function DataExceptionsPanel({
+  onSeed,
+}: {
+  onSeed: React.Dispatch<React.SetStateAction<ActionItem[]>>;
+  queue: ActionItem[];
+}) {
+  const { selectedProduct, getScopeCache, setScopeCache } = useProduct();
+  const [useData, setUseData] = useState(true);
+  const [loading, setLoading] = useState(false);
+  const [showRows, setShowRows] = useState(false);
+  // rehydrate from the per-scope cache so results survive tab navigation
+  const [result, setResult] = useState<DataExResult | null>(
+    () => getScopeCache<DataExResult>('dataExceptions') ?? null
+  );
+
+  const generate = async () => {
+    setLoading(true);
+    try {
+      const resp = await fetch('/api/data-exceptions', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ product: selectedProduct.product_name }),
+      });
+      const d = (await resp.json()) as {
+        actions?: Record<string, unknown>[];
+        rows?: Record<string, unknown>[];
+        stats?: Record<string, unknown> | null;
+        llm?: boolean;
+        reason?: string;
+      };
+      const actions = d.actions ?? [];
+      const items: ActionItem[] = actions.map((a, i) => ({
+        id: `dx-${selectedProduct.product_name}-${i}-${Date.now()}`,
+        source: 'exception',
+        priority: (['HIGH', 'MEDIUM', 'LOW'].includes(String(a.priority))
+          ? a.priority
+          : 'MEDIUM') as ActionItem['priority'],
+        issue: String(a.issue ?? 'Data exception'),
+        root_cause: String(a.root_cause ?? ''),
+        recommended_action: String(a.recommended_action ?? ''),
+        confidence: typeof a.confidence === 'number' ? a.confidence : 0.6,
+        status: 'pending',
+      }));
+      onSeed((prev) => [...items, ...prev.filter((p) => p.source !== 'exception')]);
+      const res: DataExResult = {
+        actions,
+        stats: d.stats ?? null,
+        rows: d.rows ?? [],
+        llm: d.llm,
+        note: actions.length
+          ? `${actions.length} aggregate action(s) from the backing data${d.llm ? ' (LLM-summarized)' : ''}.`
+          : `No exceptions returned${d.reason ? ` — ${d.reason}` : ''}.`,
+      };
+      setResult(res);
+      setScopeCache('dataExceptions', res); // persist for this scope
+    } catch (err) {
+      setResult({ actions: [], stats: null, rows: [], note: `Error: ${err instanceof Error ? err.message : String(err)}` });
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const stats = result?.stats ?? null;
+
+  return (
+    <Card className="shadow-sm">
+      <CardHeader>
+        <CardTitle className="text-base flex items-center gap-2">
+          <Database className="h-4 w-4" /> Data-backed exceptions (aggregated)
+        </CardTitle>
+        <CardDescription>
+          Summarizes {selectedProduct.display_name}'s exception rule over the backing schema into a
+          handful of high-level actions (row detail on expand).
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-3">
+        <div className="flex flex-wrap items-center gap-3">
+          <label className="flex items-center gap-2 text-sm cursor-pointer">
+            <Checkbox checked={useData} onCheckedChange={(v) => setUseData(Boolean(v))} />
+            Use Data Avlbl
+          </label>
+          <Button size="sm" className="gap-1.5" disabled={loading || !useData} onClick={generate}>
+            {loading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Zap className="h-4 w-4" />}
+            Generate from data
+          </Button>
+          {result && <Badge variant="secondary">{result.actions.length} aggregate action(s)</Badge>}
+          {result?.note && <span className="text-xs text-muted-foreground">{result.note}</span>}
+        </div>
+
+        {stats && (
+          <div className="flex flex-wrap gap-2">
+            {Object.entries(stats).map(([k, v]) => (
+              <Badge key={k} variant="outline" className="font-normal">
+                {k.replace(/_/g, ' ')}: <span className="font-medium ml-1">{String(v)}</span>
+              </Badge>
+            ))}
+          </div>
+        )}
+
+        {result && result.rows.length > 0 && (
+          <div>
+            <Button size="sm" variant="ghost" className="text-xs" onClick={() => setShowRows((s) => !s)}>
+              {showRows ? 'Hide' : 'Show'} representative rows ({result.rows.length})
+            </Button>
+            {showRows && (
+              <div className="mt-2 overflow-x-auto rounded-md border">
+                <table className="text-xs w-full">
+                  <thead>
+                    <tr className="bg-muted/50">
+                      {Object.keys(result.rows[0]).map((c) => (
+                        <th key={c} className="text-left px-2 py-1 font-medium">
+                          {c}
+                        </th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {result.rows.map((r, i) => (
+                      <tr key={i} className="border-t">
+                        {Object.values(r).map((v, j) => (
+                          <td key={j} className="px-2 py-1 whitespace-nowrap">
+                            {String(v)}
+                          </td>
+                        ))}
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
+// Further analysis — pivots to deeper tooling. If a Genie/dashboard link is
+// attached → Open in Genie / Open dashboard (new window). Else → guidance +
+// Attach Genie Space (paste URL).
+function FurtherAnalysisPanel({
+  product,
+  schemaLabel,
+  domain,
+  backingTables,
+}: {
+  product: string;
+  schemaLabel: string;
+  domain: string;
+  backingTables: string[];
+}) {
+  const [links, setLinks] = useState<ProductLink[]>([]);
+  const [showAttach, setShowAttach] = useState(false);
+  const [url, setUrl] = useState('');
+  const [label, setLabel] = useState('');
+  const [note, setNote] = useState<string | null>(null);
+
+  const load = React.useCallback(async () => {
+    setLinks(await fetchProductLinks(product));
+  }, [product]);
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  const attach = async () => {
+    if (!url.trim()) return;
+    const r = await attachLink({
+      schema_label: schemaLabel,
+      domain,
+      product,
+      link_type: 'genie',
+      url: url.trim(),
+      label: label.trim() || 'Genie Space',
+    });
+    if (r.ok) {
+      setUrl('');
+      setLabel('');
+      setShowAttach(false);
+      setNote('Genie Space attached.');
+      void load();
+    } else {
+      setNote(`Attach failed: ${r.error ?? 'unknown'}`);
+    }
+  };
+
+  const remove = async (id: string) => {
+    if (await deleteLink(id)) void load();
+  };
+
+  return (
+    <Card className="shadow-sm">
+      <CardHeader>
+        <CardTitle className="text-base flex items-center gap-2">
+          <MessageSquare className="h-4 w-4" /> Further analysis
+        </CardTitle>
+        <CardDescription>Explore this product interactively in Genie or an AI/BI dashboard.</CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-3">
+        {links.length > 0 ? (
+          <div className="flex flex-wrap items-center gap-2">
+            {links.map((l) => (
+              <div key={l.link_id} className="flex items-center gap-1">
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="gap-1.5"
+                  onClick={() => window.open(l.url, '_blank')}
+                >
+                  {l.link_type === 'dashboard' ? <Zap className="h-4 w-4" /> : <MessageSquare className="h-4 w-4" />}
+                  {l.link_type === 'dashboard' ? 'Open dashboard' : 'Open in Genie'}
+                  {l.label ? ` · ${l.label}` : ''}
+                </Button>
+                <Button size="sm" variant="ghost" className="h-7 w-7 p-0" onClick={() => remove(l.link_id)} title="Remove link">
+                  <XCircle className="h-3.5 w-3.5 text-destructive" />
+                </Button>
+              </div>
+            ))}
+            <Button size="sm" variant="ghost" className="text-xs" onClick={() => setShowAttach((s) => !s)}>
+              + Attach another
+            </Button>
+          </div>
+        ) : (
+          <div className="flex items-start gap-2 rounded-md bg-muted/50 p-3 text-sm">
+            <Info className="h-4 w-4 mt-0.5 text-muted-foreground shrink-0" />
+            <span className="text-muted-foreground">
+              Build a Genie Space on{' '}
+              {backingTables.length ? (
+                <code>{backingTables.join(', ')}</code>
+              ) : (
+                <code>the backing table(s)</code>
+              )}{' '}
+              to explore this further, then attach it here.
+              <Button size="sm" variant="outline" className="ml-2 gap-1.5" onClick={() => setShowAttach(true)}>
+                <MessageSquare className="h-3.5 w-3.5" /> Attach Genie Space
+              </Button>
+            </span>
+          </div>
+        )}
+
+        {showAttach && (
+          <div className="flex flex-wrap items-end gap-2">
+            <div className="flex-1 min-w-[220px] space-y-1">
+              <Label className="text-xs">Genie Space URL</Label>
+              <Input placeholder="https://…/genie/rooms/…" value={url} onChange={(e) => setUrl(e.target.value)} />
+            </div>
+            <div className="min-w-[140px] space-y-1">
+              <Label className="text-xs">Label (optional)</Label>
+              <Input placeholder="e.g. DQ Genie" value={label} onChange={(e) => setLabel(e.target.value)} />
+            </div>
+            <Button size="sm" onClick={attach} disabled={!url.trim()}>
+              Attach
+            </Button>
+          </div>
+        )}
+        {note && <span className="text-xs text-muted-foreground">{note}</span>}
+      </CardContent>
+    </Card>
   );
 }
 
@@ -272,9 +722,11 @@ function ScenarioPanel({ onActions }: { onActions: (items: ActionItem[]) => void
 function QueueList({
   queue,
   setQueue,
+  logCtx,
 }: {
   queue: ActionItem[];
   setQueue: React.Dispatch<React.SetStateAction<ActionItem[]>>;
+  logCtx: LogContext;
 }) {
   if (queue.length === 0) {
     return (
@@ -289,7 +741,7 @@ function QueueList({
   return (
     <div className="space-y-3">
       {queue.map((a) => (
-        <ActionCard key={a.id} action={a} setQueue={setQueue} />
+        <ActionCard key={a.id} action={a} setQueue={setQueue} logCtx={logCtx} />
       ))}
     </div>
   );
@@ -304,20 +756,37 @@ function priorityVariant(p: string): 'default' | 'secondary' | 'outline' {
 function ActionCard({
   action,
   setQueue,
+  logCtx,
 }: {
   action: ActionItem;
   setQueue: React.Dispatch<React.SetStateAction<ActionItem[]>>;
+  logCtx: LogContext;
 }) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(action.recommended_action);
+  const [logNote, setLogNote] = useState<string | null>(null);
 
   const update = (patch: Partial<ActionItem>) =>
     setQueue((prev) => prev.map((q) => (q.id === action.id ? { ...q, ...patch } : q)));
 
-  const approve = () => update({ status: 'approved', trail: simulatedTrail(action) });
-  const reject = () => update({ status: 'rejected', trail: undefined });
+  // persist the decision to jai_action_log (best-effort; UI still updates in-session)
+  const persist = async (decision: 'approved' | 'modified' | 'rejected', override?: ActionItem) => {
+    setLogNote('Recording…');
+    const r = await logAction(override ?? action, decision, logCtx);
+    setLogNote(r.ok ? `Recorded to action log${r.decided_by ? ` (as ${r.decided_by})` : ''}.` : `Log failed: ${r.error ?? 'unknown'}`);
+  };
+
+  const approve = () => {
+    update({ status: 'approved', trail: simulatedTrail(action) });
+    void persist('approved');
+  };
+  const reject = () => {
+    update({ status: 'rejected', trail: undefined });
+    void persist('rejected');
+  };
   const saveEdit = () => {
     update({ status: 'modified', recommended_action: draft });
+    void persist('modified', { ...action, recommended_action: draft });
     setEditing(false);
   };
 
@@ -369,9 +838,11 @@ function ActionCard({
                 {t}
               </div>
             ))}
-            <div className="text-muted-foreground italic">(simulated — no external writes)</div>
+            <div className="text-muted-foreground italic">(execution simulated — decision persisted to the action log)</div>
           </div>
         )}
+
+        {logNote && <div className="text-xs text-muted-foreground">{logNote}</div>}
 
         {!editing && action.status !== 'approved' && (
           <div className="flex gap-2 pt-1">

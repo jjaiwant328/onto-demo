@@ -2,39 +2,44 @@
 // product summary + data contract + ontology (classes/mappings/measures) + lineage.
 // Zero deps: a dedicated route + @media print CSS; an "Open print dialog" button
 // calls window.print() (user saves as PDF).
-import { useEffect } from 'react';
+import { useEffect, useMemo } from 'react';
 import { useParams, useNavigate } from 'react-router';
 import { Button } from '@databricks/appkit-ui/react';
 import { Printer, ArrowLeft } from 'lucide-react';
 import { useProduct } from '../lib/product';
+import { deriveProduct } from '../lib/deriveComponents';
 import { deriveContract } from '../lib/contract';
 import { useActions } from '../lib/actions';
 
 export function PrintProduct() {
   const { productName } = useParams();
   const navigate = useNavigate();
-  const { domains, components, selectedProduct, setSelectedProduct } = useProduct();
+  // resolve the requested product LOCALLY from the active catalog/schema — never
+  // mutate the left-panel Scope selection (which the left panel controls solely).
+  const { domains, schema, selectedProduct, activeSourceCatalog } = useProduct();
   const { queue } = useActions();
   const approvedActions = queue.filter((a) => a.status === 'approved' || a.status === 'modified');
 
-  // ensure the requested product is the selected one (so components match)
-  useEffect(() => {
-    if (productName && productName !== selectedProduct.product_name) {
-      setSelectedProduct(productName);
+  const product = useMemo(() => {
+    for (const d of domains) {
+      const found = d.products.find((p) => p.product_name === productName);
+      if (found) return found;
     }
-  }, [productName, selectedProduct.product_name, setSelectedProduct]);
+    return selectedProduct;
+  }, [domains, productName, selectedProduct]);
 
-  const product = selectedProduct;
+  const components = useMemo(() => deriveProduct(product, schema), [product, schema]);
   const domain = domains.find((d) => d.products.some((p) => p.product_name === product.product_name));
-  const contract = deriveContract(product, components);
+  const contract = deriveContract(product, components, {
+    sourceCatalog: activeSourceCatalog ?? undefined,
+  });
   const generated = new Date().toLocaleString();
 
-  // auto-open the print dialog once the page has settled (only when names match)
+  // auto-open the print dialog once the page has settled
   useEffect(() => {
-    if (productName !== selectedProduct.product_name) return undefined;
     const t = setTimeout(() => window.print(), 600);
     return () => clearTimeout(t);
-  }, [productName, selectedProduct.product_name]);
+  }, [product.product_name]);
 
   return (
     <div className="print-doc">
@@ -51,7 +56,7 @@ export function PrintProduct() {
       </div>
 
       <header className="doc-header">
-        <div className="doc-eyebrow">RT_onto_demo · Data Product Brief</div>
+        <div className="doc-eyebrow">Ontology-demo · Data Product Brief</div>
         <h1>{product.display_name}</h1>
         <div className="doc-meta">
           {domain?.label ?? '—'} · {product.live ? 'Live' : 'Schema-derived'} · {product.maturity} ·
@@ -304,7 +309,7 @@ export function PrintProduct() {
       )}
 
       <footer className="doc-footer">
-        RT_onto_demo · {product.display_name} · {contract.name} · generated {generated}
+        Ontology-demo · {product.display_name} · {contract.name} · generated {generated}
       </footer>
     </div>
   );
