@@ -316,13 +316,14 @@ export function ProductProvider({ children }: { children: ReactNode }) {
     return first ? [first.id] : [];
   });
 
-  // toggle: whether in-section interactions update the left-panel scope.
-  // Default false (view-only); restored from localStorage on mount.
+  // toggle: whether in-section interactions update the left-panel scope (and the
+  // Explore↔Scope bidirectional sync). Default ON now (user wants sync); an
+  // explicit '0' in localStorage still disables it.
   const [syncScopeFromSections, setSyncScopeFromSectionsState] = useState<boolean>(() => {
     try {
-      return localStorage.getItem(SYNC_KEY) === '1';
+      return localStorage.getItem(SYNC_KEY) !== '0'; // unset or '1' → ON
     } catch {
-      return false;
+      return true;
     }
   });
   const setSyncScopeFromSections = useCallback((v: boolean) => {

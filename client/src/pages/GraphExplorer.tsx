@@ -163,6 +163,8 @@ export function GraphExplorer() {
     enterpriseGraph,
     enterpriseHighlight,
     setSelectedProduct,
+    setSelectedDomain,
+    productScope,
     syncScopeFromSections,
     catalogLoading,
     rebuilding,
@@ -176,10 +178,45 @@ export function GraphExplorer() {
   const [focusId, setFocusId] = useState<string | null>(null);
   const [trail, setTrail] = useState<string[]>([]);
 
+  // resolve an enterprise-map node to a scope target (product | domain | all).
+  //  • prod:<name> / mv:<name> / link:<kind>:<name> → that product
+  //  • etbl:<short> → its owning product ONLY when unambiguous (single owner)
+  //  • dom:<name> → that domain (product = All)
+  //  • ent:root → All
+  const resolveNodeScope = (id: string): { product?: string; domain?: string; all?: boolean } => {
+    if (id === 'ent:root') return { all: true };
+    if (id.startsWith('prod:')) return { product: id.slice('prod:'.length) };
+    if (id.startsWith('dom:')) return { domain: id.slice('dom:'.length) };
+    if (id.startsWith('link:')) {
+      const pn = id.split(':')[2];
+      return pn ? { product: pn } : {};
+    }
+    if (id.startsWith('mv:')) {
+      const rest = id.slice('mv:'.length);
+      // planned metric views are mv:<product_name>; live ones are mv:<view> (no product)
+      return enterpriseGraph.nodes[`prod:${rest}`] ? { product: rest } : {};
+    }
+    if (id.startsWith('etbl:')) {
+      const owners = enterpriseGraph.productsForNode(id);
+      return owners.length === 1 ? { product: owners[0].product_name } : {}; // ambiguous → don't force
+    }
+    return {};
+  };
+
+  // apply a resolved node to the left-panel Scope (only when the sync toggle is ON)
+  const syncScopeToNode = (id: string) => {
+    if (!syncScopeFromSections) return;
+    const r = resolveNodeScope(id);
+    if (r.product) setSelectedProduct(r.product);
+    else if (r.domain) setSelectedDomain(r.domain);
+    else if (r.all) setSelectedDomain('__all__');
+  };
+
   const travelTo = (id: string) => {
-    // when the "Selections update scope" toggle is ON, clicking a product node
-    // also updates the left-panel scope; OFF (default) = view-only travel.
-    if (syncScopeFromSections && id.startsWith('prod:')) setSelectedProduct(id.slice('prod:'.length));
+    // Explore travel → scope (item 1): resolve node to its owning product/domain.
+    // Guarded to product-level (or unambiguous table) so intermediate hops don't
+    // thrash scope. The scope→Explore effect below is guarded on focus, so no loop.
+    syncScopeToNode(id);
     if (id === focusId) return;
     setTrail((t) => (focusId ? [...t, focusId] : t));
     setFocusId(id);
@@ -202,6 +239,24 @@ export function GraphExplorer() {
     setFocusId(trail[idx]);
     setTrail(trail.slice(0, idx));
   };
+
+  // Scope → Explore (item 2): when the left-panel product scope changes to a
+  // concrete product, center the Explore map on that product's node — UNLESS the
+  // current focus already resolves to it (loop guard). Keyed on productScope so a
+  // travel-driven scope change (which set focus first) doesn't re-fire travel.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  useEffect(() => {
+    if (productScope === '__all__') return; // All products → leave the overview
+    const pnode = `prod:${productScope}`;
+    if (!enterpriseGraph.nodes[pnode]) return;
+    // already focused on (or within) this product? don't re-travel
+    if (focusId === pnode) return;
+    const cur = focusId ? resolveNodeScope(focusId) : {};
+    if (cur.product === productScope) return;
+    setTrail((t) => (focusId ? [...t, focusId] : t));
+    setFocusId(pnode);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [productScope, enterpriseGraph]);
 
   const [selOntoId, setSelOntoId] = useState<string | null>(null);
 
