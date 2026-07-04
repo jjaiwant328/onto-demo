@@ -61,6 +61,8 @@ export type InspectorNode = {
   conformedSources?: string[];
   // section the "Open in" button should navigate to (ontology view only)
   openIn?: 'data-products' | 'ontology-studio' | 'business-view' | null;
+  // external URL to open in a new window (genie / dashboard link nodes)
+  openUrl?: string;
 };
 
 export type GraphData = {

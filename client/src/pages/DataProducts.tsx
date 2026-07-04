@@ -20,13 +20,18 @@ import {
   TooltipTrigger,
   TooltipContent,
   TooltipProvider,
+  Popover,
+  PopoverTrigger,
+  PopoverContent,
+  Input,
+  Label,
 } from '@databricks/appkit-ui/react';
-import { CheckCircle2, FileText, FileDown, Layers, Database, MessageSquare } from 'lucide-react';
+import { CheckCircle2, FileText, FileDown, Layers, Database, MessageSquare, BarChart3, Plus } from 'lucide-react';
 import { useNavigate } from 'react-router';
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useProduct } from '../lib/product';
 import { CatalogLoadingSkeleton } from '../components/LoadingSkeleton';
-import { fetchProductLinks, type ProductLink } from '../lib/productLinks';
+import { fetchProductLinks, attachLink, deleteLink, type ProductLink } from '../lib/productLinks';
 
 function maturityVariant(m: string): 'default' | 'secondary' | 'outline' {
   const s = (m || '').toLowerCase();
@@ -35,13 +40,128 @@ function maturityVariant(m: string): 'default' | 'secondary' | 'outline' {
   return 'outline';
 }
 
+// A Genie-Space or Dashboard cell: opens the attached URL in a new window, or
+// shows an "Attach" popover (URL + optional label) when none is attached.
+function LinkCell({
+  kind,
+  product,
+  domain,
+  schemaLabel,
+  link,
+  onChanged,
+}: {
+  kind: 'genie' | 'dashboard';
+  product: string;
+  domain: string;
+  schemaLabel: string;
+  link?: ProductLink;
+  onChanged: () => void | Promise<void>;
+}) {
+  const [open, setOpen] = useState(false);
+  const [url, setUrl] = useState('');
+  const [label, setLabel] = useState('');
+  const [busy, setBusy] = useState(false);
+  const Icon = kind === 'genie' ? MessageSquare : BarChart3;
+  const noun = kind === 'genie' ? 'Genie Space' : 'Dashboard';
+
+  if (link) {
+    return (
+      <div className="flex items-center gap-1">
+        <TooltipProvider>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <button
+                type="button"
+                className="text-primary hover:opacity-80"
+                onClick={() => window.open(link.url, '_blank')}
+                aria-label={`Open ${noun}`}
+              >
+                <Icon className="h-4 w-4" />
+              </button>
+            </TooltipTrigger>
+            <TooltipContent>Open {link.label || noun} in a new window</TooltipContent>
+          </Tooltip>
+        </TooltipProvider>
+        <button
+          type="button"
+          className="text-[11px] text-muted-foreground hover:text-destructive"
+          title={`Detach ${noun}`}
+          onClick={async () => {
+            await deleteLink(link.link_id);
+            await onChanged();
+          }}
+        >
+          ✕
+        </button>
+      </div>
+    );
+  }
+
+  return (
+    <Popover open={open} onOpenChange={setOpen}>
+      <PopoverTrigger asChild>
+        <button
+          type="button"
+          className="text-xs text-muted-foreground hover:text-foreground inline-flex items-center gap-1"
+        >
+          <Plus className="h-3 w-3" /> Attach
+        </button>
+      </PopoverTrigger>
+      <PopoverContent className="w-72 p-3 space-y-2" align="start">
+        <div className="text-xs font-medium flex items-center gap-1.5">
+          <Icon className="h-3.5 w-3.5" /> Attach {noun}
+        </div>
+        <div className="space-y-1">
+          <Label className="text-xs">URL</Label>
+          <Input
+            className="text-xs"
+            placeholder={kind === 'genie' ? 'https://…/genie/rooms/…' : 'https://…/dashboards/…'}
+            value={url}
+            onChange={(e) => setUrl(e.target.value)}
+          />
+          <Input
+            className="text-xs"
+            placeholder="Label (optional)"
+            value={label}
+            onChange={(e) => setLabel(e.target.value)}
+          />
+        </div>
+        <Button
+          size="sm"
+          className="w-full"
+          disabled={busy || !url.trim()}
+          onClick={async () => {
+            setBusy(true);
+            const r = await attachLink({
+              schema_label: schemaLabel,
+              domain,
+              product,
+              link_type: kind,
+              url: url.trim(),
+              label: label.trim() || noun,
+            });
+            setBusy(false);
+            if (r.ok) {
+              setUrl('');
+              setLabel('');
+              setOpen(false);
+              await onChanged();
+            }
+          }}
+        >
+          Attach
+        </Button>
+      </PopoverContent>
+    </Popover>
+  );
+}
+
 export function DataProducts() {
   const navigate = useNavigate();
   const {
     scopedDomains,
     selectedProduct,
     setSelectedDomain,
-    setSelectedProduct,
     syncScopeFromSections,
     schemaEntries,
     combined,
@@ -67,10 +187,6 @@ export function DataProducts() {
     setFocusProductName(null);
     if (syncScopeFromSections) setSelectedDomain(name);
   };
-  const pickProduct = (name: string) => {
-    setFocusProductName(name);
-    if (syncScopeFromSections) setSelectedProduct(name);
-  };
 
   const focusDomain = useMemo(
     () => domains.find((d) => d.name === focusDomainName) ?? domains[0],
@@ -88,21 +204,23 @@ export function DataProducts() {
 
   const totalProducts = domains.reduce((n, d) => n + d.products.length, 0);
 
-  // product links (Genie Space / dashboard) keyed by product display_name.
-  // Loaded from Delta so they persist across reloads.
+  // product links (Genie Space + Dashboard) keyed by product display_name.
+  // Loaded from Lakebase so they persist across reloads.
   const [linksByProduct, setLinksByProduct] = useState<Map<string, ProductLink[]>>(new Map());
-  useEffect(() => {
-    void (async () => {
-      const all = await fetchProductLinks();
-      const map = new Map<string, ProductLink[]>();
-      for (const l of all) {
-        const key = l.product ?? '';
-        if (!map.has(key)) map.set(key, []);
-        map.get(key)!.push(l);
-      }
-      setLinksByProduct(map);
-    })();
+  const loadLinks = useCallback(async () => {
+    const all = await fetchProductLinks();
+    const map = new Map<string, ProductLink[]>();
+    for (const l of all) {
+      const key = l.product ?? '';
+      if (!map.has(key)) map.set(key, []);
+      map.get(key)!.push(l);
+    }
+    setLinksByProduct(map);
   }, []);
+  useEffect(() => {
+    void loadLinks();
+  }, [loadLinks]);
+  const schemaLabelForLinks = schemaLabel;
 
   if (catalogLoading) return <CatalogLoadingSkeleton />;
   if (rebuilding) return <CatalogLoadingSkeleton label="Rebuilding…" />;
@@ -185,45 +303,25 @@ export function DataProducts() {
                 <TableHead>Status</TableHead>
                 <TableHead>Source tables</TableHead>
                 <TableHead>Genie Space</TableHead>
+                <TableHead>Dashboard</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
               {(focusDomain?.products ?? []).map((p) => {
-                const active = p.product_name === focusProduct?.product_name;
+                // rows are display-only; the only interactive controls are the
+                // Genie / Dashboard attach/open cells below.
+                const links = linksByProduct.get(p.display_name) ?? [];
                 return (
-                  <TableRow
-                    key={p.product_name}
-                    className={`cursor-pointer ${active ? 'bg-muted/60' : ''}`}
-                    onClick={() => pickProduct(p.product_name)}
-                  >
+                  <TableRow key={p.product_name}>
                     <TableCell className="font-medium">{p.display_name}</TableCell>
                     <TableCell>
                       <Badge variant={maturityVariant(p.maturity)}>{p.maturity}</Badge>
                     </TableCell>
                     <TableCell>
                       {p.dataAvailable ? (
-                        <TooltipProvider>
-                          <Tooltip>
-                            <TooltipTrigger asChild>
-                              <Badge
-                                variant="default"
-                                className="gap-1 cursor-pointer hover:opacity-90"
-                                role="button"
-                                tabIndex={0}
-                                onClick={(e) => {
-                                  e.stopPropagation();
-                                  setSelectedProduct(p.product_name);
-                                  navigate('/action-center');
-                                }}
-                              >
-                                <Database className="h-3 w-3" /> Data Avlbl
-                              </Badge>
-                            </TooltipTrigger>
-                            <TooltipContent>
-                              Backed by live data — open in Action Center
-                            </TooltipContent>
-                          </Tooltip>
-                        </TooltipProvider>
+                        <Badge variant="default" className="gap-1">
+                          <Database className="h-3 w-3" /> Data Avlbl
+                        </Badge>
                       ) : p.live ? (
                         <Badge variant="default" className="gap-1">
                           <CheckCircle2 className="h-3 w-3" /> live
@@ -236,51 +334,24 @@ export function DataProducts() {
                       {p.fact_tables.length + p.dim_tables.length} tables
                     </TableCell>
                     <TableCell>
-                      {(() => {
-                        const genie = (linksByProduct.get(p.display_name) ?? []).find(
-                          (l) => l.link_type === 'genie' || l.link_type === 'dashboard'
-                        );
-                        if (genie) {
-                          return (
-                            <TooltipProvider>
-                              <Tooltip>
-                                <TooltipTrigger asChild>
-                                  <button
-                                    type="button"
-                                    className="text-primary hover:opacity-80"
-                                    onClick={(e) => {
-                                      e.stopPropagation();
-                                      window.open(genie.url, '_blank');
-                                    }}
-                                    aria-label="Open Genie Space"
-                                  >
-                                    <MessageSquare className="h-4 w-4" />
-                                  </button>
-                                </TooltipTrigger>
-                                <TooltipContent>
-                                  Open {genie.label || 'Genie Space'} in a new window
-                                </TooltipContent>
-                              </Tooltip>
-                            </TooltipProvider>
-                          );
-                        }
-                        if (p.dataAvailable) {
-                          return (
-                            <button
-                              type="button"
-                              className="text-xs text-muted-foreground hover:text-foreground underline"
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                setSelectedProduct(p.product_name);
-                                navigate('/action-center');
-                              }}
-                            >
-                              Attach
-                            </button>
-                          );
-                        }
-                        return <span className="text-xs text-muted-foreground">—</span>;
-                      })()}
+                      <LinkCell
+                        kind="genie"
+                        product={p.display_name}
+                        domain={focusDomain?.label ?? ''}
+                        schemaLabel={schemaLabelForLinks}
+                        link={links.find((l) => l.link_type === 'genie')}
+                        onChanged={loadLinks}
+                      />
+                    </TableCell>
+                    <TableCell>
+                      <LinkCell
+                        kind="dashboard"
+                        product={p.display_name}
+                        domain={focusDomain?.label ?? ''}
+                        schemaLabel={schemaLabelForLinks}
+                        link={links.find((l) => l.link_type === 'dashboard')}
+                        onChanged={loadLinks}
+                      />
                     </TableCell>
                   </TableRow>
                 );

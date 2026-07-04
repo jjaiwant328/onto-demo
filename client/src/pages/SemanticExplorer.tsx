@@ -28,8 +28,9 @@ import {
   TooltipTrigger,
   TooltipContent,
   TooltipProvider,
+  Input,
 } from '@databricks/appkit-ui/react';
-import { ArrowRight, Info } from 'lucide-react';
+import { ArrowRight, Info, Search, Check, X } from 'lucide-react';
 import { useProduct } from '../lib/product';
 import { deriveProduct } from '../lib/deriveComponents';
 import { CatalogLoadingSkeleton } from '../components/LoadingSkeleton';
@@ -45,7 +46,12 @@ export function SemanticExplorer() {
     domainScopeAll,
     productScopeAll,
     selectedDomain,
+    ontologyOverrides,
+    saveOntologyOverride,
+    deleteOntologyOverride,
   } = useProduct();
+  const edgeOverride = (ref: string, action: 'confirm' | 'reject') =>
+    ontologyOverrides.find((o) => o.kind === 'edge_status' && o.ref === ref && o.action === action);
 
   // aggregate relationships + measures + mappings across the SCOPED products
   // (all → every product; a domain → its products; a single product → just it).
@@ -85,7 +91,25 @@ export function SemanticExplorer() {
   );
   const [activeClass, setActiveClass] = useState<string>(classes[0] ?? '');
   const effectiveClass = classes.includes(activeClass) ? activeClass : (classes[0] ?? '');
-  const classProps = mappings.filter((m) => m.class === effectiveClass);
+
+  // case-insensitive search across relationships / measures / entities / mappings
+  const [search, setSearch] = useState('');
+  const q = search.trim().toLowerCase();
+  const match = (...vals: (string | undefined)[]) =>
+    !q || vals.some((v) => (v ?? '').toLowerCase().includes(q));
+
+  const shownRelationships = useMemo(
+    () => relationships.filter((r) => match(r.from.join(' '), r.predicate, r.to)),
+    [relationships, q]
+  );
+  const shownMeasures = useMemo(
+    () => measures.filter((m) => match(m.measure, m.type, m.formula)),
+    [measures, q]
+  );
+  const shownClasses = useMemo(() => classes.filter((c) => match(c)), [classes, q]);
+  const classProps = mappings
+    .filter((m) => m.class === effectiveClass)
+    .filter((m) => match(m.property, m.class, m.role, m.type));
 
   if (catalogLoading) return <CatalogLoadingSkeleton label="Generating semantics…" />;
   if (rebuilding) return <CatalogLoadingSkeleton label="Rebuilding…" />;
@@ -116,6 +140,21 @@ export function SemanticExplorer() {
           Relationships and measures for <span className="font-medium">{scopeLabel}</span> (
           {relationships.length} relationships · {measures.length} measures).
         </p>
+        <div className="relative mt-3 max-w-sm">
+          <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
+          <Input
+            className="pl-8"
+            placeholder="Search relationships, measures, entities, columns…"
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+          />
+        </div>
+        {q && (
+          <p className="text-xs text-muted-foreground mt-1">
+            Showing {shownRelationships.length} relationship(s), {shownMeasures.length} measure(s),{' '}
+            {shownClasses.length} entity(ies) matching “{search.trim()}”.
+          </p>
+        )}
       </div>
 
       <Card className="shadow-sm">
@@ -124,27 +163,80 @@ export function SemanticExplorer() {
           <CardDescription>Shared-key joins inferred from the schema</CardDescription>
         </CardHeader>
         <CardContent className="space-y-4">
-          {relationships.length === 0 ? (
+          {shownRelationships.length === 0 ? (
             <p className="text-sm text-muted-foreground">
-              No foreign-key relationships inferred for this product's tables.
+              {q
+                ? 'No relationships match your search.'
+                : "No foreign-key relationships inferred for this product's tables."}
             </p>
           ) : (
             <>
               <div className="flex flex-wrap gap-2">
-                {relationships.map((r, i) => (
-                  <div
-                    key={`${r.predicate}-${i}`}
-                    className="flex items-center gap-2 rounded-lg border bg-muted/40 px-3 py-2 text-sm"
-                  >
-                    <span className="font-medium">{r.from.join(' | ')}</span>
-                    <span className="flex items-center gap-1 text-muted-foreground">
-                      <ArrowRight className="h-3.5 w-3.5" />
-                      <em>{r.predicate}</em>
-                      <ArrowRight className="h-3.5 w-3.5" />
-                    </span>
-                    <span className="font-medium">{r.to}</span>
-                  </div>
-                ))}
+                {shownRelationships.map((r, i) => {
+                  const ref = `${r.from.join(',')}>${r.to}:${r.predicate}`;
+                  const confirmOv = edgeOverride(ref, 'confirm');
+                  const rejectOv = edgeOverride(ref, 'reject');
+                  const conf = r.status === 'confirmed' ? 100 : Math.round((r.confidence ?? 0.6) * 100);
+                  return (
+                    <div
+                      key={`${r.predicate}-${i}`}
+                      className={`flex items-center gap-2 rounded-lg border px-3 py-2 text-sm ${
+                        r.status === 'rejected'
+                          ? 'opacity-50 line-through bg-muted/20'
+                          : r.status === 'confirmed'
+                            ? 'border-emerald-400/60 bg-emerald-50/50 dark:bg-emerald-950/20'
+                            : 'bg-muted/40'
+                      }`}
+                    >
+                      <span className="font-medium">{r.from.join(' | ')}</span>
+                      <span className="flex items-center gap-1 text-muted-foreground">
+                        <ArrowRight className="h-3.5 w-3.5" />
+                        <em>{r.predicate}</em>
+                        <ArrowRight className="h-3.5 w-3.5" />
+                      </span>
+                      <span className="font-medium">{r.to}</span>
+                      <Badge variant="outline" className="text-[10px]">
+                        {r.origin ?? 'heuristic'} · {conf}%
+                      </Badge>
+                      <button
+                        type="button"
+                        title="Confirm (trusted)"
+                        className={`hover:text-emerald-600 ${r.status === 'confirmed' ? 'text-emerald-600' : 'text-muted-foreground'}`}
+                        onClick={() =>
+                          confirmOv
+                            ? void deleteOntologyOverride(confirmOv.id)
+                            : void saveOntologyOverride({
+                                product: selectedProduct.product_name,
+                                kind: 'edge_status',
+                                ref,
+                                action: 'confirm',
+                                value: { predicate: r.predicate },
+                              })
+                        }
+                      >
+                        <Check className="h-3.5 w-3.5" />
+                      </button>
+                      <button
+                        type="button"
+                        title="Reject (hide)"
+                        className={`hover:text-destructive ${r.status === 'rejected' ? 'text-destructive' : 'text-muted-foreground'}`}
+                        onClick={() =>
+                          rejectOv
+                            ? void deleteOntologyOverride(rejectOv.id)
+                            : void saveOntologyOverride({
+                                product: selectedProduct.product_name,
+                                kind: 'edge_status',
+                                ref,
+                                action: 'reject',
+                                value: { predicate: r.predicate },
+                              })
+                        }
+                      >
+                        <X className="h-3.5 w-3.5" />
+                      </button>
+                    </div>
+                  );
+                })}
               </div>
               <Table>
                 <TableHeader>
@@ -155,7 +247,7 @@ export function SemanticExplorer() {
                   </TableRow>
                 </TableHeader>
                 <TableBody>
-                  {relationships.map((r, i) => (
+                  {shownRelationships.map((r, i) => (
                     <TableRow key={`${r.predicate}-${i}`}>
                       <TableCell>{r.from.join(', ')}</TableCell>
                       <TableCell className="font-medium">{r.predicate}</TableCell>
@@ -186,7 +278,7 @@ export function SemanticExplorer() {
             {(['all', 'base', 'derived'] as const).map((kind) => (
               <TabsContent key={kind} value={kind}>
                 <MeasureTable
-                  rows={measures.filter((m) => kind === 'all' || m.type === kind)}
+                  rows={shownMeasures.filter((m) => kind === 'all' || m.type === kind)}
                 />
               </TabsContent>
             ))}
@@ -200,13 +292,13 @@ export function SemanticExplorer() {
             <CardTitle>Entity → property drill-down</CardTitle>
             <CardDescription>Properties and physical bindings for one entity</CardDescription>
           </div>
-          {classes.length > 0 && (
+          {shownClasses.length > 0 && (
             <Select value={effectiveClass} onValueChange={setActiveClass}>
               <SelectTrigger className="w-56">
                 <SelectValue placeholder="Select entity" />
               </SelectTrigger>
               <SelectContent>
-                {classes.map((c) => (
+                {shownClasses.map((c) => (
                   <SelectItem key={c} value={c}>
                     {c}
                   </SelectItem>

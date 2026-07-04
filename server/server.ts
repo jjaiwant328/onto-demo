@@ -7,6 +7,7 @@ import {
   isDemoProduct,
   DEMO_PRODUCTS,
 } from '../shared/demoDomains';
+import { lbQuery, ensureLakebaseTables, lakebaseConfigured } from './lakebase';
 
 // The serving plugin is wired to a Foundation Model endpoint (alias "llm",
 // endpoint name from DATABRICKS_SERVING_ENDPOINT_NAME). It powers the optional
@@ -36,7 +37,6 @@ createApp({
       return s.replace(/\*/g, '%'); // wildcard: * or % both → %
     };
     const safeIdent = (v: string): string => v.replace(/[^a-zA-Z0-9_]/g, '');
-    const sqlStr = (v: unknown): string => `'${String(v ?? '').replace(/'/g, "''")}'`;
 
     // ---- SP-authenticated Databricks REST (host + bearer via the SDK config) ----
     // Works locally (profile) and on the Apps runtime (injected SP creds).
@@ -54,7 +54,6 @@ createApp({
       return fetch(`${host}${path}`, { method: init.method, headers, body: init.rawBody });
     };
     const VOLUME_BASE = '/Volumes/jai_ontos/demo_schema/onto_artifacts';
-    const SAVED_TABLE = 'jai_ontos.demo_schema.jai_saved_schemas';
     // Files API: PUT/GET/DELETE a volume file
     const volumePut = (volPath: string, body: string) =>
       authFetch(`/api/2.0/fs/files${volPath}?overwrite=true`, {
@@ -66,16 +65,116 @@ createApp({
     const volumeDelete = (volPath: string) =>
       authFetch(`/api/2.0/fs/files${volPath}`, { method: 'DELETE' });
 
+    // ---- Lakebase startup: create operational tables + one-time migrate from
+    // the Delta backups (jai_ontos.demo_schema.*). Idempotent: CREATE IF NOT
+    // EXISTS + INSERT ... ON CONFLICT DO NOTHING, so it never clobbers newer
+    // Lakebase writes. Delta copies are left in place as backup. Runs once at
+    // startup, best-effort (never blocks the server from serving).
+    const initLakebase = async (): Promise<void> => {
+      if (!lakebaseConfigured()) {
+        console.log('[lakebase] not configured (no PGHOST/LAKEBASE_ENDPOINT) — skipping init');
+        return;
+      }
+      try {
+        await ensureLakebaseTables();
+        console.log('[lakebase] tables ensured');
+      } catch (err) {
+        console.error('[lakebase] ensureTables failed:', String(err));
+        return; // if DDL fails (e.g. missing CREATE grant), skip migration
+      }
+      // one-time migration (guarded: only if the Lakebase table is empty)
+      try {
+        const existing = await lbQuery<{ n: string }>(`SELECT count(*)::text AS n FROM saved_schemas`);
+        if (Number(existing[0]?.n ?? '0') === 0) {
+          const rows = await runSql(
+            `SELECT schema_id, customer, schema_name, source, catalog_ref, table_count, created_by, ` +
+              `cast(created_at as string) as created_at, volume_path, schema_json, catalog_json ` +
+              `FROM jai_ontos.demo_schema.jai_saved_schemas`
+          ).catch(() => [] as Record<string, unknown>[]);
+          for (const r of rows) {
+            await lbQuery(
+              `INSERT INTO saved_schemas (schema_id, customer, schema_name, source, catalog_ref, ` +
+                `table_count, created_by, created_at, volume_path, schema_json, catalog_json) ` +
+                `VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT (schema_id) DO NOTHING`,
+              [
+                r.schema_id, r.customer, r.schema_name, r.source, r.catalog_ref,
+                r.table_count == null ? null : Number(r.table_count), r.created_by,
+                r.created_at ? new Date(String(r.created_at)) : null, r.volume_path,
+                r.schema_json ?? null, r.catalog_json ?? null,
+              ]
+            ).catch((e) => console.error('[lakebase] migrate saved_schemas row failed:', String(e)));
+          }
+          console.log(`[lakebase] migrated ${rows.length} saved_schemas row(s) from Delta`);
+        }
+      } catch (err) {
+        console.error('[lakebase] saved_schemas migration skipped:', String(err));
+      }
+      try {
+        const existing = await lbQuery<{ n: string }>(`SELECT count(*)::text AS n FROM action_log`);
+        if (Number(existing[0]?.n ?? '0') === 0) {
+          const rows = await runSql(
+            `SELECT action_id, cast(created_at as string) c, cast(updated_at as string) u, schema_label, ` +
+              `domain, product, source, priority, issue, root_cause, recommended_action, confidence, ` +
+              `decision, track_status, decided_by, cast(decided_at as string) d, ref_entity, notes ` +
+              `FROM jai_ontos.demo_schema.jai_action_log`
+          ).catch(() => [] as Record<string, unknown>[]);
+          for (const r of rows) {
+            await lbQuery(
+              `INSERT INTO action_log (action_id, created_at, updated_at, schema_label, domain, product, ` +
+                `source, priority, issue, root_cause, recommended_action, confidence, decision, ` +
+                `track_status, decided_by, decided_at, ref_entity, notes) VALUES ` +
+                `($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18) ON CONFLICT (action_id) DO NOTHING`,
+              [
+                r.action_id, r.c ? new Date(String(r.c)) : null, r.u ? new Date(String(r.u)) : null,
+                r.schema_label, r.domain, r.product, r.source, r.priority, r.issue, r.root_cause,
+                r.recommended_action, r.confidence == null ? null : Number(r.confidence), r.decision,
+                r.track_status, r.decided_by, r.d ? new Date(String(r.d)) : null, r.ref_entity, r.notes,
+              ]
+            ).catch((e) => console.error('[lakebase] migrate action_log row failed:', String(e)));
+          }
+          console.log(`[lakebase] migrated ${rows.length} action_log row(s) from Delta`);
+        }
+      } catch (err) {
+        console.error('[lakebase] action_log migration skipped:', String(err));
+      }
+      try {
+        const existing = await lbQuery<{ n: string }>(`SELECT count(*)::text AS n FROM product_links`);
+        if (Number(existing[0]?.n ?? '0') === 0) {
+          const rows = await runSql(
+            `SELECT link_id, schema_label, domain, product, link_type, url, label, created_by, ` +
+              `cast(created_at as string) c FROM jai_ontos.demo_schema.jai_product_links`
+          ).catch(() => [] as Record<string, unknown>[]);
+          for (const r of rows) {
+            await lbQuery(
+              `INSERT INTO product_links (link_id, schema_label, domain, product, link_type, url, label, ` +
+                `created_by, created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT (link_id) DO NOTHING`,
+              [
+                r.link_id, r.schema_label, r.domain, r.product, r.link_type, r.url, r.label,
+                r.created_by, r.c ? new Date(String(r.c)) : null,
+              ]
+            ).catch((e) => console.error('[lakebase] migrate product_links row failed:', String(e)));
+          }
+          console.log(`[lakebase] migrated ${rows.length} product_links row(s) from Delta`);
+        }
+      } catch (err) {
+        console.error('[lakebase] product_links migration skipped:', String(err));
+      }
+    };
+    void initLakebase();
+
     appkit.server.extend((app) => {
       // Tells the client whether the LLM-polish path is available.
       app.get('/api/llm-status', (_req, res) => {
         res.json({ available: hasLlm });
       });
 
-      // ---- durable schema store: Volume = content, Delta = index ----
-      const INLINE_MAX = 150 * 1024; // inline schema_json in Delta only if small
+      // ---- durable schema store: Volume = content, Lakebase = index ----
+      // Operational index rows live in Lakebase (Postgres) for fast reads; the
+      // raw schema JSON *content* stays in the UC Volume (lazy-loaded), same as
+      // before. schema_json is also inlined in Postgres when small.
+      const INLINE_MAX = 150 * 1024; // inline schema_json only if small
 
-      // Save a schema: raw JSON → volume; metadata row → Delta.
+      // Save a schema: raw JSON → volume; metadata row → Lakebase (UPSERT dedupe).
       app.post('/api/save-schema', async (req, res) => {
         const b = (req.body ?? {}) as {
           customer?: string;
@@ -116,16 +215,48 @@ createApp({
             /* ignore */
           }
 
-          // 3) index row in Delta (inline JSON only if small)
-          const inline = json.length <= INLINE_MAX ? sqlStr(json) : 'NULL';
-          await runSql(
-            `INSERT INTO ${SAVED_TABLE} ` +
+          // 3) index row in Lakebase (inline JSON only if small). De-dupe by
+          // schema_name + customer: UPDATE in place (clear stale catalog_json)
+          // instead of inserting a duplicate.
+          const inline = json.length <= INLINE_MAX ? json : null;
+          const existing = await lbQuery<{ schema_id: string }>(
+            `SELECT schema_id FROM saved_schemas WHERE schema_name = $1 AND customer = $2 LIMIT 1`,
+            [schemaName, customer]
+          );
+          if (existing.length > 0) {
+            const existingId = existing[0].schema_id;
+            await lbQuery(
+              `UPDATE saved_schemas SET source = $1, catalog_ref = $2, table_count = $3, ` +
+                `volume_path = $4, schema_json = $5, catalog_json = NULL WHERE schema_id = $6`,
+              [b.source ?? 'upload', b.catalogRef ?? '', tableCount, volPath, inline, existingId]
+            );
+            res.json({ ok: true, schema_id: existingId, volume_path: volPath, table_count: tableCount, updated: true });
+            return;
+          }
+          await lbQuery(
+            `INSERT INTO saved_schemas ` +
               `(schema_id, customer, schema_name, source, catalog_ref, table_count, created_by, created_at, volume_path, schema_json) ` +
-              `VALUES (${sqlStr(schemaId)}, ${sqlStr(customer)}, ${sqlStr(schemaName)}, ${sqlStr(
-                b.source ?? 'upload'
-              )}, ${sqlStr(b.catalogRef ?? '')}, ${tableCount}, ${sqlStr(createdBy)}, current_timestamp(), ${sqlStr(volPath)}, ${inline})`
+              `VALUES ($1, $2, $3, $4, $5, $6, $7, now(), $8, $9)`,
+            [schemaId, customer, schemaName, b.source ?? 'upload', b.catalogRef ?? '', tableCount, createdBy, volPath, inline]
           );
           res.json({ ok: true, schema_id: schemaId, volume_path: volPath, table_count: tableCount });
+        } catch (err) {
+          res.json({ ok: false, error: humanizeSqlError(err) });
+        }
+      });
+
+      // Persist a refined catalog for a saved schema (skip the LLM next time).
+      app.post('/api/save-catalog', async (req, res) => {
+        const b = (req.body ?? {}) as { schema_id?: string; catalog_json?: unknown };
+        const id = String(b.schema_id ?? '').trim();
+        if (!id || b.catalog_json == null) {
+          res.status(400).json({ ok: false, error: 'schema_id and catalog_json required' });
+          return;
+        }
+        const cat = typeof b.catalog_json === 'string' ? b.catalog_json : JSON.stringify(b.catalog_json);
+        try {
+          await lbQuery(`UPDATE saved_schemas SET catalog_json = $1 WHERE schema_id = $2`, [cat, id]);
+          res.json({ ok: true });
         } catch (err) {
           res.json({ ok: false, error: humanizeSqlError(err) });
         }
@@ -134,9 +265,10 @@ createApp({
       // List saved-schema metadata (no blob).
       app.get('/api/saved-schemas', async (_req, res) => {
         try {
-          const rows = await runSql(
+          const rows = await lbQuery(
             `SELECT schema_id, customer, schema_name, source, catalog_ref, table_count, created_by, ` +
-              `cast(created_at as string) as created_at, volume_path FROM ${SAVED_TABLE} ORDER BY created_at DESC`
+              `to_char(created_at, 'YYYY-MM-DD HH24:MI:SS') AS created_at, volume_path ` +
+              `FROM saved_schemas ORDER BY created_at DESC`
           );
           res.json({ schemas: rows });
         } catch (err) {
@@ -144,24 +276,35 @@ createApp({
         }
       });
 
-      // Fetch a saved schema's full content (volume file, or inline schema_json).
+      // Fetch a saved schema's full content (volume file, or inline schema_json)
+      // plus the cached refined catalog (catalog_json) when present.
       app.get('/api/saved-schema/:id', async (req, res) => {
-        const id = safeIdent(String(req.params.id));
+        const id = String(req.params.id);
         try {
-          const rows = await runSql(
-            `SELECT volume_path, schema_json FROM ${SAVED_TABLE} WHERE schema_id = ${sqlStr(id)} LIMIT 1`
+          const rows = await lbQuery<{ volume_path: string | null; schema_json: string | null; catalog_json: string | null }>(
+            `SELECT volume_path, schema_json, catalog_json FROM saved_schemas WHERE schema_id = $1 LIMIT 1`,
+            [id]
           );
           if (rows.length === 0) {
             res.status(404).json({ error: 'not found' });
             return;
           }
+          // parse the cached refined catalog if present
+          let catalog: unknown = undefined;
+          const catRaw = rows[0].catalog_json;
+          if (catRaw != null && catRaw !== '') {
+            try {
+              const c = typeof catRaw === 'string' ? JSON.parse(catRaw) : catRaw;
+              if (c && typeof c === 'object') catalog = c;
+            } catch {
+              /* ignore bad cache */
+            }
+          }
           const inlineJson = rows[0].schema_json;
           if (inlineJson != null && inlineJson !== '') {
-            // analytics may return the column already-parsed (object) or as a string
-            const parsed =
-              typeof inlineJson === 'string' ? JSON.parse(inlineJson) : inlineJson;
+            const parsed = typeof inlineJson === 'string' ? JSON.parse(inlineJson) : inlineJson;
             if (parsed && typeof parsed === 'object' && Object.keys(parsed).length > 0) {
-              res.json({ schema: parsed });
+              res.json({ schema: parsed, catalog });
               return;
             }
           }
@@ -171,25 +314,26 @@ createApp({
             res.json({ error: `Volume read failed (${dl.status})` });
             return;
           }
-          res.json({ schema: JSON.parse(await dl.text()) });
+          res.json({ schema: JSON.parse(await dl.text()), catalog });
         } catch (err) {
           res.status(200).json({ error: humanizeSqlError(err) });
         }
       });
 
-      // Delete a saved schema (Delta row + volume file).
+      // Delete a saved schema (Lakebase row + volume file).
       app.post('/api/delete-saved-schema', async (req, res) => {
-        const id = safeIdent(String((req.body ?? {}).schema_id ?? ''));
+        const id = String((req.body ?? {}).schema_id ?? '').trim();
         if (!id) {
           res.status(400).json({ error: 'schema_id required' });
           return;
         }
         try {
-          const rows = await runSql(
-            `SELECT volume_path FROM ${SAVED_TABLE} WHERE schema_id = ${sqlStr(id)} LIMIT 1`
+          const rows = await lbQuery<{ volume_path: string | null }>(
+            `SELECT volume_path FROM saved_schemas WHERE schema_id = $1 LIMIT 1`,
+            [id]
           );
           const volPath = rows[0]?.volume_path ? String(rows[0].volume_path) : '';
-          await runSql(`DELETE FROM ${SAVED_TABLE} WHERE schema_id = ${sqlStr(id)}`);
+          await lbQuery(`DELETE FROM saved_schemas WHERE schema_id = $1`, [id]);
           if (volPath) {
             try {
               await volumeDelete(volPath);
@@ -571,8 +715,7 @@ createApp({
         res.json({ answer, action: action && action.recommended_action ? action : undefined });
       });
 
-      // ---- Feature 3: action log / tracker (persisted to jai_action_log) ----
-      const ACTION_LOG_TABLE = 'jai_ontos.demo_schema.jai_action_log';
+      // ---- Feature 3: action log / tracker (persisted to Lakebase action_log) ----
       const whoami = async (): Promise<string> => {
         try {
           const me = await authFetch('/api/2.0/preview/scim/v2/Me', { method: 'GET' });
@@ -583,7 +726,7 @@ createApp({
         return 'unknown';
       };
 
-      // POST /api/log-action — insert a decided action into the log.
+      // POST /api/log-action — insert a decided action into the Lakebase log.
       app.post('/api/log-action', async (req, res) => {
         const b = (req.body ?? {}) as Record<string, unknown>;
         const decision = String(b.decision ?? '');
@@ -595,16 +738,28 @@ createApp({
         const actionId = `act_${Date.now().toString(36)}_${randomUUID().slice(0, 8)}`;
         const conf = typeof b.confidence === 'number' ? (b.confidence as number) : Number(b.confidence) || 0;
         try {
-          await runSql(
-            `INSERT INTO ${ACTION_LOG_TABLE} ` +
+          await lbQuery(
+            `INSERT INTO action_log ` +
               `(action_id, created_at, updated_at, schema_label, domain, product, source, priority, ` +
               `issue, root_cause, recommended_action, confidence, decision, track_status, decided_by, ` +
               `decided_at, ref_entity, notes) VALUES (` +
-              `${sqlStr(actionId)}, current_timestamp(), current_timestamp(), ` +
-              `${sqlStr(b.schema_label)}, ${sqlStr(b.domain)}, ${sqlStr(b.product)}, ${sqlStr(b.source)}, ` +
-              `${sqlStr(b.priority)}, ${sqlStr(b.issue)}, ${sqlStr(b.root_cause)}, ` +
-              `${sqlStr(b.recommended_action)}, ${conf}, ${sqlStr(decision)}, 'open', ` +
-              `${sqlStr(decidedBy)}, current_timestamp(), ${sqlStr(b.ref_entity)}, ${sqlStr(b.notes)})`
+              `$1, now(), now(), $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'open', $12, now(), $13, $14)`,
+            [
+              actionId,
+              String(b.schema_label ?? ''),
+              String(b.domain ?? ''),
+              String(b.product ?? ''),
+              String(b.source ?? ''),
+              String(b.priority ?? ''),
+              String(b.issue ?? ''),
+              String(b.root_cause ?? ''),
+              String(b.recommended_action ?? ''),
+              conf,
+              decision,
+              decidedBy,
+              String(b.ref_entity ?? ''),
+              String(b.notes ?? ''),
+            ]
           );
           res.json({ ok: true, action_id: actionId, decided_by: decidedBy });
         } catch (err) {
@@ -617,16 +772,18 @@ createApp({
         const product = (req.query.product as string | undefined)?.trim();
         const status = (req.query.status as string | undefined)?.trim();
         const where: string[] = [];
-        if (product) where.push(`product = ${sqlStr(product)}`);
-        if (status) where.push(`track_status = ${sqlStr(status)}`);
+        const params: unknown[] = [];
+        if (product) { params.push(product); where.push(`product = $${params.length}`); }
+        if (status) { params.push(status); where.push(`track_status = $${params.length}`); }
         const clause = where.length ? ` WHERE ${where.join(' AND ')}` : '';
         try {
-          const rows = await runSql(
-            `SELECT action_id, cast(created_at as string) AS created_at, ` +
-              `cast(updated_at as string) AS updated_at, schema_label, domain, product, source, ` +
+          const rows = await lbQuery(
+            `SELECT action_id, to_char(created_at, 'YYYY-MM-DD HH24:MI:SS') AS created_at, ` +
+              `to_char(updated_at, 'YYYY-MM-DD HH24:MI:SS') AS updated_at, schema_label, domain, product, source, ` +
               `priority, issue, root_cause, recommended_action, confidence, decision, track_status, ` +
-              `decided_by, cast(decided_at as string) AS decided_at, ref_entity, notes ` +
-              `FROM ${ACTION_LOG_TABLE}${clause} ORDER BY created_at DESC LIMIT 500`
+              `decided_by, to_char(decided_at, 'YYYY-MM-DD HH24:MI:SS') AS decided_at, ref_entity, notes ` +
+              `FROM action_log${clause} ORDER BY created_at DESC LIMIT 500`,
+            params
           );
           res.json({ actions: rows });
         } catch (err) {
@@ -644,9 +801,9 @@ createApp({
           return;
         }
         try {
-          await runSql(
-            `UPDATE ${ACTION_LOG_TABLE} SET track_status = ${sqlStr(st)}, ` +
-              `updated_at = current_timestamp() WHERE action_id = ${sqlStr(id)}`
+          await lbQuery(
+            `UPDATE action_log SET track_status = $1, updated_at = now() WHERE action_id = $2`,
+            [st, id]
           );
           res.json({ ok: true });
         } catch (err) {
@@ -655,8 +812,6 @@ createApp({
       });
 
       // ---- Feature 4: product links (Genie Space / AI-BI dashboard) ----
-      const PRODUCT_LINKS_TABLE = 'jai_ontos.demo_schema.jai_product_links';
-
       // POST /api/attach-link — attach a Genie/dashboard URL to a product.
       app.post('/api/attach-link', async (req, res) => {
         const b = (req.body ?? {}) as Record<string, unknown>;
@@ -669,11 +824,20 @@ createApp({
         const createdBy = await whoami();
         const linkId = `lnk_${Date.now().toString(36)}_${randomUUID().slice(0, 8)}`;
         try {
-          await runSql(
-            `INSERT INTO ${PRODUCT_LINKS_TABLE} ` +
-              `(link_id, schema_label, domain, product, link_type, url, label, created_by, created_at) VALUES (` +
-              `${sqlStr(linkId)}, ${sqlStr(b.schema_label)}, ${sqlStr(b.domain)}, ${sqlStr(b.product)}, ` +
-              `${sqlStr(linkType)}, ${sqlStr(url)}, ${sqlStr(b.label)}, ${sqlStr(createdBy)}, current_timestamp())`
+          await lbQuery(
+            `INSERT INTO product_links ` +
+              `(link_id, schema_label, domain, product, link_type, url, label, created_by, created_at) ` +
+              `VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now())`,
+            [
+              linkId,
+              String(b.schema_label ?? ''),
+              String(b.domain ?? ''),
+              String(b.product ?? ''),
+              linkType,
+              url,
+              String(b.label ?? ''),
+              createdBy,
+            ]
           );
           res.json({ ok: true, link_id: linkId, created_by: createdBy });
         } catch (err) {
@@ -684,12 +848,15 @@ createApp({
       // GET /api/product-links — list links (optional ?product=).
       app.get('/api/product-links', async (req, res) => {
         const product = (req.query.product as string | undefined)?.trim();
-        const clause = product ? ` WHERE product = ${sqlStr(product)}` : '';
+        const params: unknown[] = [];
+        let clause = '';
+        if (product) { params.push(product); clause = ` WHERE product = $1`; }
         try {
-          const rows = await runSql(
+          const rows = await lbQuery(
             `SELECT link_id, schema_label, domain, product, link_type, url, label, created_by, ` +
-              `cast(created_at as string) AS created_at FROM ${PRODUCT_LINKS_TABLE}${clause} ` +
-              `ORDER BY created_at DESC LIMIT 500`
+              `to_char(created_at, 'YYYY-MM-DD HH24:MI:SS') AS created_at FROM product_links${clause} ` +
+              `ORDER BY created_at DESC LIMIT 500`,
+            params
           );
           res.json({ links: rows });
         } catch (err) {
@@ -705,7 +872,84 @@ createApp({
           return;
         }
         try {
-          await runSql(`DELETE FROM ${PRODUCT_LINKS_TABLE} WHERE link_id = ${sqlStr(id)}`);
+          await lbQuery(`DELETE FROM product_links WHERE link_id = $1`, [id]);
+          res.json({ ok: true });
+        } catch (err) {
+          res.json({ ok: false, error: String(err) });
+        }
+      });
+
+      // ---- Ontology curation: user overrides layered over derived components ----
+      // POST /api/ontology-override — upsert one override (unique per
+      // schema_label + product + kind + ref + action).
+      app.post('/api/ontology-override', async (req, res) => {
+        const b = (req.body ?? {}) as {
+          schema_label?: string;
+          product?: string;
+          kind?: string;
+          ref?: string;
+          action?: string;
+          value?: unknown;
+        };
+        const kinds = ['entity', 'relationship', 'mapping', 'edge_status'];
+        const actions = ['rename', 'merge', 'set_role', 'set_pii', 'delete', 'confirm', 'reject'];
+        if (!b.schema_label || !kinds.includes(String(b.kind)) || !actions.includes(String(b.action)) || !b.ref) {
+          res.status(400).json({ ok: false, error: 'schema_label, kind, action, ref required' });
+          return;
+        }
+        const createdBy = await whoami();
+        const value = b.value == null ? '' : typeof b.value === 'string' ? b.value : JSON.stringify(b.value);
+        // deterministic id so the same target+action upserts in place
+        const id = `ov_${Buffer.from(`${b.schema_label}|${b.product ?? ''}|${b.kind}|${b.ref}|${b.action}`).toString('base64url').slice(0, 48)}`;
+        try {
+          await lbQuery(
+            `INSERT INTO ontology_overrides (id, schema_label, product, kind, ref, action, value, created_by, created_at) ` +
+              `VALUES ($1,$2,$3,$4,$5,$6,$7,$8, now()) ` +
+              `ON CONFLICT (id) DO UPDATE SET value = EXCLUDED.value, created_by = EXCLUDED.created_by, created_at = now()`,
+            [id, b.schema_label, b.product ?? '', b.kind, b.ref, b.action, value, createdBy]
+          );
+          res.json({ ok: true, id });
+        } catch (err) {
+          res.json({ ok: false, error: String(err) });
+        }
+      });
+
+      // GET /api/ontology-overrides?schema=<label>[&product=<name>]
+      app.get('/api/ontology-overrides', async (req, res) => {
+        const schema = (req.query.schema as string | undefined)?.trim();
+        const product = (req.query.product as string | undefined)?.trim();
+        if (!schema) {
+          res.status(400).json({ overrides: [], error: 'schema required' });
+          return;
+        }
+        const params: unknown[] = [schema];
+        let clause = `schema_label = $1`;
+        if (product) {
+          params.push(product);
+          clause += ` AND product = $2`;
+        }
+        try {
+          const rows = await lbQuery(
+            `SELECT id, schema_label, product, kind, ref, action, value, created_by, ` +
+              `to_char(created_at, 'YYYY-MM-DD HH24:MI:SS') AS created_at ` +
+              `FROM ontology_overrides WHERE ${clause} ORDER BY created_at DESC LIMIT 2000`,
+            params
+          );
+          res.json({ overrides: rows });
+        } catch (err) {
+          res.json({ overrides: [], error: String(err) });
+        }
+      });
+
+      // POST /api/delete-ontology-override {id}
+      app.post('/api/delete-ontology-override', async (req, res) => {
+        const id = String((req.body as { id?: string })?.id ?? '').trim();
+        if (!id) {
+          res.status(400).json({ ok: false, error: 'id required' });
+          return;
+        }
+        try {
+          await lbQuery(`DELETE FROM ontology_overrides WHERE id = $1`, [id]);
           res.json({ ok: true });
         } catch (err) {
           res.json({ ok: false, error: String(err) });

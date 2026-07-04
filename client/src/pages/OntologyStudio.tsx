@@ -18,21 +18,35 @@ import {
   TableRow,
   ToggleGroup,
   ToggleGroupItem,
+  Button,
+  Switch,
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
 } from '@databricks/appkit-ui/react';
-import { CheckCircle2, XCircle, AlertTriangle, Info } from 'lucide-react';
+import { CheckCircle2, XCircle, AlertTriangle, Info, Check, X, Trash2 } from 'lucide-react';
 import { useProduct } from '../lib/product';
 import { LiveValidation } from './LiveValidation';
 import { CatalogLoadingSkeleton } from '../components/LoadingSkeleton';
 
-const ROLE_VARIANT: Record<string, 'default' | 'secondary' | 'outline'> = {
-  key: 'default',
-  attribute: 'secondary',
-  measure: 'outline',
-};
-
 export function OntologyStudio() {
-  const { components, selectedProduct, catalogLoading, rebuilding, activeSourceCatalog } = useProduct();
-  const { classes, mappings, live } = components;
+  const {
+    components,
+    selectedProduct,
+    catalogLoading,
+    rebuilding,
+    activeSourceCatalog,
+    saveOntologyOverride,
+    deleteOntologyOverride,
+    ontologyOverrides,
+  } = useProduct();
+  const { classes, mappings, relationships, live } = components;
+
+  // quick lookup: is there an override for a given ref (by key)?
+  const overrideFor = (kind: string, ref: string, action: string) =>
+    ontologyOverrides.find((o) => o.kind === kind && o.ref === ref && o.action === action);
 
   const roles = useMemo<string[]>(
     () => Array.from(new Set(mappings.map((m) => m.role as string))).sort(),
@@ -124,27 +138,209 @@ export function OntologyStudio() {
                   <TableHead>Entity</TableHead>
                   <TableHead>Property</TableHead>
                   <TableHead>Role</TableHead>
+                  <TableHead>PII</TableHead>
                   <TableHead>Type</TableHead>
                   <TableHead>Source</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
-                {filteredMappings.map((m, i) => (
-                  <TableRow key={`${m.class}-${m.property}-${i}`}>
-                    <TableCell className="font-medium">{m.class}</TableCell>
-                    <TableCell>{m.property}</TableCell>
-                    <TableCell>
-                      <Badge variant={ROLE_VARIANT[m.role] ?? 'outline'}>{m.role}</Badge>
-                    </TableCell>
-                    <TableCell className="text-muted-foreground">{m.type}</TableCell>
-                    <TableCell>
-                      <code className="text-xs">{m.source}</code>
-                    </TableCell>
-                  </TableRow>
-                ))}
+                {filteredMappings.map((m, i) => {
+                  const ref = `${m.class}.${m.column}`;
+                  const roleOv = overrideFor('mapping', ref, 'set_role');
+                  const piiOv = overrideFor('mapping', ref, 'set_pii');
+                  return (
+                    <TableRow key={`${m.class}-${m.property}-${i}`}>
+                      <TableCell className="font-medium">{m.class}</TableCell>
+                      <TableCell>{m.property}</TableCell>
+                      <TableCell>
+                        <div className="flex items-center gap-1.5">
+                          <Select
+                            value={m.role}
+                            onValueChange={(v) =>
+                              void saveOntologyOverride({
+                                product: selectedProduct.product_name,
+                                kind: 'mapping',
+                                ref,
+                                action: 'set_role',
+                                value: { role: v },
+                              })
+                            }
+                          >
+                            <SelectTrigger className="h-7 w-28 text-xs">
+                              <SelectValue />
+                            </SelectTrigger>
+                            <SelectContent>
+                              <SelectItem value="key">key</SelectItem>
+                              <SelectItem value="measure">measure</SelectItem>
+                              <SelectItem value="attribute">attribute</SelectItem>
+                            </SelectContent>
+                          </Select>
+                          {m.origin === 'user' && (
+                            <Badge variant="outline" className="text-[10px]">
+                              edited
+                            </Badge>
+                          )}
+                          {roleOv && (
+                            <button
+                              type="button"
+                              className="text-[10px] text-muted-foreground hover:text-destructive"
+                              title="Clear role override"
+                              onClick={() => void deleteOntologyOverride(roleOv.id)}
+                            >
+                              clear
+                            </button>
+                          )}
+                        </div>
+                      </TableCell>
+                      <TableCell>
+                        <div className="flex items-center gap-1.5">
+                          <Switch
+                            checked={Boolean(m.pii)}
+                            onCheckedChange={(v) =>
+                              void saveOntologyOverride({
+                                product: selectedProduct.product_name,
+                                kind: 'mapping',
+                                ref,
+                                action: 'set_pii',
+                                value: { pii: Boolean(v) },
+                              })
+                            }
+                            aria-label="PII"
+                          />
+                          {piiOv && (
+                            <button
+                              type="button"
+                              className="text-[10px] text-muted-foreground hover:text-destructive"
+                              title="Clear PII override"
+                              onClick={() => void deleteOntologyOverride(piiOv.id)}
+                            >
+                              clear
+                            </button>
+                          )}
+                        </div>
+                      </TableCell>
+                      <TableCell className="text-muted-foreground">{m.type}</TableCell>
+                      <TableCell>
+                        <code className="text-xs">{m.source}</code>
+                      </TableCell>
+                    </TableRow>
+                  );
+                })}
               </TableBody>
             </Table>
           </div>
+        </CardContent>
+      </Card>
+
+      {/* Relationships — origin + confidence, with confirm/reject/delete */}
+      <Card className="shadow-sm">
+        <CardHeader>
+          <CardTitle>Relationships (inferred lineage / FKs)</CardTitle>
+          <CardDescription>
+            Confirm trusted edges, reject spurious ones, or delete an FK. Confirmed edges become
+            user-trusted; rejected edges are hidden downstream.
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          {relationships.length === 0 ? (
+            <p className="text-sm text-muted-foreground">No relationships inferred.</p>
+          ) : (
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead>From → To</TableHead>
+                  <TableHead>Origin</TableHead>
+                  <TableHead>Confidence</TableHead>
+                  <TableHead className="text-right">Curate</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {relationships.map((r, i) => {
+                  const ref = `${r.from.join(',')}>${r.to}:${r.predicate}`;
+                  const confirmOv = overrideFor('edge_status', ref, 'confirm');
+                  const rejectOv = overrideFor('edge_status', ref, 'reject');
+                  return (
+                    <TableRow key={`${ref}-${i}`}>
+                      <TableCell className="font-medium">
+                        {r.from.join(', ')} <span className="text-muted-foreground">·{r.predicate}·</span> {r.to}
+                      </TableCell>
+                      <TableCell>
+                        <Badge variant={r.origin === 'user' ? 'default' : 'outline'} className="text-[10px]">
+                          {r.origin ?? 'heuristic'}
+                        </Badge>
+                      </TableCell>
+                      <TableCell>
+                        <span className="text-xs text-muted-foreground">
+                          {r.status === 'confirmed'
+                            ? '100% (confirmed)'
+                            : `${Math.round((r.confidence ?? 0.6) * 100)}%`}
+                        </span>
+                      </TableCell>
+                      <TableCell className="text-right">
+                        <div className="inline-flex items-center gap-1">
+                          <Button
+                            size="sm"
+                            variant={r.status === 'confirmed' ? 'default' : 'ghost'}
+                            className="h-7 px-2"
+                            title="Confirm (trusted)"
+                            onClick={() =>
+                              confirmOv
+                                ? void deleteOntologyOverride(confirmOv.id)
+                                : void saveOntologyOverride({
+                                    product: selectedProduct.product_name,
+                                    kind: 'edge_status',
+                                    ref,
+                                    action: 'confirm',
+                                    value: { predicate: r.predicate },
+                                  })
+                            }
+                          >
+                            <Check className="h-3.5 w-3.5" />
+                          </Button>
+                          <Button
+                            size="sm"
+                            variant={r.status === 'rejected' ? 'default' : 'ghost'}
+                            className="h-7 px-2"
+                            title="Reject (hide)"
+                            onClick={() =>
+                              rejectOv
+                                ? void deleteOntologyOverride(rejectOv.id)
+                                : void saveOntologyOverride({
+                                    product: selectedProduct.product_name,
+                                    kind: 'edge_status',
+                                    ref,
+                                    action: 'reject',
+                                    value: { predicate: r.predicate },
+                                  })
+                            }
+                          >
+                            <X className="h-3.5 w-3.5" />
+                          </Button>
+                          <Button
+                            size="sm"
+                            variant="ghost"
+                            className="h-7 px-2 text-destructive"
+                            title="Delete this FK/relationship"
+                            onClick={() =>
+                              void saveOntologyOverride({
+                                product: selectedProduct.product_name,
+                                kind: 'relationship',
+                                ref,
+                                action: 'delete',
+                                value: { predicate: r.predicate },
+                              })
+                            }
+                          >
+                            <Trash2 className="h-3.5 w-3.5" />
+                          </Button>
+                        </div>
+                      </TableCell>
+                    </TableRow>
+                  );
+                })}
+              </TableBody>
+            </Table>
+          )}
         </CardContent>
       </Card>
 

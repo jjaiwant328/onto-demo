@@ -34,6 +34,7 @@ import {
   Target,
   RotateCcw,
   Loader2,
+  Settings,
 } from 'lucide-react';
 import { ProductProvider, useProduct, ALL_SCOPE } from './lib/product';
 import { ActionsContext, type ActionItem } from './lib/actions';
@@ -49,15 +50,17 @@ import { PrintActions } from './pages/PrintActions';
 import { SchemaLoader } from './components/SchemaLoader';
 import { Copilot } from './components/Copilot';
 
-const NAV = [
+// always-on nav (ontology-focused)
+const NAV_BASE = [
   { to: '/data-products', label: 'Data Products' },
   { to: '/ontology-studio', label: 'Ontology Studio' },
   { to: '/semantic-explorer', label: 'Semantic Explorer' },
   { to: '/graph-explorer', label: 'Graph Explorer' },
   { to: '/data-contract', label: 'Data Contract' },
-  { to: '/action-center', label: 'Action Center' },
-  { to: '/business-view', label: 'Business View' },
 ];
+// optional nav entries, gated by settings toggles (default OFF)
+const NAV_ACTION_CENTER = { to: '/action-center', label: 'Action Center' };
+const NAV_BUSINESS_VIEW = { to: '/business-view', label: 'Business View' };
 
 // in-session action queue provider (shared by Action Center + Copilot).
 // Reset when the active customer/schema changes so no customer's actions leak
@@ -97,9 +100,15 @@ function NavLinks({
   linkClass: NavLinkClassFn;
   onClick?: () => void;
 }) {
+  const { showActionCenter, showBusinessView } = useProduct();
+  const nav = [
+    ...NAV_BASE,
+    ...(showActionCenter ? [NAV_ACTION_CENTER] : []),
+    ...(showBusinessView ? [NAV_BUSINESS_VIEW] : []),
+  ];
   return (
     <nav className={className}>
-      {NAV.map((n) => (
+      {nav.map((n) => (
         <NavLink key={n.to} to={n.to} className={linkClass} onClick={onClick}>
           {n.label}
         </NavLink>
@@ -157,6 +166,12 @@ function SchemaList() {
       <div className="flex flex-col gap-0.5 max-h-48 overflow-auto p-1">
         {schemaEntries.map((s) => {
           const bundled = isBundledSchema(s.id);
+          const isCurated = s.id === 'fc_entdata_gold';
+          const title = isCurated
+            ? 'Delete Retailer — removes the live flagship (restore via Reset)'
+            : bundled
+              ? 'Delete built-in schema (restore via Reset)'
+              : 'Delete schema';
           return (
             <div
               key={s.id}
@@ -172,18 +187,18 @@ function SchemaList() {
                 variant="ghost"
                 size="sm"
                 className="h-6 w-6 p-0 shrink-0"
-                disabled={bundled}
-                title={bundled ? 'Bundled schema — not removable' : 'Delete schema'}
+                title={title}
                 onClick={() => removeSchema(s.id)}
               >
-                <Trash2 className={`h-3.5 w-3.5 ${bundled ? 'opacity-30' : 'text-destructive'}`} />
+                <Trash2 className="h-3.5 w-3.5 text-destructive" />
               </Button>
             </div>
           );
         })}
       </div>
       <p className="text-[11px] text-muted-foreground px-2 py-1.5 border-t">
-        Select 1 to view alone; 2+ to combine &amp; conform shared dimensions.
+        Select 1 to view alone; 2+ to combine &amp; conform shared dimensions. Any schema (incl.
+        built-ins) can be deleted; Reset restores them.
       </p>
     </div>
   );
@@ -369,6 +384,7 @@ function ControlPanel() {
 
       <div className="space-y-2 border-t pt-4">
         <Copilot />
+        <SettingsMenu />
         <Button
           variant="ghost"
           size="sm"
@@ -380,6 +396,35 @@ function ControlPanel() {
         </Button>
       </div>
     </div>
+  );
+}
+
+// Settings — nav visibility toggles (Action Center + Business View, default OFF).
+function SettingsMenu() {
+  const { showActionCenter, setShowActionCenter, showBusinessView, setShowBusinessView } =
+    useProduct();
+  return (
+    <Popover>
+      <PopoverTrigger asChild>
+        <Button variant="outline" size="sm" className="w-full justify-start gap-1.5">
+          <Settings className="h-4 w-4" /> Settings
+        </Button>
+      </PopoverTrigger>
+      <PopoverContent className="w-64 p-3 space-y-2.5" align="start">
+        <div className="text-xs font-medium text-muted-foreground">Show sections</div>
+        <label className="flex items-center gap-2 text-sm cursor-pointer">
+          <Switch checked={showActionCenter} onCheckedChange={setShowActionCenter} />
+          Action Center
+        </label>
+        <label className="flex items-center gap-2 text-sm cursor-pointer">
+          <Switch checked={showBusinessView} onCheckedChange={setShowBusinessView} />
+          Business View
+        </label>
+        <p className="text-[11px] text-muted-foreground pt-1">
+          Off by default. Turn on to add these to the top navigation.
+        </p>
+      </PopoverContent>
+    </Popover>
   );
 }
 

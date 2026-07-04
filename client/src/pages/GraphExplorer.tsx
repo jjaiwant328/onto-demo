@@ -299,11 +299,78 @@ export function GraphExplorer() {
 
           <Inspector
             node={selectedNode}
+            sharedProducts={
+              isExplore && focusId ? enterpriseGraph.productsForNode(focusId) : []
+            }
+            onOpenProduct={(pn) => {
+              if (syncScopeFromSections) setSelectedProduct(pn);
+              const pnode = `prod:${pn}`;
+              if (enterpriseGraph.nodes[pnode]) travelTo(pnode);
+            }}
             onClear={() => (isExplore ? reset() : setSelOntoId(null))}
-            onJump={(n) => n.openIn && navigate(`/${n.openIn}`)}
+            onJump={(n) => {
+              // genie/dashboard link nodes → open the external URL in a new window
+              if (n.openUrl) {
+                window.open(n.openUrl, '_blank');
+                return;
+              }
+              if (n.openIn) navigate(`/${n.openIn}`);
+            }}
           />
         </div>
       </Tabs>
+
+      {/* Shared dimensions — the enterprise-ontology payoff: conformed/shared
+          tables and the products they connect (click a product to travel).
+          Always rendered (with a count, or a "none in scope" note) so it's
+          discoverable regardless of tab / focus / travel state. */}
+      <Card className="shadow-sm mt-4">
+        <CardHeader>
+          <CardTitle className="text-base flex items-center gap-2">
+            <Layers className="h-4 w-4 text-primary" /> Shared dimensions
+            <Badge variant="secondary">{enterpriseGraph.sharedDimensions.length}</Badge>
+          </CardTitle>
+          <CardDescription>
+            Tables connected to 2+ products — cross-product / cross-domain lineage across the active
+            catalog. Click a product to travel to it in the Explore map.
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-2">
+          {enterpriseGraph.sharedDimensions.length === 0 ? (
+            <p className="text-sm text-muted-foreground">No shared dimensions in this scope.</p>
+          ) : (
+            enterpriseGraph.sharedDimensions.slice(0, 30).map((sd) => (
+              <div
+                key={sd.nodeId}
+                className="flex flex-wrap items-center gap-2 text-sm border-b pb-2 last:border-b-0"
+              >
+                <span className="font-medium">{sd.label}</span>
+                <Badge variant="outline" className="text-[10px]">
+                  {sd.products.length} products
+                </Badge>
+                <span className="text-xs text-muted-foreground">shared across</span>
+                {sd.products.map((p) => (
+                  <button
+                    key={p.product_name}
+                    type="button"
+                    className="text-xs rounded-full border px-2 py-0.5 hover:bg-muted"
+                    onClick={() => {
+                      if (syncScopeFromSections) setSelectedProduct(p.product_name);
+                      const pnode = `prod:${p.product_name}`;
+                      if (enterpriseGraph.nodes[pnode]) {
+                        setTab('explore');
+                        travelTo(pnode);
+                      }
+                    }}
+                  >
+                    {p.display_name}
+                  </button>
+                ))}
+              </div>
+            ))
+          )}
+        </CardContent>
+      </Card>
     </div>
   );
 }
@@ -348,10 +415,14 @@ function Inspector({
   node,
   onClear,
   onJump,
+  sharedProducts = [],
+  onOpenProduct,
 }: {
   node: InspectorNode | null;
   onClear: () => void;
   onJump: (n: InspectorNode) => void;
+  sharedProducts?: { product_name: string; display_name: string }[];
+  onOpenProduct?: (productName: string) => void;
 }) {
   return (
     <Card className="shadow-sm h-fit">
@@ -377,6 +448,25 @@ function Inspector({
                 </Badge>
                 <div className="text-muted-foreground">
                   Shared across: {node.conformedSources.join(', ')} (columns unioned).
+                </div>
+              </div>
+            )}
+            {sharedProducts.length > 1 && (
+              <div className="rounded-md border p-2 text-xs space-y-1">
+                <div className="font-medium flex items-center gap-1.5">
+                  <Layers className="h-3 w-3" /> Shared across {sharedProducts.length} products
+                </div>
+                <div className="flex flex-wrap gap-1">
+                  {sharedProducts.map((p) => (
+                    <button
+                      key={p.product_name}
+                      type="button"
+                      className="rounded-full border px-2 py-0.5 hover:bg-muted"
+                      onClick={() => onOpenProduct?.(p.product_name)}
+                    >
+                      {p.display_name}
+                    </button>
+                  ))}
                 </div>
               </div>
             )}
@@ -432,7 +522,12 @@ function Inspector({
                 </p>
               </div>
             )}
-            {node.openIn && (
+            {node.openUrl && (
+              <Button variant="default" size="sm" className="w-full" onClick={() => onJump(node)}>
+                Open {node.kindLabel} in a new window
+              </Button>
+            )}
+            {!node.openUrl && node.openIn && (
               <Button variant="outline" size="sm" className="w-full" onClick={() => onJump(node)}>
                 Open in{' '}
                 {node.openIn === 'data-products'

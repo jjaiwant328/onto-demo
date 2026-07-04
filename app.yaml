@@ -10,3 +10,17 @@ env:
   # (serving plugin alias "llm"). From the attached `serving-endpoint` resource.
   - name: DATABRICKS_SERVING_ENDPOINT_NAME
     valueFrom: serving-endpoint
+  # Lakebase (Autoscaling Postgres) for the app's OPERATIONAL state tables
+  # (saved_schemas / action_log / product_links). Analytical data stays on the
+  # SQL warehouse. The app connects as the attached SP via @databricks/lakebase
+  # (OAuth token auto-refresh). Instance `jai-onto-demo`, branch production.
+  - name: PGHOST
+    value: 'ep-long-mountain-d27it82n.database.us-east-1.cloud.databricks.com'
+  - name: PGDATABASE
+    value: 'databricks_postgres'
+  - name: PGUSER
+    value: 'bf309888-d7fa-4311-b847-22b6a8b19693'
+  - name: LAKEBASE_ENDPOINT
+    value: 'projects/jai-onto-demo/branches/production/endpoints/primary'
+  - name: PGSSLMODE
+    value: 'require'

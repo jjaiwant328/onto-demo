@@ -20,8 +20,17 @@ import {
   type CatalogProduct,
   type DerivedComponents,
   type EnterpriseGraph,
+  type GraphProductLink,
   type Schema,
 } from './deriveComponents';
+import { fetchProductLinks } from './productLinks';
+import {
+  fetchOntologyOverrides,
+  saveOntologyOverride,
+  deleteOntologyOverride,
+  applyOntologyOverrides,
+  type OntologyOverride,
+} from './ontologyOverrides';
 import { buildCatalog } from './catalogGen';
 import { DEMO_DOMAINS } from '../../../shared/demoDomains';
 import { combineSchemas, type SchemaEntry, type ConformanceInfo } from './combineSchemas';
@@ -64,6 +73,9 @@ export type CatalogSource = 'curated' | 'generated' | 'generated+llm' | 'combine
 export type RegistrySchema = SchemaEntry & {
   bundled?: boolean; // built-in, non-removable
   curated?: boolean; // uses the curated catalog + live flagship when sole selection
+  // cached refined catalog for a saved schema (from catalog_json). When present,
+  // selecting the schema uses it directly and SKIPS the LLM refine (instant).
+  cachedCatalog?: Catalog;
 };
 
 // saved-schema index row (from /api/saved-schemas)
@@ -140,9 +152,26 @@ export type ProductContextValue = {
   // view-only. Persisted to localStorage.
   syncScopeFromSections: boolean;
   setSyncScopeFromSections: (v: boolean) => void;
+  // nav visibility toggles (persisted). Action Center + Business View default OFF
+  // ("actions later" / redundant); user can re-enable via the settings menu.
+  showActionCenter: boolean;
+  setShowActionCenter: (v: boolean) => void;
+  showBusinessView: boolean;
+  setShowBusinessView: (v: boolean) => void;
   // leading catalog/namespace segment of the active schema's tables (for
   // schema-accurate data contracts); null when it can't be determined.
   activeSourceCatalog: string | null;
+  // ontology curation (overrides layered over derived components, per schema)
+  activeSchemaLabel: string;
+  ontologyOverrides: OntologyOverride[];
+  saveOntologyOverride: (args: {
+    product?: string;
+    kind: OntologyOverride['kind'];
+    ref: string;
+    action: OntologyOverride['action'];
+    value?: unknown;
+  }) => Promise<{ ok: boolean; id?: string; error?: string }>;
+  deleteOntologyOverride: (id: string) => Promise<boolean>;
   // scope signature (schema|domain|product) — the key for per-scope caches and
   // the "rebuilding" indicator; changes on any schema/domain/product change.
   scopeSig: string;
@@ -251,10 +280,41 @@ function sanitizeCatalog(catalog: Catalog, schema: Schema): Catalog {
 }
 
 const SYNC_KEY = 'rt_onto_sync_scope';
+const SHOW_AC_KEY = 'rt_onto_show_action_center'; // nav toggle (default OFF)
+const SHOW_BV_KEY = 'rt_onto_show_business_view'; // nav toggle (default OFF)
+// ids of built-in schemas the user has deleted (hidden). Built-ins aren't in
+// Lakebase, so we hide them via localStorage rather than DB-delete.
+const HIDDEN_KEY = 'rt_onto_hidden_builtins';
+
+function readHiddenBuiltins(): string[] {
+  try {
+    const raw = localStorage.getItem(HIDDEN_KEY);
+    const arr = raw ? (JSON.parse(raw) as unknown) : [];
+    return Array.isArray(arr) ? arr.filter((x): x is string => typeof x === 'string') : [];
+  } catch {
+    return [];
+  }
+}
+function writeHiddenBuiltins(ids: string[]): void {
+  try {
+    localStorage.setItem(HIDDEN_KEY, JSON.stringify([...new Set(ids)]));
+  } catch {
+    /* ignore */
+  }
+}
+// built-in schemas minus any the user has hidden
+function visibleBuiltinSchemas(): RegistrySchema[] {
+  const hidden = new Set(readHiddenBuiltins());
+  return builtinSchemas().filter((s) => !hidden.has(s.id));
+}
 
 export function ProductProvider({ children }: { children: ReactNode }) {
-  const [schemasReg, setSchemasReg] = useState<RegistrySchema[]>(builtinSchemas);
-  const [selectedSchemaIds, setSelectedSchemaIds] = useState<string[]>([CURATED_SCHEMA_ID]);
+  const [schemasReg, setSchemasReg] = useState<RegistrySchema[]>(visibleBuiltinSchemas);
+  const [selectedSchemaIds, setSelectedSchemaIds] = useState<string[]>(() => {
+    const vis = visibleBuiltinSchemas();
+    const first = vis.find((s) => s.id === CURATED_SCHEMA_ID) ?? vis[0];
+    return first ? [first.id] : [];
+  });
 
   // toggle: whether in-section interactions update the left-panel scope.
   // Default false (view-only); restored from localStorage on mount.
@@ -269,6 +329,36 @@ export function ProductProvider({ children }: { children: ReactNode }) {
     setSyncScopeFromSectionsState(v);
     try {
       localStorage.setItem(SYNC_KEY, v ? '1' : '0');
+    } catch {
+      /* ignore */
+    }
+  }, []);
+
+  // nav visibility toggles (persisted; default OFF)
+  const mkToggle = (key: string) => {
+    const read = () => {
+      try {
+        return localStorage.getItem(key) === '1';
+      } catch {
+        return false;
+      }
+    };
+    return read;
+  };
+  const [showActionCenter, setShowActionCenterState] = useState<boolean>(mkToggle(SHOW_AC_KEY));
+  const [showBusinessView, setShowBusinessViewState] = useState<boolean>(mkToggle(SHOW_BV_KEY));
+  const setShowActionCenter = useCallback((v: boolean) => {
+    setShowActionCenterState(v);
+    try {
+      localStorage.setItem(SHOW_AC_KEY, v ? '1' : '0');
+    } catch {
+      /* ignore */
+    }
+  }, []);
+  const setShowBusinessView = useCallback((v: boolean) => {
+    setShowBusinessViewState(v);
+    try {
+      localStorage.setItem(SHOW_BV_KEY, v ? '1' : '0');
     } catch {
       /* ignore */
     }
@@ -311,21 +401,31 @@ export function ProductProvider({ children }: { children: ReactNode }) {
   const isCuratedSingle =
     !combined && selected.length === 1 && Boolean(selected[0].curated) && selected[0].id === CURATED_SCHEMA_ID;
 
+  // a sole-selected SAVED schema whose refined catalog is already cached →
+  // use it directly and SKIP the LLM refine (instant on reselect).
+  const cachedSaved =
+    !combined && selected.length === 1 && selected[0].savedId && selected[0].cachedCatalog?.domains?.length
+      ? (selected[0].cachedCatalog as Catalog)
+      : null;
+
   // signature of the current dataset (for the async LLM overlay match + isolation)
   const sig = [...selectedSchemaIds].sort().join(',');
 
   const heuristicCatalog = useMemo(() => {
     if (isCuratedSingle) return DEFAULT_CATALOG;
+    if (cachedSaved) return cachedSaved;
     const built = buildCatalog(schema);
     // Empty schema (e.g. a saved entry whose content is still lazy-loading, or an
     // empty selection) yields 0 domains — synthesize a placeholder so every section
     // has a defined domain/product and never crashes on undefined.fact_tables.
     if (built.domains.length === 0) return PLACEHOLDER_CATALOG;
     return built;
-  }, [isCuratedSingle, schema]);
+  }, [isCuratedSingle, cachedSaved, schema]);
 
   const generatedCatalog =
-    !isCuratedSingle && llmCatalog && llmCatalog.sig === sig ? llmCatalog.catalog : heuristicCatalog;
+    !isCuratedSingle && !cachedSaved && llmCatalog && llmCatalog.sig === sig
+      ? llmCatalog.catalog
+      : heuristicCatalog;
 
   // Overlay the two DATA-BACKED demo domains when the QSR schema is active. These
   // are real, query-backed domains (badged "Data Avlbl") prepended ahead of the
@@ -501,10 +601,21 @@ export function ProductProvider({ children }: { children: ReactNode }) {
         /* ignore */
       }
     }
-    if (isCuratedSingle) {
+    if (isCuratedSingle || cachedSaved) {
+      // curated catalog, or a saved schema whose refined catalog is cached →
+      // instant, no LLM call.
       setLlmRefining(false);
-      return; // curated catalog — no generation
+      return;
     }
+    // Skip while a saved entry's content is still lazy-loading (empty schema) —
+    // the effect re-runs once content arrives (schema change bumps deps via sig?).
+    if (Object.keys(schema).length === 0) {
+      setLlmRefining(false);
+      return;
+    }
+    // the sole-selected saved entry (to persist its refined catalog for reuse)
+    const soleSaved =
+      !combined && selected.length === 1 && selected[0].savedId ? selected[0].savedId : null;
     // best-effort LLM polish of the generated/combined catalog (graceful fallback)
     let cancelled = false;
     setLlmRefining(true);
@@ -521,7 +632,20 @@ export function ProductProvider({ children }: { children: ReactNode }) {
         });
         const data = await resp.json();
         if (!cancelled && data?.llm && data?.catalog?.domains?.length) {
-          setLlmCatalog({ sig, catalog: sanitizeCatalog(data.catalog as Catalog, schema) });
+          const refined = sanitizeCatalog(data.catalog as Catalog, schema);
+          setLlmCatalog({ sig, catalog: refined });
+          // persist the refined catalog with the saved schema so the next select
+          // skips the LLM entirely; also cache it on the registry entry in-session.
+          if (soleSaved) {
+            setSchemasReg((prev) =>
+              prev.map((s) => (s.savedId === soleSaved ? { ...s, cachedCatalog: refined } : s))
+            );
+            void fetch('/api/save-catalog', {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ schema_id: soleSaved, catalog_json: JSON.stringify(refined) }),
+            }).catch(() => {});
+          }
         }
       } catch {
         /* keep heuristic */
@@ -534,7 +658,7 @@ export function ProductProvider({ children }: { children: ReactNode }) {
       setLlmRefining(false);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sig]);
+  }, [sig, schema]);
 
   // after a session domain edit removes/renames a singly-selected domain, fall
   // back to All (leave ALL scope and valid single selections untouched)
@@ -571,23 +695,52 @@ export function ProductProvider({ children }: { children: ReactNode }) {
     [schemasReg]
   );
 
+  // Delete ANY schema — including the built-ins (Retailer / QSR). Built-ins are
+  // hidden via localStorage (they aren't in Lakebase); saved schemas call
+  // delete-saved-schema. Never leaves the registry empty.
   const removeSchema = useCallback((sid: string) => {
+    let savedId: string | undefined;
+    let wasBundled = false;
+    let fallbackId: string | undefined;
     setSchemasReg((prev) => {
       const entry = prev.find((s) => s.id === sid);
-      if (!entry || entry.bundled) return prev; // bundled schema is not removable
+      if (!entry) return prev;
+      savedId = entry.savedId;
+      wasBundled = Boolean(entry.bundled);
       const remaining = prev.filter((s) => s.id !== sid);
-      return remaining.length ? remaining : prev;
+      // never leave the registry empty — if this was the last one, restore built-ins
+      if (remaining.length === 0) {
+        const restored = builtinSchemas();
+        fallbackId = restored[0]?.id;
+        return restored;
+      }
+      fallbackId = remaining[0]?.id;
+      return remaining;
     });
+    // built-in → persist as hidden so it stays gone after reload
+    if (wasBundled) {
+      writeHiddenBuiltins([...readHiddenBuiltins(), sid]);
+    }
     setSelectedSchemaIds((prev) => {
       const next = prev.filter((id) => id !== sid);
-      return next.length ? next : [CURATED_SCHEMA_ID];
+      return next.length ? next : fallbackId ? [fallbackId] : [];
     });
+    // a SAVED schema must be deleted server-side too, or it returns on reload.
+    if (savedId) {
+      setSavedSchemas((prev) => prev.filter((s) => s.schema_id !== savedId));
+      void fetch('/api/delete-saved-schema', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ schema_id: savedId }),
+      }).catch(() => {});
+    }
   }, []);
 
-  // clear persisted state and restore exactly the built-in schemas
+  // clear persisted state (incl. hidden built-ins) and restore ALL built-ins
   const resetSchemas = useCallback(() => {
     try {
       localStorage.removeItem(LS_KEY);
+      localStorage.removeItem(HIDDEN_KEY);
     } catch {
       /* ignore */
     }
@@ -602,10 +755,16 @@ export function ProductProvider({ children }: { children: ReactNode }) {
   const [savedSchemas, setSavedSchemas] = useState<SavedSchemaMeta[]>([]);
 
   // merge saved-schema index rows into the flat registry as (lazy) entries.
+  // De-dupes by schema_name+customer (rows arrive newest-first, so the first
+  // occurrence wins) AND by entry id, so the same schema never appears twice.
   const mergeSaved = useCallback((rows: SavedSchemaMeta[]) => {
     setSchemasReg((prev) => {
       const next = [...prev];
+      const seenKey = new Set<string>();
       for (const r of rows) {
+        const key = `${(r.schema_name ?? '').toLowerCase()}|${(r.customer ?? '').toLowerCase()}`;
+        if (seenKey.has(key)) continue; // duplicate name+customer in the index
+        seenKey.add(key);
         const entryId = `saved:${r.schema_id}`;
         if (next.some((s) => s.id === entryId)) continue;
         // lazy entry: empty schema until first selected (content in the volume)
@@ -624,7 +783,15 @@ export function ProductProvider({ children }: { children: ReactNode }) {
     try {
       const resp = await fetch('/api/saved-schemas');
       const data = await resp.json();
-      const rows: SavedSchemaMeta[] = Array.isArray(data?.schemas) ? data.schemas : [];
+      const raw: SavedSchemaMeta[] = Array.isArray(data?.schemas) ? data.schemas : [];
+      // de-dupe by schema_name+customer (index is newest-first → first wins)
+      const seen = new Set<string>();
+      const rows = raw.filter((r) => {
+        const key = `${(r.schema_name ?? '').toLowerCase()}|${(r.customer ?? '').toLowerCase()}`;
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      });
       setSavedSchemas(rows);
       mergeSaved(rows);
     } catch {
@@ -689,8 +856,16 @@ export function ProductProvider({ children }: { children: ReactNode }) {
           const resp = await fetch(`/api/saved-schema/${entry.savedId}`);
           const data = await resp.json();
           if (cancelled || !data?.schema) continue;
+          // capture the cached refined catalog too (if the server has one) so the
+          // select is instant and the LLM refine is skipped.
+          const cached =
+            data.catalog && typeof data.catalog === 'object' && data.catalog.domains?.length
+              ? (data.catalog as Catalog)
+              : undefined;
           setSchemasReg((prev) =>
-            prev.map((s) => (s.id === entry.id ? { ...s, schema: data.schema } : s))
+            prev.map((s) =>
+              s.id === entry.id ? { ...s, schema: data.schema, ...(cached ? { cachedCatalog: cached } : {}) } : s
+            )
           );
         } catch {
           /* leave empty; section renders an empty catalog gracefully */
@@ -716,8 +891,9 @@ export function ProductProvider({ children }: { children: ReactNode }) {
       const raw = localStorage.getItem(LS_KEY);
       if (raw) {
         const p = JSON.parse(raw) as { selectedSchemaIds?: string[] };
-        const builtinIds = new Set(builtinSchemas().map((s) => s.id));
-        const valid = (p.selectedSchemaIds ?? []).filter((id) => builtinIds.has(id));
+        // only restore VISIBLE built-in ids (skip ones the user has hidden/deleted)
+        const visibleIds = new Set(visibleBuiltinSchemas().map((s) => s.id));
+        const valid = (p.selectedSchemaIds ?? []).filter((id) => visibleIds.has(id));
         if (valid.length) setSelectedSchemaIds(valid);
       }
     } catch {
@@ -735,6 +911,51 @@ export function ProductProvider({ children }: { children: ReactNode }) {
     const seg = first.split('.')[0];
     return seg && seg !== first ? seg : (seg || null);
   }, [schema]);
+
+  // active schema label — the key for per-schema ontology overrides. Single
+  // selection = that entry's label; combined = joined labels.
+  const activeSchemaLabel = useMemo(() => {
+    if (selected.length === 1) return selected[0].label;
+    if (selected.length > 1) return selected.map((s) => s.label).sort().join(' + ');
+    return schemaEntries[0]?.label ?? '';
+  }, [selected, schemaEntries]);
+
+  // ---- ontology overrides (user curation, persisted per schema in Lakebase) ----
+  const [ontologyOverrides, setOntologyOverrides] = useState<OntologyOverride[]>([]);
+  const refreshOntologyOverrides = useCallback(async () => {
+    if (!activeSchemaLabel) {
+      setOntologyOverrides([]);
+      return;
+    }
+    setOntologyOverrides(await fetchOntologyOverrides(activeSchemaLabel));
+  }, [activeSchemaLabel]);
+  // reload overrides whenever the active schema changes
+  useEffect(() => {
+    void refreshOntologyOverrides();
+  }, [refreshOntologyOverrides]);
+
+  const saveOntologyOverrideFn = useCallback(
+    async (args: {
+      product?: string;
+      kind: OntologyOverride['kind'];
+      ref: string;
+      action: OntologyOverride['action'];
+      value?: unknown;
+    }) => {
+      const r = await saveOntologyOverride({ schema_label: activeSchemaLabel, ...args });
+      if (r.ok) await refreshOntologyOverrides();
+      return r;
+    },
+    [activeSchemaLabel, refreshOntologyOverrides]
+  );
+  const deleteOntologyOverrideFn = useCallback(
+    async (id: string) => {
+      const ok = await deleteOntologyOverride(id);
+      if (ok) await refreshOntologyOverrides();
+      return ok;
+    },
+    [refreshOntologyOverrides]
+  );
 
   // scope signature: changes on any schema / domain / product change
   const scopeSig = `${sig}|${domainName}|${productName}`;
@@ -763,11 +984,27 @@ export function ProductProvider({ children }: { children: ReactNode }) {
     [scopeSig]
   );
 
+  // product links (Genie / dashboard) overlaid onto the enterprise graph. Loaded
+  // once on startup from Lakebase; refreshed when links are attached/detached.
+  const [graphLinks, setGraphLinks] = useState<GraphProductLink[]>([]);
+  useEffect(() => {
+    void (async () => {
+      const all = await fetchProductLinks();
+      setGraphLinks(
+        all.map((l) => ({ product: l.product ?? '', link_type: l.link_type, url: l.url, label: l.label }))
+      );
+    })();
+  }, []);
+
   // ---- derived artifacts ----
-  const components = useMemo(() => deriveProduct(selectedProduct, schema), [selectedProduct, schema]);
+  // effective components = heuristic/LLM derivation with user overrides layered on
+  const components = useMemo(
+    () => applyOntologyOverrides(deriveProduct(selectedProduct, schema), ontologyOverrides),
+    [selectedProduct, schema, ontologyOverrides]
+  );
   const enterpriseGraph = useMemo(
-    () => buildEnterpriseGraph(catalog, schema, conformance?.conformedTables),
-    [catalog, schema, conformance]
+    () => buildEnterpriseGraph(catalog, schema, conformance?.conformedTables, graphLinks),
+    [catalog, schema, conformance, graphLinks]
   );
   // Scope-driven enterprise-graph highlight (recomputes on scope/schema change):
   //  • All domains + All products → highlight EVERYTHING (no dimming).
@@ -840,7 +1077,15 @@ export function ProductProvider({ children }: { children: ReactNode }) {
     isolationKey: sig,
     syncScopeFromSections,
     setSyncScopeFromSections,
+    showActionCenter,
+    setShowActionCenter,
+    showBusinessView,
+    setShowBusinessView,
     activeSourceCatalog,
+    activeSchemaLabel,
+    ontologyOverrides,
+    saveOntologyOverride: saveOntologyOverrideFn,
+    deleteOntologyOverride: deleteOntologyOverrideFn,
     scopeSig,
     rebuilding,
     getScopeCache,

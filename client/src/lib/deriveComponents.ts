@@ -55,6 +55,8 @@ export type DerivedClass = {
   role: 'fact' | 'dim' | 'product' | 'view';
   comment: string;
 };
+// provenance of an inferred component
+export type Origin = 'heuristic' | 'llm' | 'user';
 export type DerivedMapping = {
   class: string;
   property: string;
@@ -62,12 +64,17 @@ export type DerivedMapping = {
   source: string;
   column: string;
   type: string;
+  pii?: boolean; // user-flagged PII
+  origin?: Origin; // 'user' once a role/pii override is applied
 };
 export type DerivedRelationship = {
   predicate: string;
   label: string;
   from: string[];
   to: string;
+  origin?: Origin; // heuristic | llm | user
+  confidence?: number; // 0..1
+  status?: 'confirmed' | 'rejected'; // user confirm/reject (edge_status override)
 };
 export type DerivedMeasure = {
   measure: string;
@@ -197,6 +204,7 @@ export function deriveProduct(product: CatalogProduct, schema: Schema): DerivedC
         source: t,
         column: c.name,
         type: c.type,
+        origin: 'heuristic',
       });
     }
   }
@@ -226,11 +234,20 @@ export function deriveProduct(product: CatalogProduct, schema: Schema): DerivedC
         const id = `${shortName(t)}->${dim}:${c.name}`;
         if (seenRel.has(id)) continue;
         seenRel.add(id);
+        // shared-key exact match on a key column both sides → high confidence
+        const exactName = schema[t]?.some((x) => x.name === c.name) &&
+          (dimTables.find((d) => shortName(d) === dim)
+            ? (schema[dimTables.find((d) => shortName(d) === dim) as string] ?? []).some(
+                (x) => x.name === c.name
+              )
+            : false);
         relationships.push({
           predicate: c.name,
           label: `${c.name} → ${dim}`,
           from: [shortName(t)],
           to: dim,
+          origin: 'heuristic',
+          confidence: exactName ? 0.9 : 0.6, // exact key-name match = high; normalized-only = medium
         });
         fkEdges.push({ from: shortName(t), to: dim, label: `${c.name} (FK)` });
       }
@@ -474,6 +491,8 @@ export const ENTERPRISE_KIND_COLOR: Record<string, string> = {
   fact: '#64748b', // slate
   dim: '#0891b2', // cyan
   metric_view: '#16a34a', // green
+  genie: '#9333ea', // purple — Genie Space
+  dashboard: '#ea580c', // orange — AI/BI dashboard
 };
 export const ENTERPRISE_KIND_LABEL: Record<string, string> = {
   enterprise: 'Enterprise',
@@ -482,13 +501,34 @@ export const ENTERPRISE_KIND_LABEL: Record<string, string> = {
   fact: 'Fact table',
   dim: 'Dimension table',
   metric_view: 'Metric view',
+  genie: 'Genie Space',
+  dashboard: 'Dashboard',
+};
+
+// a product link to overlay on the enterprise graph (from product_links)
+export type GraphProductLink = {
+  product: string; // matches CatalogProduct.display_name
+  link_type: 'genie' | 'dashboard' | string;
+  url: string;
+  label?: string;
 };
 
 export const ENTERPRISE_ROOT_ID = 'ent:root';
 
+// a shared dimension/table and the products it connects (conformed lineage)
+export type SharedDimension = {
+  nodeId: string;
+  label: string;
+  products: { product_name: string; display_name: string }[];
+  domains: string[];
+};
 export type EnterpriseGraph = UnifiedGraph & {
   // membership: nodeId -> set of product ids it belongs to (for highlight calc)
   highlightFor: (domainName: string | null, productName: string | null) => Set<string>;
+  // products connected to a given node (for the "Shared across" inspector panel)
+  productsForNode: (nodeId: string) => { product_name: string; display_name: string }[];
+  // dimensions/tables shared across 2+ products (the enterprise-ontology payoff)
+  sharedDimensions: SharedDimension[];
 };
 
 const SERVING_VIEWS_LIVE = [
@@ -500,8 +540,15 @@ const SERVING_VIEWS_LIVE = [
 export function buildEnterpriseGraph(
   catalog: Catalog,
   schema: Schema,
-  conformedTables?: Record<string, string[]>
+  conformedTables?: Record<string, string[]>,
+  productLinks?: GraphProductLink[]
 ): EnterpriseGraph {
+  // index attached links by product display_name for quick per-product lookup
+  const linksByProduct = new Map<string, GraphProductLink[]>();
+  for (const l of productLinks ?? []) {
+    if (!l.url) continue;
+    (linksByProduct.get(l.product) ?? linksByProduct.set(l.product, []).get(l.product)!).push(l);
+  }
   // index conformed provenance by short table name (enterprise nodes key on it)
   const conformedByShort = new Map<string, string[]>();
   for (const [key, sources] of Object.entries(conformedTables ?? {})) {
@@ -523,6 +570,9 @@ export function buildEnterpriseGraph(
     (nodeProducts.get(id) ?? nodeProducts.set(id, new Set()).get(id)!).add(productName);
     (nodeDomains.get(id) ?? nodeDomains.set(id, new Set()).get(id)!).add(domainName);
   };
+  // product_name → display_name (for the "Shared across" panel)
+  const productDisplay = new Map<string, string>();
+  for (const d of catalog.domains) for (const p of d.products) productDisplay.set(p.product_name, p.display_name);
 
   // 1. enterprise root — derive the label from the ACTIVE schema (never hardcode
   // a specific schema name, or a non-Retailer selection appears to leak Retailer).
@@ -596,6 +646,23 @@ export function buildEnterpriseGraph(
       tag(pid, p.product_name, d.name);
       tag(did, p.product_name, d.name);
       addEdge(did, pid, 'contains');
+
+      // 3b. attached links (Genie Space / Dashboard) as first-class child nodes
+      for (const link of linksByProduct.get(p.display_name) ?? []) {
+        const kind = link.link_type === 'dashboard' ? 'dashboard' : 'genie';
+        const lid = `link:${kind}:${p.product_name}`;
+        nodes[lid] = {
+          id: lid,
+          label: link.label || ENTERPRISE_KIND_LABEL[kind],
+          kind,
+          kindLabel: ENTERPRISE_KIND_LABEL[kind],
+          color: ENTERPRISE_KIND_COLOR[kind],
+          detail: `${ENTERPRISE_KIND_LABEL[kind]} — click to open in a new window`,
+          openUrl: link.url,
+        };
+        tag(lid, p.product_name, d.name);
+        addEdge(pid, lid, kind === 'dashboard' ? 'dashboard' : 'explore');
+      }
 
       // 4. tables (dedup shared nodes; tag membership per product)
       const factShorts = new Set(p.fact_tables.map(shortName));
@@ -697,5 +764,31 @@ export function buildEnterpriseGraph(
     return set;
   };
 
-  return { nodes, edges, entryIds: [ENTERPRISE_ROOT_ID], highlightFor };
+  const productsForNode = (nodeId: string): { product_name: string; display_name: string }[] => {
+    const prods = nodeProducts.get(nodeId);
+    if (!prods) return [];
+    return [...prods]
+      .map((pn) => ({ product_name: pn, display_name: productDisplay.get(pn) ?? pn }))
+      .sort((a, b) => a.display_name.localeCompare(b.display_name));
+  };
+
+  // dimensions/tables (etbl: nodes) connected to 2+ products = shared/conformed
+  const sharedDimensions: SharedDimension[] = [];
+  for (const [id, node] of Object.entries(nodes)) {
+    if (!id.startsWith('etbl:')) continue;
+    const prods = productsForNode(id);
+    if (prods.length < 2) continue;
+    const domains = [...(nodeDomains.get(id) ?? new Set<string>())];
+    sharedDimensions.push({ nodeId: id, label: node.label, products: prods, domains });
+  }
+  sharedDimensions.sort((a, b) => b.products.length - a.products.length);
+
+  return {
+    nodes,
+    edges,
+    entryIds: [ENTERPRISE_ROOT_ID],
+    highlightFor,
+    productsForNode,
+    sharedDimensions,
+  };
 }
