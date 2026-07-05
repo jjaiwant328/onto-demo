@@ -891,14 +891,14 @@ export function OntologyStudio() {
       {/* item 3 — Generate serving view + contract (deferred DDL; preview/copy) */}
       <Card className="shadow-sm">
         <CardHeader className="flex flex-row items-center justify-between gap-4">
-          <div>
+          <div className="min-w-0">
             <CardTitle className="flex items-center gap-2">
               <FileCode className="h-4 w-4 text-primary" /> Serving view + contract
             </CardTitle>
             <CardDescription>
               A conformed <code>CREATE VIEW</code> from the fact table + confirmed relationships, plus
-              the derived data contract. Executing the DDL is deferred (needs a one-time CREATE grant)
-              — preview & copy here; it's also in the exported brief.
+              the derived data contract. Executing the DDL is deferred (needs a one-time CREATE grant):
+              preview, verify, and copy here; it is also in the exported brief.
             </CardDescription>
           </div>
           <div className="flex items-center gap-2 shrink-0">
