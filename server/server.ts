@@ -891,8 +891,8 @@ createApp({
           action?: string;
           value?: unknown;
         };
-        const kinds = ['entity', 'relationship', 'mapping', 'edge_status'];
-        const actions = ['rename', 'merge', 'set_role', 'set_pii', 'delete', 'confirm', 'reject'];
+        const kinds = ['entity', 'relationship', 'mapping', 'edge_status', 'glossary', 'suggest_status'];
+        const actions = ['rename', 'merge', 'set_role', 'set_pii', 'delete', 'confirm', 'reject', 'add', 'define'];
         if (!b.schema_label || !kinds.includes(String(b.kind)) || !actions.includes(String(b.action)) || !b.ref) {
           res.status(400).json({ ok: false, error: 'schema_label, kind, action, ref required' });
           return;
@@ -954,6 +954,163 @@ createApp({
         } catch (err) {
           res.json({ ok: false, error: String(err) });
         }
+      });
+
+      // ---- B) LLM-suggested relationships the shared-key heuristic missed ----
+      // Body: { product, componentsSummary, tables:[{table, columns:[]}] }.
+      // Returns sanitized [{from,to,predicate,column,rationale,confidence}] that
+      // only reference tables/columns present in `tables`. [] if LLM unavailable.
+      app.post('/api/suggest-relationships', async (req, res) => {
+        const b = (req.body ?? {}) as {
+          product?: string;
+          componentsSummary?: string;
+          tables?: { table: string; columns: string[] }[];
+        };
+        const tables = Array.isArray(b.tables) ? b.tables : [];
+        if (!hasLlm || tables.length < 2) {
+          res.json({ suggestions: [], llm: hasLlm, reason: hasLlm ? 'need >=2 tables' : 'no serving endpoint' });
+          return;
+        }
+        const tableCols = new Map<string, Set<string>>();
+        for (const t of tables) tableCols.set(t.table, new Set((t.columns ?? []).map((c) => String(c))));
+        const shape = tables
+          .map((t) => `${t.table}: ${(t.columns ?? []).slice(0, 30).join(', ')}`)
+          .join('\n')
+          .slice(0, 12000);
+        const prompt =
+          `You are a data modeler. Below are the REAL tables and columns of the data product ` +
+          `"${b.product}". Propose plausible JOIN relationships (foreign keys) that a naive shared-` +
+          `key match would MISS — e.g. semantically-equivalent column names (customer_id ↔ cust_id), ` +
+          `or a dimension key referenced under a different name. ONLY use tables and columns listed ` +
+          `below; do NOT invent any. Return ONLY a JSON array; each item: ` +
+          `{from (table), to (table), predicate (short label), column (the join column on 'from'), ` +
+          `toColumn (the matching column on 'to' — may differ in name from column), ` +
+          `rationale (one sentence), confidence (0..1)}.\n\nTABLES:\n${shape}`;
+        const content = await llmComplete(prompt, 2000);
+        const raw = extractJsonArray(content ?? '') ?? [];
+        // sanitize: keep only suggestions referencing real tables (drop hallucinations)
+        const suggestions = raw
+          .map((s) => {
+            const column = String(s.column ?? '');
+            // fall back to the from-column name when the LLM omits toColumn
+            const toColumn = String(s.toColumn ?? s.to_column ?? column);
+            return {
+              from: String(s.from ?? ''),
+              to: String(s.to ?? ''),
+              predicate: String(s.predicate ?? s.column ?? 'related'),
+              column,
+              toColumn,
+              rationale: String(s.rationale ?? ''),
+              confidence: typeof s.confidence === 'number' ? s.confidence : 0.4,
+            };
+          })
+          .filter(
+            (s) =>
+              s.from &&
+              s.to &&
+              s.from !== s.to &&
+              tableCols.has(s.from) &&
+              tableCols.has(s.to) &&
+              // named columns must exist on their respective tables
+              (!s.column || tableCols.get(s.from)!.has(s.column)) &&
+              (!s.toColumn || tableCols.get(s.to)!.has(s.toColumn))
+          )
+          .slice(0, 12);
+        res.json({ suggestions, llm: true });
+      });
+
+      // ---- C) Validate ontology against live warehouse data (opt-in) ----
+      // Body: { product, tables:[<catalog.schema.table>], relationships:[{from,to,column}] }
+      // Returns per-table row_count + per-key null/distinct %, per-FK join hit-rate.
+      // Per-target errors (inaccessible catalog) are caught → "no access".
+      app.post('/api/validate-ontology', async (req, res) => {
+        const b = (req.body ?? {}) as {
+          product?: string;
+          tables?: { table: string; keys?: string[] }[];
+          // `column` is the shared-name fallback; fromColumn/toColumn let a FK
+          // join differently-named keys (e.g. cust_id ↔ customer_id).
+          relationships?: {
+            from: string;
+            to: string;
+            column: string;
+            fromColumn?: string;
+            toColumn?: string;
+          }[];
+        };
+        const tables = Array.isArray(b.tables) ? b.tables.slice(0, 40) : [];
+        const rels = Array.isArray(b.relationships) ? b.relationships.slice(0, 40) : [];
+        const okIdent = (t: string) => /^[A-Za-z0-9_]+(\.[A-Za-z0-9_]+){1,2}$/.test(t);
+        const okCol = (c: string) => /^[A-Za-z0-9_]+$/.test(c);
+
+        const tableResults: Record<string, unknown>[] = [];
+        for (const t of tables) {
+          if (!okIdent(t.table)) {
+            tableResults.push({ table: t.table, error: 'invalid identifier' });
+            continue;
+          }
+          try {
+            const cnt = await runSql(`SELECT count(*) AS n FROM ${t.table}`);
+            const rowCount = Number((cnt[0]?.n ?? cnt[0]?.N) ?? 0);
+            const keyStats: Record<string, unknown>[] = [];
+            for (const k of (t.keys ?? []).filter(okCol).slice(0, 8)) {
+              try {
+                const s = await runSql(
+                  `SELECT count(*) AS total, count(${k}) AS non_null, approx_count_distinct(${k}) AS distinct_ct ` +
+                    `FROM ${t.table}`
+                );
+                const total = Number(s[0]?.total ?? 0) || 0;
+                const nonNull = Number(s[0]?.non_null ?? 0) || 0;
+                const distinct = Number(s[0]?.distinct_ct ?? 0) || 0;
+                keyStats.push({
+                  column: k,
+                  null_pct: total ? Math.round(((total - nonNull) / total) * 1000) / 10 : 0,
+                  distinct_pct: total ? Math.round((distinct / total) * 1000) / 10 : 0,
+                });
+              } catch (e) {
+                keyStats.push({ column: k, error: humanizeSqlError(e) });
+              }
+            }
+            tableResults.push({ table: t.table, row_count: rowCount, keys: keyStats });
+          } catch (e) {
+            tableResults.push({ table: t.table, error: humanizeSqlError(e) || 'no access / cannot validate' });
+          }
+        }
+
+        const relResults: Record<string, unknown>[] = [];
+        for (const r of rels) {
+          // fromColumn lives on the child (from) table, toColumn on the parent
+          // (to). Both default to `column` for same-named heuristic FKs.
+          const fromCol = r.fromColumn || r.column;
+          const toCol = r.toColumn || r.column;
+          if (!okIdent(r.from) || !okIdent(r.to) || !okCol(fromCol) || !okCol(toCol)) {
+            relResults.push({ ...r, error: 'invalid identifier' });
+            continue;
+          }
+          try {
+            // hit-rate = fraction of child (from) rows whose key matches a parent (to) row
+            const q =
+              `SELECT count(*) AS child_rows, ` +
+              `count(p.k) AS matched FROM ${r.from} c ` +
+              `LEFT JOIN (SELECT DISTINCT ${toCol} AS k FROM ${r.to}) p ON c.${fromCol} = p.k ` +
+              `WHERE c.${fromCol} IS NOT NULL`;
+            const s = await runSql(q);
+            const child = Number(s[0]?.child_rows ?? 0) || 0;
+            const matched = Number(s[0]?.matched ?? 0) || 0;
+            relResults.push({
+              from: r.from,
+              to: r.to,
+              column: r.column,
+              from_column: fromCol,
+              to_column: toCol,
+              hit_rate: child ? Math.round((matched / child) * 1000) / 10 : null,
+              child_rows: child,
+            });
+          } catch (e) {
+            relResults.push({ ...r, error: humanizeSqlError(e) || 'no access / cannot validate' });
+          }
+        }
+
+        res.json({ product: b.product, tables: tableResults, relationships: relResults });
       });
     });
   },

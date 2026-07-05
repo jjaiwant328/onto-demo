@@ -15,6 +15,8 @@ export type DemoProduct = {
   business_outcome: string;
   table: string; // backing table (unqualified; joined to DEMO_BACKING_CATALOG_SCHEMA)
   fact_tables: string[]; // qualified names for the derived catalog/graph
+  dim_tables?: string[]; // related tables in the domain (multi-table flow demo)
+  serving_example?: string; // an example serving object (already hand-built)
   kpis: string[];
   // exception selection: the WHERE predicate that flags actionable rows
   exception_where: string;
@@ -50,6 +52,7 @@ export const DEMO_DOMAINS: DemoDomain[] = [
         business_outcome: 'Surface and triage failing data-quality tests before they reach consumers.',
         table: 'dq_test_results',
         fact_tables: [`${SCHEMA}.dq_test_results`],
+        dim_tables: [`${SCHEMA}.table_health`, `${SCHEMA}.pipeline_runs`],
         kpis: ['failed_tests', 'critical_failures', 'failed_rows'],
         exception_where: "status = 'fail'",
         exception_order_by:
@@ -71,6 +74,7 @@ export const DEMO_DOMAINS: DemoDomain[] = [
         business_outcome: 'Detect stale serving tables that miss their expected freshness SLA.',
         table: 'table_health',
         fact_tables: [`${SCHEMA}.table_health`],
+        dim_tables: [`${SCHEMA}.dq_test_results`, `${SCHEMA}.pipeline_runs`],
         kpis: ['stale_tables', 'staleness_hours'],
         exception_where: 'is_stale = true',
         exception_order_by: 'staleness_hours DESC',
@@ -89,6 +93,7 @@ export const DEMO_DOMAINS: DemoDomain[] = [
         business_outcome: 'Catch failed pipeline runs and repeated retries early.',
         table: 'pipeline_runs',
         fact_tables: [`${SCHEMA}.pipeline_runs`],
+        dim_tables: [`${SCHEMA}.dq_test_results`, `${SCHEMA}.table_health`],
         kpis: ['failed_runs', 'retries'],
         exception_where: "status = 'failed'",
         exception_order_by: 'retries DESC, run_ts DESC',
@@ -115,6 +120,8 @@ export const DEMO_DOMAINS: DemoDomain[] = [
         business_outcome: 'Find items whose demand forecast is materially off (high MAPE).',
         table: 'forecast_accuracy',
         fact_tables: [`${SCHEMA}.forecast_accuracy`],
+        dim_tables: [`${SCHEMA}.inventory_position`, `${SCHEMA}.purchase_orders`],
+        serving_example: `${SCHEMA}.jai_demand_planning_serving`,
         kpis: ['high_mape_items', 'mape_pct', 'bias_pct'],
         exception_where: 'mape_pct > 30',
         exception_order_by: 'mape_pct DESC',
@@ -134,6 +141,8 @@ export const DEMO_DOMAINS: DemoDomain[] = [
         business_outcome: 'Prevent stockouts by flagging items below safety stock / low days of supply.',
         table: 'inventory_position',
         fact_tables: [`${SCHEMA}.inventory_position`],
+        dim_tables: [`${SCHEMA}.forecast_accuracy`, `${SCHEMA}.purchase_orders`],
+        serving_example: `${SCHEMA}.jai_demand_planning_serving`,
         kpis: ['at_risk_items', 'days_of_supply'],
         exception_where: 'stockout_risk = true',
         exception_order_by: 'days_of_supply ASC',
@@ -153,6 +162,8 @@ export const DEMO_DOMAINS: DemoDomain[] = [
         business_outcome: 'Track late purchase orders and supplier reliability.',
         table: 'purchase_orders',
         fact_tables: [`${SCHEMA}.purchase_orders`],
+        dim_tables: [`${SCHEMA}.forecast_accuracy`, `${SCHEMA}.inventory_position`],
+        serving_example: `${SCHEMA}.jai_demand_planning_serving`,
         kpis: ['late_pos', 'days_late'],
         exception_where: "status = 'late'",
         exception_order_by: 'days_late DESC',
@@ -169,6 +180,72 @@ export const DEMO_DOMAINS: DemoDomain[] = [
     ],
   },
 ];
+
+// The backing tables' column shapes (from the jai_ontos.qsr_demo DDL). Merged
+// into the active schema when the demo domains are active so the derived
+// ontology (relationships/mappings) + Suggest/Validate/Generate operate on the
+// real columns. Keys are catalog-qualified to match fact_tables/dim_tables.
+export const DEMO_SCHEMA: Record<string, { name: string; type: string }[]> = {
+  [`${SCHEMA}.dq_test_results`]: [
+    { name: 'test_id', type: 'string' },
+    { name: 'test_name', type: 'string' },
+    { name: 'table_name', type: 'string' },
+    { name: 'run_ts', type: 'timestamp' },
+    { name: 'status', type: 'string' },
+    { name: 'failed_rows', type: 'bigint' },
+    { name: 'threshold_rows', type: 'bigint' },
+    { name: 'severity', type: 'string' },
+    { name: 'owner_email', type: 'string' },
+  ],
+  [`${SCHEMA}.table_health`]: [
+    { name: 'table_name', type: 'string' },
+    { name: 'last_refresh_ts', type: 'timestamp' },
+    { name: 'expected_freshness_hours', type: 'int' },
+    { name: 'staleness_hours', type: 'double' },
+    { name: 'row_count', type: 'bigint' },
+    { name: 'is_stale', type: 'boolean' },
+    { name: 'owner_email', type: 'string' },
+  ],
+  [`${SCHEMA}.pipeline_runs`]: [
+    { name: 'run_id', type: 'string' },
+    { name: 'pipeline', type: 'string' },
+    { name: 'run_ts', type: 'timestamp' },
+    { name: 'status', type: 'string' },
+    { name: 'duration_min', type: 'double' },
+    { name: 'expected_min', type: 'double' },
+    { name: 'retries', type: 'int' },
+  ],
+  [`${SCHEMA}.forecast_accuracy`]: [
+    { name: 'item_id', type: 'string' },
+    { name: 'item_name', type: 'string' },
+    { name: 'location_id', type: 'string' },
+    { name: 'week', type: 'date' },
+    { name: 'forecast_qty', type: 'double' },
+    { name: 'actual_qty', type: 'double' },
+    { name: 'mape_pct', type: 'double' },
+    { name: 'bias_pct', type: 'double' },
+  ],
+  [`${SCHEMA}.inventory_position`]: [
+    { name: 'item_id', type: 'string' },
+    { name: 'item_name', type: 'string' },
+    { name: 'location_id', type: 'string' },
+    { name: 'on_hand', type: 'double' },
+    { name: 'safety_stock', type: 'double' },
+    { name: 'avg_daily_demand', type: 'double' },
+    { name: 'days_of_supply', type: 'double' },
+    { name: 'stockout_risk', type: 'boolean' },
+  ],
+  [`${SCHEMA}.purchase_orders`]: [
+    { name: 'po_id', type: 'string' },
+    { name: 'supplier', type: 'string' },
+    { name: 'item_id', type: 'string' },
+    { name: 'order_date', type: 'date' },
+    { name: 'promised_date', type: 'date' },
+    { name: 'received_date', type: 'date' },
+    { name: 'status', type: 'string' },
+    { name: 'days_late', type: 'int' },
+  ],
+};
 
 // flat product lookup by product_name (used by the server exception endpoint)
 export const DEMO_PRODUCTS: Record<string, DemoProduct & { domainLabel: string }> = Object.fromEntries(

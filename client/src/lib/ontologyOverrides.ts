@@ -1,9 +1,20 @@
 // User curation of the auto-derived ontology, persisted per schema in Lakebase
 // (ontology_overrides). Overrides are layered over the heuristic/LLM-derived
 // components to produce the EFFECTIVE components used everywhere.
-import type { DerivedComponents, DerivedMapping, DerivedRelationship, ColRole } from './deriveComponents';
+import type {
+  DerivedComponents,
+  DerivedMapping,
+  DerivedRelationship,
+  ColRole,
+} from './deriveComponents';
 
-export type OverrideKind = 'entity' | 'relationship' | 'mapping' | 'edge_status';
+export type OverrideKind =
+  | 'entity'
+  | 'relationship'
+  | 'mapping'
+  | 'edge_status'
+  | 'glossary'
+  | 'suggest_status';
 export type OverrideAction =
   | 'rename'
   | 'merge'
@@ -11,7 +22,9 @@ export type OverrideAction =
   | 'set_pii'
   | 'delete'
   | 'confirm'
-  | 'reject';
+  | 'reject'
+  | 'add' // add a relationship (from an accepted LLM suggestion)
+  | 'define'; // glossary definition + synonyms
 
 export type OntologyOverride = {
   id: string;
@@ -36,6 +49,71 @@ function parseVal<T>(v: string | undefined): T | undefined {
     return JSON.parse(v) as T;
   } catch {
     return v as unknown as T;
+  }
+}
+
+// ---- LLM relationship suggestions ----
+export type SuggestedRelationship = {
+  from: string;
+  to: string;
+  predicate: string;
+  column: string; // join column on `from`
+  toColumn: string; // matching column on `to` (may differ from `column`)
+  rationale: string;
+  confidence: number;
+};
+export async function suggestRelationships(args: {
+  product: string;
+  componentsSummary?: string;
+  tables: { table: string; columns: string[] }[];
+}): Promise<SuggestedRelationship[]> {
+  try {
+    const resp = await fetch('/api/suggest-relationships', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(args),
+    });
+    const d = await resp.json();
+    return Array.isArray(d?.suggestions) ? d.suggestions : [];
+  } catch {
+    return [];
+  }
+}
+
+// ---- validate ontology against live data ----
+export type ValidationResult = {
+  product?: string;
+  tables: {
+    table: string;
+    row_count?: number;
+    keys?: { column: string; null_pct?: number; distinct_pct?: number; error?: string }[];
+    error?: string;
+  }[];
+  relationships: {
+    from: string;
+    to: string;
+    column: string;
+    from_column?: string;
+    to_column?: string;
+    hit_rate?: number | null;
+    child_rows?: number;
+    error?: string;
+  }[];
+};
+export async function validateOntology(args: {
+  product: string;
+  tables: { table: string; keys?: string[] }[];
+  relationships: { from: string; to: string; column: string; fromColumn?: string; toColumn?: string }[];
+}): Promise<ValidationResult | null> {
+  try {
+    const resp = await fetch('/api/validate-ontology', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(args),
+    });
+    return await resp.json();
+  } catch {
+    return null;
   }
 }
 
@@ -126,19 +204,58 @@ export function applyOntologyOverrides(
   // relationship deletes + edge_status confirm/reject, keyed by relRef
   const relDeleted = new Set<string>();
   const relStatus = new Map<string, 'confirmed' | 'rejected'>();
+  // added relationships (accepted LLM suggestions)
+  const relAdded: DerivedRelationship[] = [];
   for (const o of overrides) {
     if (o.kind === 'relationship' && o.action === 'delete') relDeleted.add(o.ref);
+    if (o.kind === 'relationship' && o.action === 'add') {
+      const v = parseVal<{
+        from?: string;
+        to?: string;
+        predicate?: string;
+        column?: string;
+        toColumn?: string;
+      }>(o.value);
+      if (v?.from && v?.to && v?.predicate) {
+        relAdded.push({
+          predicate: v.predicate,
+          label: `${v.predicate} → ${v.to}`,
+          from: [v.from],
+          to: v.to,
+          // preserve differently-named join keys so validation can join them
+          fromColumn: v.column,
+          toColumn: v.toColumn ?? v.column,
+          origin: 'user',
+          confidence: 1,
+          status: 'confirmed',
+        });
+      }
+    }
     if (o.kind === 'edge_status') {
       if (o.action === 'confirm') relStatus.set(o.ref, 'confirmed');
       if (o.action === 'reject') relStatus.set(o.ref, 'rejected');
     }
   }
 
+  // glossary: definition + synonyms keyed by entity/measure name
+  const glossary = new Map<string, { definition?: string; synonyms?: string[]; term_type?: string }>();
+  for (const o of overrides) {
+    if (o.kind !== 'glossary') continue;
+    const v = parseVal<{ definition?: string; synonyms?: string[]; term_type?: string }>(o.value);
+    if (v) glossary.set(o.ref, v);
+  }
+
   const classes = components.classes
     .filter((c) => !mergeMap.has(c.class)) // merged-away classes disappear
     .map((c) => {
       const newId = remapClass(c.class);
-      return newId !== c.class ? { ...c, class: newId, label: newId } : c;
+      const g = glossary.get(c.class) ?? glossary.get(newId);
+      const base = newId !== c.class ? { ...c, class: newId, label: newId } : { ...c };
+      if (g) {
+        base.definition = g.definition ?? base.definition;
+        base.synonyms = g.synonyms ?? base.synonyms;
+      }
+      return base;
     });
 
   const mappings: DerivedMapping[] = components.mappings.map((m) => {
@@ -175,5 +292,30 @@ export function applyOntologyOverrides(
     .filter(({ ref }) => !relDeleted.has(ref))
     .map(({ remapped }) => remapped);
 
-  return { ...components, classes, mappings, relationships };
+  // append accepted LLM-suggested relationships (de-dupe against existing)
+  const existingRefs = new Set(relationships.map(relRef));
+  for (const add of relAdded) {
+    if (!existingRefs.has(relRef(add))) {
+      relationships.push(add);
+      existingRefs.add(relRef(add));
+    }
+  }
+
+  // glossary on measures (definition + synonyms by measure name)
+  const measures =
+    glossary.size > 0
+      ? components.measures.map((m) => {
+          const g = glossary.get(m.measure);
+          return g ? { ...m, definition: g.definition ?? m.definition, synonyms: g.synonyms ?? m.synonyms } : m;
+        })
+      : components.measures;
+
+  return { ...components, classes, mappings, relationships, measures };
+}
+
+// which suggestion refs the user has rejected (to hide them from re-suggest UI)
+export function rejectedSuggestionRefs(overrides: OntologyOverride[]): Set<string> {
+  const s = new Set<string>();
+  for (const o of overrides) if (o.kind === 'relationship' && o.action === 'reject') s.add(o.ref);
+  return s;
 }

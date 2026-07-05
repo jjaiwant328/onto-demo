@@ -32,7 +32,7 @@ import {
   type OntologyOverride,
 } from './ontologyOverrides';
 import { buildCatalog } from './catalogGen';
-import { DEMO_DOMAINS } from '../../../shared/demoDomains';
+import { DEMO_DOMAINS, DEMO_SCHEMA } from '../../../shared/demoDomains';
 import { combineSchemas, type SchemaEntry, type ConformanceInfo } from './combineSchemas';
 
 const DEFAULT_CATALOG = catalogJson as unknown as Catalog;
@@ -390,13 +390,23 @@ export function ProductProvider({ children }: { children: ReactNode }) {
 
   // ---- active schema (single or combined+conformed) ----
   const { schema, conformance } = useMemo(() => {
-    if (selected.length === 0) {
-      return { schema: schemaEntries[0]?.schema ?? {}, conformance: null };
+    let base: Schema;
+    let conf: ConformanceInfo | null = null;
+    if (selected.length === 0) base = schemaEntries[0]?.schema ?? {};
+    else if (selected.length === 1) base = selected[0].schema;
+    else {
+      const r = combineSchemas(selected);
+      base = r.schema;
+      conf = r.info;
     }
-    if (selected.length === 1) return { schema: selected[0].schema, conformance: null };
-    const r = combineSchemas(selected);
-    return { schema: r.schema, conformance: r.info };
-  }, [selected, schemaEntries]);
+    // When the QSR schema is active, merge the data-backed demo tables' real
+    // column shapes so the demo products are genuinely multi-table (Suggest /
+    // Validate / Generate-serving-view operate on real columns).
+    if (selectedSchemaIds.includes('qsr_scd')) {
+      base = { ...base, ...(DEMO_SCHEMA as Schema) };
+    }
+    return { schema: base, conformance: conf };
+  }, [selected, schemaEntries, selectedSchemaIds]);
 
   // ---- active catalog: curated (single curated schema) else generated ----
   const isCuratedSingle =
@@ -444,7 +454,7 @@ export function ProductProvider({ children }: { children: ReactNode }) {
         display_name: p.display_name,
         business_outcome: p.business_outcome,
         fact_tables: p.fact_tables,
-        dim_tables: [],
+        dim_tables: p.dim_tables ?? [],
         kpis: p.kpis,
         maturity: 'ga',
         dataAvailable: true,

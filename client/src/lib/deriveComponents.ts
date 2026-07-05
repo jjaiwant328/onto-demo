@@ -54,9 +54,12 @@ export type DerivedClass = {
   derived: boolean;
   role: 'fact' | 'dim' | 'product' | 'view';
   comment: string;
+  // business glossary (user-curated override)
+  definition?: string;
+  synonyms?: string[];
 };
 // provenance of an inferred component
-export type Origin = 'heuristic' | 'llm' | 'user';
+export type Origin = 'heuristic' | 'llm' | 'user' | 'llm-suggested';
 export type DerivedMapping = {
   class: string;
   property: string;
@@ -72,6 +75,11 @@ export type DerivedRelationship = {
   label: string;
   from: string[];
   to: string;
+  // join columns; when absent the join uses `predicate` on both sides (matches
+  // the heuristic FK case). Differently-named keys (from an accepted LLM
+  // suggestion) carry both so validation can join them.
+  fromColumn?: string;
+  toColumn?: string;
   origin?: Origin; // heuristic | llm | user
   confidence?: number; // 0..1
   status?: 'confirmed' | 'rejected'; // user confirm/reject (edge_status override)
@@ -82,6 +90,9 @@ export type DerivedMeasure = {
   unit: string;
   formula: string;
   description: string;
+  // business glossary (user-curated override)
+  definition?: string;
+  synonyms?: string[];
   // Feature 3 — graph "drivers" overlay (deterministic, no new data):
   drivers?: string[]; // base measures/columns + joined dims this measure depends on
   related?: string[]; // other measures sharing an input with this one

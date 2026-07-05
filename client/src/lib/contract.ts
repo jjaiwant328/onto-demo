@@ -110,7 +110,7 @@ function sourceCatalogOf(components: DerivedComponents, fallback?: string): stri
 export function deriveContract(
   product: CatalogProduct,
   components: DerivedComponents,
-  opts?: { sourceCatalog?: string }
+  opts?: { sourceCatalog?: string; servingObject?: string }
 ): DataContract {
   if (product.live && product.product_name === FLAGSHIP_CONTRACT.product) {
     return FLAGSHIP_CONTRACT;
@@ -124,9 +124,10 @@ export function deriveContract(
     components.tables[0]?.table ??
     product.product_name;
   const anchorShort = shortTable(anchorTable).replace(/^jai_/, '');
-  // planned governed target under the active catalog (never hardcode jai_ontos)
+  // planned governed target under the active catalog (never hardcode jai_ontos).
+  // If a generated serving-view name is supplied, use it as the serving object.
   const targetCatalog = srcCatalog ?? '<catalog>';
-  const plannedServing = `${targetCatalog}.governed.jai_${anchorShort} (planned)`;
+  const plannedServing = opts?.servingObject ?? `${targetCatalog}.governed.jai_${anchorShort} (planned)`;
   const sourceCatalogPhrase = srcCatalog
     ? `the live ${srcCatalog} catalog`
     : 'the source catalog';

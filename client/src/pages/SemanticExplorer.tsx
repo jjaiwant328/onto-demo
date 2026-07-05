@@ -1,6 +1,7 @@
 // Semantic Explorer — lineage relationships (FK edges) + measures/KPIs + an
 // entity → property drill-down, aggregated across the active SCOPE (all/domain/
 // product) so it reflects the left-panel selection, not just one product.
+import type React from 'react';
 import { useMemo, useState } from 'react';
 import {
   Card,
@@ -34,6 +35,7 @@ import { ArrowRight, Info, Search, Check, X } from 'lucide-react';
 import { useProduct } from '../lib/product';
 import { deriveProduct } from '../lib/deriveComponents';
 import { CatalogLoadingSkeleton } from '../components/LoadingSkeleton';
+import { GlossaryCell } from './OntologyStudio';
 
 export function SemanticExplorer() {
   const {
@@ -279,6 +281,30 @@ export function SemanticExplorer() {
               <TabsContent key={kind} value={kind}>
                 <MeasureTable
                   rows={shownMeasures.filter((m) => kind === 'all' || m.type === kind)}
+                  renderGlossary={(m) => {
+                    const gloss = ontologyOverrides.find(
+                      (o) => o.kind === 'glossary' && o.ref === m.measure && o.action === 'define'
+                    );
+                    return (
+                      <GlossaryCell
+                        termType="measure"
+                        name={m.measure}
+                        definition={m.definition}
+                        synonyms={m.synonyms}
+                        hasOverride={Boolean(gloss)}
+                        onSave={(def, syn) =>
+                          void saveOntologyOverride({
+                            product: selectedProduct.product_name,
+                            kind: 'glossary',
+                            ref: m.measure,
+                            action: 'define',
+                            value: { term_type: 'measure', definition: def, synonyms: syn },
+                          })
+                        }
+                        onClear={() => gloss && void deleteOntologyOverride(gloss.id)}
+                      />
+                    );
+                  }}
                 />
               </TabsContent>
             ))}
@@ -342,8 +368,18 @@ export function SemanticExplorer() {
 
 function MeasureTable({
   rows,
+  renderGlossary,
 }: {
-  rows: { measure: string; type: string; unit: string; formula: string; description: string }[];
+  rows: {
+    measure: string;
+    type: string;
+    unit: string;
+    formula: string;
+    description: string;
+    definition?: string;
+    synonyms?: string[];
+  }[];
+  renderGlossary?: (m: { measure: string; definition?: string; synonyms?: string[] }) => React.ReactNode;
 }) {
   if (rows.length === 0)
     return <p className="text-sm text-muted-foreground py-3">No measures in this view.</p>;
@@ -355,7 +391,7 @@ function MeasureTable({
           <TableHead>Type</TableHead>
           <TableHead>Unit</TableHead>
           <TableHead>Formula</TableHead>
-          <TableHead>Description</TableHead>
+          <TableHead>Glossary</TableHead>
         </TableRow>
       </TableHeader>
       <TableBody>
@@ -371,7 +407,17 @@ function MeasureTable({
             <TableCell>
               <code className="text-xs whitespace-pre-wrap">{m.formula}</code>
             </TableCell>
-            <TableCell className="text-muted-foreground text-sm">{m.description}</TableCell>
+            <TableCell>
+              <div className="space-y-0.5">
+                {m.definition && (
+                  <div className="text-xs text-muted-foreground max-w-[240px] truncate">
+                    {m.definition}
+                    {m.synonyms?.length ? ` · ${m.synonyms.join(', ')}` : ''}
+                  </div>
+                )}
+                {renderGlossary?.(m)}
+              </div>
+            </TableCell>
           </TableRow>
         ))}
       </TableBody>
