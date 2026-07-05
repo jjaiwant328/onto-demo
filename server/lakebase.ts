@@ -127,4 +127,12 @@ export async function ensureLakebaseTables(): Promise<void> {
     created_by text,
     created_at timestamptz
   )`);
+  // LLM-refined catalog cache keyed by scope signature (sorted schema-id list),
+  // so the "AI refining labels" polish runs ONCE per scope and every later
+  // reload — including combined/built-in scopes — loads instantly.
+  await lbQuery(`CREATE TABLE IF NOT EXISTS catalog_cache (
+    sig text PRIMARY KEY,
+    catalog_json text,
+    created_at timestamptz
+  )`);
 }

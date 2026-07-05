@@ -632,6 +632,20 @@ export function ProductProvider({ children }: { children: ReactNode }) {
     setLlmRefining(true);
     (async () => {
       try {
+        // 1) scope-sig cache (Lakebase) — covers combined + built-in scopes, so
+        // the LLM polish runs ONCE per scope and later reloads are instant.
+        try {
+          const cacheResp = await fetch(`/api/catalog-cache?sig=${encodeURIComponent(sig)}`);
+          const cached = await cacheResp.json();
+          if (!cancelled && cached?.catalog?.domains?.length) {
+            setLlmCatalog({ sig, catalog: sanitizeCatalog(cached.catalog as Catalog, schema) });
+            return; // cache hit → skip the LLM entirely
+          }
+        } catch {
+          /* cache unavailable → fall through to the LLM */
+        }
+        if (cancelled) return;
+
         const summary = Object.entries(schema)
           .map(([t, cols]) => `${t}: ${cols.slice(0, 8).map((c) => c.name).join(', ')}`)
           .join('\n')
@@ -645,8 +659,15 @@ export function ProductProvider({ children }: { children: ReactNode }) {
         if (!cancelled && data?.llm && data?.catalog?.domains?.length) {
           const refined = sanitizeCatalog(data.catalog as Catalog, schema);
           setLlmCatalog({ sig, catalog: refined });
-          // persist the refined catalog with the saved schema so the next select
-          // skips the LLM entirely; also cache it on the registry entry in-session.
+          // 2) persist to the scope-sig cache so ANY later reload of this scope
+          // (combined or not) skips the LLM.
+          void fetch('/api/catalog-cache', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ sig, catalog_json: JSON.stringify(refined) }),
+          }).catch(() => {});
+          // also persist against the saved schema + in-session registry entry
+          // (kept for the single-saved-schema fast path in getCuratedCatalogId).
           if (soleSaved) {
             setSchemasReg((prev) =>
               prev.map((s) => (s.savedId === soleSaved ? { ...s, cachedCatalog: refined } : s))

@@ -262,6 +262,52 @@ createApp({
         }
       });
 
+      // ---- Scope-signature-keyed catalog cache (the "AI refining labels" cache) ----
+      // GET returns a previously-refined catalog for a scope sig, or null (miss).
+      // Covers ALL scopes (combined + built-in), not just single saved schemas.
+      app.get('/api/catalog-cache', async (req, res) => {
+        const sig = String(req.query.sig ?? '').trim();
+        if (!sig) {
+          res.json({ catalog: null });
+          return;
+        }
+        try {
+          const rows = await lbQuery<{ catalog_json: string | null }>(
+            `SELECT catalog_json FROM catalog_cache WHERE sig = $1 LIMIT 1`,
+            [sig]
+          );
+          const raw = rows[0]?.catalog_json;
+          if (!raw) {
+            res.json({ catalog: null });
+            return;
+          }
+          res.json({ catalog: typeof raw === 'string' ? JSON.parse(raw) : raw });
+        } catch (err) {
+          res.json({ catalog: null, error: humanizeSqlError(err) });
+        }
+      });
+
+      // POST upserts a refined catalog for a scope sig (called after LLM polish).
+      app.post('/api/catalog-cache', async (req, res) => {
+        const b = (req.body ?? {}) as { sig?: string; catalog_json?: unknown };
+        const sig = String(b.sig ?? '').trim();
+        if (!sig || b.catalog_json == null) {
+          res.status(400).json({ ok: false, error: 'sig and catalog_json required' });
+          return;
+        }
+        const cat = typeof b.catalog_json === 'string' ? b.catalog_json : JSON.stringify(b.catalog_json);
+        try {
+          await lbQuery(
+            `INSERT INTO catalog_cache (sig, catalog_json, created_at) VALUES ($1, $2, now()) ` +
+              `ON CONFLICT (sig) DO UPDATE SET catalog_json = EXCLUDED.catalog_json, created_at = now()`,
+            [sig, cat]
+          );
+          res.json({ ok: true });
+        } catch (err) {
+          res.json({ ok: false, error: humanizeSqlError(err) });
+        }
+      });
+
       // List saved-schema metadata (no blob).
       app.get('/api/saved-schemas', async (_req, res) => {
         try {
@@ -1111,6 +1157,43 @@ createApp({
         }
 
         res.json({ product: b.product, tables: tableResults, relationships: relResults });
+      });
+
+      // ---- D) Dry-run a generated serving-view's SELECT against the warehouse ----
+      // Body: { sql } — the full generated `CREATE ... VIEW ... AS <select>;`.
+      // We strip the DDL wrapper + comments and EXPLAIN the SELECT so the planner
+      // resolves every column/join WITHOUT creating the view or scanning data.
+      // Returns { ok, error? } so the UI can prove the DDL will run before anyone
+      // copies it. Read-only: only EXPLAIN of a single SELECT is allowed.
+      app.post('/api/verify-view-sql', async (req, res) => {
+        const raw = String((req.body as { sql?: string })?.sql ?? '');
+        // drop line comments, then take the body after the first `AS`, minus `;`
+        const noComments = raw.replace(/^\s*--.*$/gm, '').trim();
+        const asMatch = noComments.match(/\bAS\b([\s\S]*)$/i);
+        const select = (asMatch ? asMatch[1] : noComments).trim().replace(/;\s*$/, '');
+        if (!/^select\b/i.test(select)) {
+          res.json({ ok: false, error: 'No SELECT body found to verify.' });
+          return;
+        }
+        // reject anything that could mutate — EXPLAIN of one read-only SELECT only
+        if (/;|\b(insert|update|delete|drop|create|alter|merge|grant|truncate)\b/i.test(select)) {
+          res.json({ ok: false, error: 'Only a single read-only SELECT can be verified.' });
+          return;
+        }
+        try {
+          const rows = await runSql(`EXPLAIN ${select}`);
+          // DBSQL EXPLAIN may embed an analysis error in the plan text instead
+          // of failing the statement — inspect the returned plan for errors.
+          const plan = rows.map((r) => Object.values(r).join(' ')).join('\n');
+          if (/AnalysisException|cannot be resolved|UNRESOLVED_COLUMN|TABLE_OR_VIEW_NOT_FOUND/i.test(plan)) {
+            const line = plan.split('\n').find((l) => /Exception|cannot be resolved|UNRESOLVED/i.test(l));
+            res.json({ ok: false, error: (line ?? plan).slice(0, 400) });
+            return;
+          }
+          res.json({ ok: true });
+        } catch (e) {
+          res.json({ ok: false, error: humanizeSqlError(e) || 'verification failed' });
+        }
       });
     });
   },

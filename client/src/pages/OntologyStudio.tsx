@@ -2,7 +2,7 @@
 // selected product's tables, with column mappings (role badges) and validation.
 // Validation queries the warehouse only for `live` products; others are clearly
 // labelled schema-derived (no live serving layer).
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import {
   Card,
   CardContent,
@@ -35,7 +35,7 @@ import {
   TooltipContent,
   TooltipProvider,
 } from '@databricks/appkit-ui/react';
-import { CheckCircle2, XCircle, AlertTriangle, Info, Check, X, Trash2, BookText, Sparkles, Loader2, ShieldCheck, FileCode } from 'lucide-react';
+import { CheckCircle2, XCircle, AlertTriangle, Info, Check, X, Trash2, BookText, Sparkles, Loader2, ShieldCheck, FileCode, Link2, ExternalLink, Plus } from 'lucide-react';
 import { useProduct } from '../lib/product';
 import { LiveValidation } from './LiveValidation';
 import { CatalogLoadingSkeleton } from '../components/LoadingSkeleton';
@@ -44,9 +44,11 @@ import { deriveContract } from '../lib/contract';
 import {
   suggestRelationships,
   validateOntology,
+  verifyViewSql,
   type SuggestedRelationship,
   type ValidationResult,
 } from '../lib/ontologyOverrides';
+import { fetchProductLinks, attachLink, deleteLink, type ProductLink } from '../lib/productLinks';
 
 // compact relative time ("3m ago", "2h ago", "5d ago")
 function relativeTime(iso: string): string {
@@ -159,8 +161,25 @@ export function OntologyStudio() {
     ontologyOverrides,
     getScopeCache,
     setScopeCache,
+    scopedDomains,
+    selectedSchemaIds,
+    schemaEntries,
   } = useProduct();
   const { classes, mappings, relationships, live } = components;
+
+  // context for attaching product links (step 6): the schema label + the domain
+  // that contains the selected product.
+  const schemaLabel =
+    selectedSchemaIds.length === 1
+      ? (schemaEntries.find((s) => s.id === selectedSchemaIds[0])?.label ?? '1 schema')
+      : `${selectedSchemaIds.length} schemas combined`;
+  const selectedDomain = useMemo(
+    () =>
+      scopedDomains.find((d) =>
+        d.products.some((p) => p.product_name === selectedProduct?.product_name)
+      ),
+    [scopedDomains, selectedProduct]
+  );
 
   // quick lookup: is there an override for a given ref (by key)?
   const overrideFor = (kind: string, ref: string, action: string) =>
@@ -175,6 +194,9 @@ export function OntologyStudio() {
     () => getScopeCache<ValidationResult>('validation') ?? null
   );
   const [validating, setValidating] = useState(false);
+  // serving-view SQL live verification (EXPLAIN dry-run against the warehouse)
+  const [viewCheck, setViewCheck] = useState<{ ok: boolean; error?: string } | null>(null);
+  const [verifying, setVerifying] = useState(false);
   // dismissible "How this works" stepper
   const [showSteps, setShowSteps] = useState(() => {
     try {
@@ -305,6 +327,11 @@ export function OntologyStudio() {
     () => deriveContract(selectedProduct, components, { servingObject: served.name }),
     [selectedProduct, components, served.name]
   );
+  const runVerifyView = async () => {
+    setVerifying(true);
+    setViewCheck(await verifyViewSql(served.sql));
+    setVerifying(false);
+  };
 
   if (catalogLoading) return <CatalogLoadingSkeleton label="Generating ontology…" />;
   if (rebuilding) return <CatalogLoadingSkeleton label="Rebuilding…" />;
@@ -874,25 +901,68 @@ export function OntologyStudio() {
               — preview & copy here; it's also in the exported brief.
             </CardDescription>
           </div>
-          <Button
-            size="sm"
-            variant="outline"
-            className="gap-1.5 shrink-0"
-            onClick={() => void navigator.clipboard?.writeText(served.sql)}
-          >
-            Copy SQL
-          </Button>
+          <div className="flex items-center gap-2 shrink-0">
+            <Button
+              size="sm"
+              variant="outline"
+              className="gap-1.5"
+              disabled={verifying}
+              title="Dry-run the view's SELECT (EXPLAIN) against the warehouse — no view is created"
+              onClick={() => void runVerifyView()}
+            >
+              {verifying ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <ShieldCheck className="h-3.5 w-3.5" />}
+              Verify
+            </Button>
+            <Button
+              size="sm"
+              variant="outline"
+              className="gap-1.5"
+              onClick={() => void navigator.clipboard?.writeText(served.sql)}
+            >
+              Copy SQL
+            </Button>
+          </div>
         </CardHeader>
         <CardContent className="space-y-2">
           <div className="text-xs text-muted-foreground">
             Target: <code>{served.name}</code> · {served.note}
           </div>
+          {viewCheck && (
+            <div
+              className={`flex items-start gap-1.5 rounded-md p-2 text-xs ${
+                viewCheck.ok ? 'bg-success/10 text-success' : 'bg-destructive/10 text-destructive'
+              }`}
+            >
+              {viewCheck.ok ? (
+                <>
+                  <CheckCircle2 className="h-3.5 w-3.5 mt-0.5 shrink-0" />
+                  <span>Verified — the SELECT resolves against the live warehouse; this DDL will run.</span>
+                </>
+              ) : (
+                <>
+                  <XCircle className="h-3.5 w-3.5 mt-0.5 shrink-0" />
+                  <span>Won't run: {viewCheck.error}</span>
+                </>
+              )}
+            </div>
+          )}
           <pre className="text-xs bg-muted rounded-md p-3 overflow-x-auto whitespace-pre">{served.sql}</pre>
           <div className="text-xs text-muted-foreground">
             Contract serving object: <code>{contract.serving_object}</code> · grain: {contract.grain}
           </div>
         </CardContent>
       </Card>
+
+      {/* item 6 — Attach Genie / Dashboard (surfaces in the ontology map) */}
+      {selectedProduct && (
+        <AttachLinksCard
+          product={selectedProduct.display_name}
+          productName={selectedProduct.product_name}
+          domainName={selectedDomain?.name ?? ''}
+          domainLabel={selectedDomain?.label ?? selectedDomain?.name ?? ''}
+          schemaLabel={schemaLabel}
+        />
+      )}
 
       <Card className="shadow-sm">
         <CardHeader>
@@ -956,17 +1026,48 @@ function SchemaDerivedNotice({
         <TableBody>
           <CheckRow label={`Source tables resolved (${tableCount})`} ok={tableCount > 0} />
           <CheckRow label={`Columns resolved from schema (${columnCount})`} ok={columnCount > 0} />
-          <CheckRow label="Governed serving view present" ok={false} warn />
+          <CheckRow
+            label="Governed serving view present"
+            ok={false}
+            warn
+            tooltip="A governed serving view is a stable, contract-backed view (e.g. jai_ontos.demo_schema.jai_<product>_serving) that conforms the raw source tables into the product's business shape. This product is still schema-derived straight from source tables — no serving view exists yet, so downstream consumers are reading raw tables that can change. Generate + run the serving view (above) to clear this warning."
+          />
         </TableBody>
       </Table>
     </div>
   );
 }
 
-function CheckRow({ label, ok, warn }: { label: string; ok: boolean; warn?: boolean }) {
+function CheckRow({
+  label,
+  ok,
+  warn,
+  tooltip,
+}: {
+  label: string;
+  ok: boolean;
+  warn?: boolean;
+  tooltip?: string;
+}) {
   return (
     <TableRow>
-      <TableCell className="text-sm">{label}</TableCell>
+      <TableCell className="text-sm">
+        {tooltip ? (
+          <TooltipProvider>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <span className="inline-flex items-center gap-1 cursor-help border-b border-dotted border-muted-foreground/40">
+                  {label}
+                  <Info className="h-3 w-3 text-muted-foreground" />
+                </span>
+              </TooltipTrigger>
+              <TooltipContent className="max-w-sm text-xs">{tooltip}</TooltipContent>
+            </Tooltip>
+          </TooltipProvider>
+        ) : (
+          label
+        )}
+      </TableCell>
       <TableCell className="text-right">
         {ok ? (
           <CheckCircle2 className="h-4 w-4 text-success inline" />
@@ -977,5 +1078,197 @@ function CheckRow({ label, ok, warn }: { label: string; ok: boolean; warn?: bool
         )}
       </TableCell>
     </TableRow>
+  );
+}
+
+// Prebuilt sample dashboards/Genie spaces we can offer as a one-click attach for
+// a given domain. Matched by domain name; the URL points at a real workspace
+// artifact so it renders in the ontology map once attached.
+const SAMPLE_LINKS: {
+  match: (domainName: string) => boolean;
+  link_type: 'genie' | 'dashboard';
+  url: string;
+  label: string;
+}[] = [
+  {
+    match: (d) => d === 'demand_forecasting_planning',
+    link_type: 'dashboard',
+    url: 'https://fe-vm-jai-classic-ws.cloud.databricks.com/dashboardsv3/01f1780f38a51b0ead8949891f7172e3/published',
+    label: 'Demand Forecasting & Planning (sample AI/BI dashboard)',
+  },
+];
+
+// Step 6 — attach a Genie Space or AI/BI dashboard to the selected product. The
+// attached links surface as first-class nodes in the ontology / enterprise map.
+function AttachLinksCard({
+  product,
+  productName,
+  domainName,
+  domainLabel,
+  schemaLabel,
+}: {
+  product: string;
+  productName: string;
+  domainName: string;
+  domainLabel: string;
+  schemaLabel: string;
+}) {
+  const [links, setLinks] = useState<ProductLink[]>([]);
+  const [kind, setKind] = useState<'genie' | 'dashboard'>('dashboard');
+  const [url, setUrl] = useState('');
+  const [label, setLabel] = useState('');
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    void fetchProductLinks(product).then((l) => {
+      if (!cancelled) setLinks(l);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [product]);
+
+  const reload = async () => setLinks(await fetchProductLinks(product));
+  const doAttach = async (linkType: 'genie' | 'dashboard', u: string, lbl?: string) => {
+    if (!u.trim()) return;
+    setBusy(true);
+    const r = await attachLink({
+      schema_label: schemaLabel,
+      domain: domainName,
+      product,
+      link_type: linkType,
+      url: u.trim(),
+      label: lbl?.trim() || (linkType === 'genie' ? 'Genie Space' : 'Dashboard'),
+    });
+    setBusy(false);
+    if (r.ok) {
+      setUrl('');
+      setLabel('');
+      await reload();
+    }
+  };
+  const doDelete = async (id: string) => {
+    setBusy(true);
+    await deleteLink(id);
+    setBusy(false);
+    await reload();
+  };
+
+  const sample = SAMPLE_LINKS.find((s) => s.match(domainName));
+  const sampleAttached = sample ? links.some((l) => l.url === sample.url) : false;
+
+  return (
+    <Card className="shadow-sm">
+      <CardHeader>
+        <CardTitle className="flex items-center gap-2">
+          <Link2 className="h-4 w-4 text-primary" /> Attach Genie / Dashboard
+        </CardTitle>
+        <CardDescription>
+          Link a Genie Space or AI/BI dashboard to <span className="font-medium">{product}</span>. Attached
+          links appear as nodes on the ontology map so consumers can jump straight to analysis.
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-3">
+        {/* suggested prebuilt dashboard for this domain */}
+        {sample && (
+          <div className="flex flex-wrap items-center gap-2 rounded-md border border-dashed bg-muted/20 px-3 py-2 text-sm">
+            <Sparkles className="h-4 w-4 text-primary shrink-0" />
+            <span className="font-medium">Suggested for {domainLabel || domainName}:</span>
+            <span className="text-muted-foreground">{sample.label}</span>
+            {sampleAttached ? (
+              <Badge variant="outline" className="ml-auto text-[10px] text-success">
+                <Check className="h-3 w-3 mr-1" /> attached
+              </Badge>
+            ) : (
+              <Button
+                size="sm"
+                variant="outline"
+                className="ml-auto gap-1.5"
+                disabled={busy}
+                onClick={() => void doAttach(sample.link_type, sample.url, sample.label)}
+              >
+                <Plus className="h-3.5 w-3.5" /> Attach sample
+              </Button>
+            )}
+          </div>
+        )}
+
+        {/* currently attached links */}
+        {links.length > 0 && (
+          <div className="space-y-1.5">
+            {links.map((l) => (
+              <div
+                key={l.link_id}
+                className="flex items-center gap-2 rounded-md border px-3 py-1.5 text-sm"
+              >
+                <Badge variant="secondary" className="text-[10px] shrink-0">
+                  {l.link_type === 'genie' ? 'Genie' : 'Dashboard'}
+                </Badge>
+                <a
+                  href={l.url}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="truncate text-primary hover:underline inline-flex items-center gap-1"
+                >
+                  {l.label || l.url}
+                  <ExternalLink className="h-3 w-3 shrink-0" />
+                </a>
+                <Button
+                  size="icon"
+                  variant="ghost"
+                  className="ml-auto h-7 w-7 text-destructive shrink-0"
+                  disabled={busy}
+                  title="Detach"
+                  onClick={() => void doDelete(l.link_id)}
+                >
+                  <Trash2 className="h-3.5 w-3.5" />
+                </Button>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {/* manual attach form */}
+        <div className="flex flex-wrap items-center gap-2">
+          <ToggleGroup
+            type="single"
+            value={kind}
+            onValueChange={(v) => v && setKind(v as 'genie' | 'dashboard')}
+            className="shrink-0"
+          >
+            <ToggleGroupItem value="dashboard" className="text-xs">
+              Dashboard
+            </ToggleGroupItem>
+            <ToggleGroupItem value="genie" className="text-xs">
+              Genie
+            </ToggleGroupItem>
+          </ToggleGroup>
+          <Input
+            className="flex-1 min-w-[200px] text-xs"
+            placeholder={`Paste ${kind === 'genie' ? 'Genie Space' : 'dashboard'} URL`}
+            value={url}
+            onChange={(e) => setUrl(e.target.value)}
+          />
+          <Input
+            className="w-40 text-xs"
+            placeholder="Label (optional)"
+            value={label}
+            onChange={(e) => setLabel(e.target.value)}
+          />
+          <Button
+            size="sm"
+            disabled={busy || !url.trim()}
+            onClick={() => void doAttach(kind, url, label)}
+          >
+            Attach
+          </Button>
+        </div>
+        <div className="text-[11px] text-muted-foreground">
+          Persisted to <code>product_links</code> for <code>{productName}</code>; overlaid on the graph in
+          Graph Explorer.
+        </div>
+      </CardContent>
+    </Card>
   );
 }

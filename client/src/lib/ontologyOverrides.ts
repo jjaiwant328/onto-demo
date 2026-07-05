@@ -117,6 +117,20 @@ export async function validateOntology(args: {
   }
 }
 
+// ---- verify a generated serving-view's SQL compiles against the warehouse ----
+export async function verifyViewSql(sql: string): Promise<{ ok: boolean; error?: string }> {
+  try {
+    const resp = await fetch('/api/verify-view-sql', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ sql }),
+    });
+    return await resp.json();
+  } catch (e) {
+    return { ok: false, error: String(e) };
+  }
+}
+
 // ---- server helpers ----
 export async function fetchOntologyOverrides(schemaLabel: string): Promise<OntologyOverride[]> {
   try {

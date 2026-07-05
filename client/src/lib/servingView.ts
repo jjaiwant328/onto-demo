@@ -49,12 +49,21 @@ export function generateServingView(
   const factShort = shortName(fact);
   const factAlias = 'f';
 
+  // known columns per short table name — so we never emit a column the schema
+  // doesn't have (the root cause of "unresolved column" CREATE VIEW failures).
+  const colsByShort = new Map<string, Set<string>>();
+  for (const t of components.tables) {
+    colsByShort.set(shortName(t.table), new Set(t.columns.map((c) => c.name)));
+  }
+  const factColSet = colsByShort.get(factShort) ?? new Set<string>();
+
   // confirmed relationships (origin user OR status confirmed) whose from = fact
   const confirmed = components.relationships.filter(
     (r) => r.status === 'confirmed' || r.origin === 'user'
   );
   const joins: string[] = [];
-  const joinCols = new Set<string>();
+  const dimSelects: string[] = [];
+  const skipped: string[] = [];
   let i = 0;
   const seenDim = new Set<string>();
   for (const r of confirmed) {
@@ -64,17 +73,33 @@ export function generateServingView(
     if (dimShort === factShort || seenDim.has(dimShort)) continue;
     const dimFull = fullByShort.get(dimShort);
     if (!dimFull) continue;
+    // resolve the REAL join columns — predicate is only a label for LLM
+    // suggestions; fromColumn/toColumn carry the actual (possibly different) keys
+    const fromCol = r.fromColumn ?? r.predicate;
+    const toCol = r.toColumn ?? r.predicate;
+    const dimColSet = colsByShort.get(dimShort) ?? new Set<string>();
+    // only emit a join whose columns provably exist on both sides
+    if (!factColSet.has(fromCol) || !dimColSet.has(toCol)) {
+      skipped.push(`${dimShort} (unresolved key ${fromCol}=${toCol})`);
+      continue;
+    }
     seenDim.add(dimShort);
     const a = alias(dimFull, i++);
-    joins.push(`  LEFT JOIN ${dimFull} ${a}\n    ON ${factAlias}.${r.predicate} = ${a}.${r.predicate}`);
-    joinCols.add(r.predicate);
+    joins.push(`  LEFT JOIN ${dimFull} ${a}\n    ON ${factAlias}.${fromCol} = ${a}.${toCol}`);
+    // pull a couple of descriptive (non-key) dim columns, aliased to avoid
+    // ambiguous/duplicate column names in the view output
+    const descriptive = (components.tables.find((t) => shortName(t.table) === dimShort)?.columns ?? [])
+      .filter((c) => c.role !== 'key' && c.name !== toCol)
+      .slice(0, 2);
+    for (const c of descriptive) dimSelects.push(`${a}.${c.name} AS ${dimShort}_${c.name}`);
   }
 
   // select the fact's columns + a few descriptive columns from joined dims
   const factCols = (components.tables.find((t) => shortName(t.table) === factShort)?.columns ?? []).map(
     (c) => `${factAlias}.${c.name}`
   );
-  const selectList = factCols.length ? factCols.join(',\n  ') : `${factAlias}.*`;
+  const selectCols = [...factCols, ...dimSelects];
+  const selectList = selectCols.length ? selectCols.join(',\n  ') : `${factAlias}.*`;
 
   const sql =
     `-- Serving view for ${product.display_name}\n` +
@@ -85,12 +110,15 @@ export function generateServingView(
     (joins.length ? joins.join('\n') + '\n' : '') +
     `;`;
 
+  const skippedNote = skipped.length ? ` Skipped ${skipped.length}: ${skipped.join('; ')}.` : '';
   return {
     name: targetName,
     sql,
     joins: joins.length,
-    note: joins.length
-      ? `Joined ${joins.length} confirmed relationship(s).`
-      : 'No confirmed fact→dim relationships — the view selects the fact table only. Confirm relationships (or accept a suggestion) to add joins.',
+    note:
+      (joins.length
+        ? `Joined ${joins.length} confirmed relationship(s).`
+        : 'No confirmed fact→dim relationships — the view selects the fact table only. Confirm relationships (or accept a suggestion) to add joins.') +
+      skippedNote,
   };
 }
