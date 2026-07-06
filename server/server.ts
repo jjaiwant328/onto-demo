@@ -1186,9 +1186,9 @@ createApp({
           // DBSQL EXPLAIN may embed an analysis error in the plan text instead
           // of failing the statement — inspect the returned plan for errors.
           const plan = rows.map((r) => Object.values(r).join(' ')).join('\n');
-          if (/AnalysisException|cannot be resolved|UNRESOLVED_COLUMN|TABLE_OR_VIEW_NOT_FOUND/i.test(plan)) {
-            const line = plan.split('\n').find((l) => /Exception|cannot be resolved|UNRESOLVED/i.test(l));
-            res.json({ ok: false, error: (line ?? plan).slice(0, 400) });
+          if (/AnalysisException|cannot be resolved|UNRESOLVED_COLUMN|UnresolvedRelation|TABLE_OR_VIEW_NOT_FOUND/i.test(plan)) {
+            // reuse humanizeSqlError so unresolved tables get the friendly message
+            res.json({ ok: false, error: humanizeSqlError(plan) });
             return;
           }
           res.json({ ok: true });
@@ -1505,6 +1505,13 @@ function humanizeSqlError(err: unknown): string {
   const msg = String((err as { message?: string })?.message ?? err);
   if (/permission|access|denied|not authorized|PERMISSION_DENIED|forbidden/i.test(msg)) {
     return 'No access — the app service principal lacks permission on this catalog/schema.';
+  }
+  // Spark leaves unresolved tables as `'UnresolvedRelation [schema, table]` in the
+  // (parsed) plan — surface the missing table + why, instead of the raw plan tree.
+  const unresolved = msg.match(/UnresolvedRelation\s*\[([^\]]+)\]/i);
+  if (unresolved) {
+    const table = unresolved[1].split(',').map((s) => s.trim()).filter(Boolean).join('.');
+    return `Table \`${table}\` not found in the connected warehouse. Its catalog isn't qualified (or the schema isn't physically present here), so the view can't be verified against live data.`;
   }
   if (/does not exist|not found|cannot be found|TABLE_OR_VIEW_NOT_FOUND|SCHEMA_NOT_FOUND/i.test(msg)) {
     return 'Not found — no matching catalog/schema/tables (or no access).';

@@ -4,7 +4,7 @@
 //   Tab 2 "Ontology + lineage" — static layered overview map.
 // Cytoscape is the CDN global (window.cytoscape); styling/interaction adapted
 // from the databricks-industry-solutions model-viewer reference.
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useMemo, useRef } from 'react';
 import {
   Card,
   CardContent,
@@ -12,12 +12,13 @@ import {
   CardTitle,
   CardDescription,
   Button,
+  Input,
   Tabs,
   TabsList,
   TabsTrigger,
   TabsContent,
 } from '@databricks/appkit-ui/react';
-import { X, Database, KeyRound, Link2, Info, Activity, Layers } from 'lucide-react';
+import { X, Database, KeyRound, Link2, Info, Activity, Layers, Search } from 'lucide-react';
 import { useNavigate } from 'react-router';
 import { useProduct } from '../lib/product';
 import { Badge } from '@databricks/appkit-ui/react';
@@ -174,6 +175,18 @@ export function GraphExplorer() {
 
   const [tab, setTab] = useState<'explore' | 'onto'>('explore');
 
+  // node search (works on the active tab's node set; jumps to a match)
+  const [search, setSearch] = useState('');
+  const [searchOpen, setSearchOpen] = useState(false);
+  const searchRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const onDocClick = (e: MouseEvent) => {
+      if (searchRef.current && !searchRef.current.contains(e.target as Node)) setSearchOpen(false);
+    };
+    document.addEventListener('mousedown', onDocClick);
+    return () => document.removeEventListener('mousedown', onDocClick);
+  }, []);
+
   // travel state (Tab 1 — over the enterprise map)
   const [focusId, setFocusId] = useState<string | null>(null);
   const [trail, setTrail] = useState<string[]>([]);
@@ -261,6 +274,30 @@ export function GraphExplorer() {
   const [selOntoId, setSelOntoId] = useState<string | null>(null);
 
   const isExplore = tab === 'explore';
+
+  // matches in the active tab's node set (by label), capped for the dropdown
+  const searchResults = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    if (!q) return [] as { id: string; label: string; kindLabel?: string }[];
+    const src = isExplore ? enterpriseGraph.nodes : ontoData.nodes;
+    const out: { id: string; label: string; kindLabel?: string }[] = [];
+    for (const id of Object.keys(src)) {
+      const n = src[id] as { label?: string; kindLabel?: string };
+      if (n?.label && n.label.toLowerCase().includes(q)) {
+        out.push({ id, label: n.label, kindLabel: n.kindLabel });
+        if (out.length >= 12) break;
+      }
+    }
+    return out;
+  }, [search, isExplore, enterpriseGraph, ontoData]);
+
+  const jumpToSearch = (id: string) => {
+    if (isExplore) travelTo(id);
+    else setSelOntoId(id);
+    setSearch('');
+    setSearchOpen(false);
+  };
+
   const travelNode = focusId ? (enterpriseGraph.nodes[focusId] ?? null) : null;
   const selectedNode: InspectorNode | null = isExplore
     ? travelNode
@@ -293,6 +330,64 @@ export function GraphExplorer() {
         <div className="grid grid-cols-1 lg:grid-cols-[1fr_280px] gap-4 mt-3">
           <Card className="shadow-sm overflow-hidden">
             <CardHeader className="py-2.5 gap-2">
+              {/* node search — jumps to a matching node in the active view */}
+              <div ref={searchRef} className="relative w-full max-w-sm">
+                <div className="relative">
+                  <Search className="absolute left-2 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-muted-foreground" />
+                  <Input
+                    className="pl-8 pr-7 h-8 text-xs"
+                    placeholder={isExplore ? 'Search nodes (products, tables, domains…)' : 'Search ontology nodes…'}
+                    value={search}
+                    onChange={(e) => {
+                      setSearch(e.target.value);
+                      setSearchOpen(true);
+                    }}
+                    onFocus={() => setSearchOpen(true)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter' && searchResults[0]) jumpToSearch(searchResults[0].id);
+                      if (e.key === 'Escape') {
+                        setSearch('');
+                        setSearchOpen(false);
+                      }
+                    }}
+                  />
+                  {search && (
+                    <button
+                      type="button"
+                      className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+                      onClick={() => {
+                        setSearch('');
+                        setSearchOpen(false);
+                      }}
+                      aria-label="Clear search"
+                    >
+                      <X className="h-3.5 w-3.5" />
+                    </button>
+                  )}
+                </div>
+                {searchOpen && searchResults.length > 0 && (
+                  <div className="absolute z-20 mt-1 w-full max-h-64 overflow-auto rounded-md border bg-background shadow-md">
+                    {searchResults.map((r) => (
+                      <button
+                        key={r.id}
+                        type="button"
+                        className="flex w-full items-center justify-between gap-2 px-3 py-1.5 text-left text-xs hover:bg-muted"
+                        onClick={() => jumpToSearch(r.id)}
+                      >
+                        <span className="truncate">{r.label}</span>
+                        {r.kindLabel && (
+                          <span className="text-[10px] text-muted-foreground shrink-0">{r.kindLabel}</span>
+                        )}
+                      </button>
+                    ))}
+                  </div>
+                )}
+                {searchOpen && search.trim() && searchResults.length === 0 && (
+                  <div className="absolute z-20 mt-1 w-full rounded-md border bg-background p-2 text-xs text-muted-foreground shadow-md">
+                    No matching nodes.
+                  </div>
+                )}
+              </div>
               <TabsContent value="explore" className="m-0">
                 <div className="flex items-center gap-2 flex-wrap">
                   <Button variant="outline" size="sm" onClick={goBack} disabled={!focusId}>
