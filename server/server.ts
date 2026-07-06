@@ -1228,6 +1228,8 @@ createApp({
         if (!dom) return { ok: false, error: 'unknown domain' };
         const jobId = monitorJobId(domain);
         const runDate = new Date().toISOString().slice(0, 10);
+        // run-level id for the response; each stored row gets its own unique id
+        // (run_id is the table PK, so it must be unique per product row).
         const runId = `jai_run_${Date.now().toString(36)}_${randomUUID().slice(0, 8)}`;
 
         // 1) compute aggregate stats per product
@@ -1279,7 +1281,7 @@ createApp({
                 `metrics_json = EXCLUDED.metrics_json, exception_total = EXCLUDED.exception_total, ` +
                 `status = EXCLUDED.status, error = EXCLUDED.error, llm_summary = EXCLUDED.llm_summary`,
               [
-                runId,
+                `${runId}_${String(r.product)}`,
                 jobId,
                 domain,
                 runDate,
