@@ -162,6 +162,7 @@ export function DataProducts() {
     scopedDomains,
     selectedProduct,
     setSelectedDomain,
+    setSelectedProduct,
     syncScopeFromSections,
     schemaEntries,
     combined,
@@ -169,6 +170,7 @@ export function DataProducts() {
     selectedSchemaIds,
     catalogLoading,
     rebuilding,
+    refreshGraphLinks,
   } = useProduct();
   const schemaLabel =
     selectedSchemaIds.length === 1
@@ -186,6 +188,19 @@ export function DataProducts() {
     setFocusDomainName(name);
     setFocusProductName(null);
     if (syncScopeFromSections) setSelectedDomain(name);
+  };
+
+  // Pick a product row. Sets the local preview focus, and — when "Selections
+  // update scope" is on — carries the selection to the global scope so other
+  // tabs (Ontology Studio, etc.) open on this product. Domain is set first
+  // because setSelectedDomain resets product to ALL; setSelectedProduct after.
+  const pickProduct = (domainName: string, productName: string) => {
+    setFocusDomainName(domainName);
+    setFocusProductName(productName);
+    if (syncScopeFromSections) {
+      setSelectedDomain(domainName);
+      setSelectedProduct(productName);
+    }
   };
 
   const focusDomain = useMemo(
@@ -216,7 +231,10 @@ export function DataProducts() {
       map.get(key)!.push(l);
     }
     setLinksByProduct(map);
-  }, []);
+    // also refresh the enterprise/ontology graph overlay so newly attached/
+    // detached links (incl. dashboards) show without a full page reload.
+    void refreshGraphLinks();
+  }, [refreshGraphLinks]);
   useEffect(() => {
     void loadLinks();
   }, [loadLinks]);
@@ -308,12 +326,27 @@ export function DataProducts() {
             </TableHeader>
             <TableBody>
               {(focusDomain?.products ?? []).map((p) => {
-                // rows are display-only; the only interactive controls are the
-                // Genie / Dashboard attach/open cells below.
+                // clicking the product name selects it (and carries to global
+                // scope when the sync toggle is on); Genie/Dashboard cells below
+                // remain the attach/open controls.
                 const links = linksByProduct.get(p.display_name) ?? [];
+                const isSelected = focusProduct?.product_name === p.product_name;
                 return (
-                  <TableRow key={p.product_name}>
-                    <TableCell className="font-medium">{p.display_name}</TableCell>
+                  <TableRow key={p.product_name} data-state={isSelected ? 'selected' : undefined}>
+                    <TableCell className="font-medium">
+                      <button
+                        type="button"
+                        className="text-left hover:underline hover:text-primary"
+                        title={
+                          syncScopeFromSections
+                            ? 'Select — opens in Ontology Studio and updates scope'
+                            : 'Select for preview (enable "Selections update scope" to carry to other tabs)'
+                        }
+                        onClick={() => pickProduct(focusDomain?.name ?? '', p.product_name)}
+                      >
+                        {p.display_name}
+                      </button>
+                    </TableCell>
                     <TableCell>
                       <Badge variant={maturityVariant(p.maturity)}>{p.maturity}</Badge>
                     </TableCell>

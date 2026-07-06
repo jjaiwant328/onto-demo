@@ -143,6 +143,9 @@ export type ProductContextValue = {
   // enterprise map + highlight
   enterpriseGraph: EnterpriseGraph;
   enterpriseHighlight: Set<string>;
+  // re-fetch product links (Genie/dashboard) overlaid on the enterprise graph.
+  // Call after attaching/detaching a link so the graph reflects it without a reload.
+  refreshGraphLinks: () => Promise<void>;
   // token that changes whenever the active schema selection changes; session-
   // scoped panels (Action queue, Copilot conversation) reset on it so no
   // schema's state leaks into another.
@@ -1019,14 +1022,15 @@ export function ProductProvider({ children }: { children: ReactNode }) {
   // product links (Genie / dashboard) overlaid onto the enterprise graph. Loaded
   // once on startup from Lakebase; refreshed when links are attached/detached.
   const [graphLinks, setGraphLinks] = useState<GraphProductLink[]>([]);
-  useEffect(() => {
-    void (async () => {
-      const all = await fetchProductLinks();
-      setGraphLinks(
-        all.map((l) => ({ product: l.product ?? '', link_type: l.link_type, url: l.url, label: l.label }))
-      );
-    })();
+  const refreshGraphLinks = useCallback(async () => {
+    const all = await fetchProductLinks();
+    setGraphLinks(
+      all.map((l) => ({ product: l.product ?? '', link_type: l.link_type, url: l.url, label: l.label }))
+    );
   }, []);
+  useEffect(() => {
+    void refreshGraphLinks();
+  }, [refreshGraphLinks]);
 
   // ---- derived artifacts ----
   // effective components = heuristic/LLM derivation with user overrides layered on
@@ -1106,6 +1110,7 @@ export function ProductProvider({ children }: { children: ReactNode }) {
     unmergeDomain,
     enterpriseGraph,
     enterpriseHighlight,
+    refreshGraphLinks,
     isolationKey: sig,
     syncScopeFromSections,
     setSyncScopeFromSections,

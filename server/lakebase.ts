@@ -135,4 +135,49 @@ export async function ensureLakebaseTables(): Promise<void> {
     catalog_json text,
     created_at timestamptz
   )`);
+  // Domain-level monitoring-job DEFINITION — one active, revisable row per
+  // domain. Captures the aggregate spec the user assembles via the chat builder,
+  // the schedule, and the job name shown to the user. Keyed by domain so a new
+  // domain onboards with zero DDL (shared table, WHERE domain = $1).
+  await lbQuery(`CREATE TABLE IF NOT EXISTS jai_monitor_job (
+    job_id text PRIMARY KEY,
+    domain text UNIQUE NOT NULL,
+    domain_label text,
+    job_name text,
+    schedule_cron text,
+    schedule_tz text DEFAULT 'America/New_York',
+    products_json text,
+    aggregates_json text,
+    summary_prompt text,
+    enabled boolean DEFAULT true,
+    version int DEFAULT 1,
+    created_by text,
+    created_at timestamptz,
+    updated_at timestamptz
+  )`);
+  // Monitoring-job RUN OUTPUT — daily AGGREGATE results, one row per
+  // (domain, product, day). Never stores row-level detail or actions; this is
+  // physically separate from action_log (no decision/recommendation columns).
+  await lbQuery(`CREATE TABLE IF NOT EXISTS jai_monitor_run (
+    run_id text PRIMARY KEY,
+    job_id text NOT NULL,
+    domain text NOT NULL,
+    run_ts timestamptz NOT NULL,
+    run_date date NOT NULL,
+    trigger text,
+    product text NOT NULL,
+    metrics_json text,
+    exception_total bigint,
+    status text,
+    error text,
+    llm_summary text,
+    created_at timestamptz
+  )`);
+  await lbQuery(
+    `CREATE INDEX IF NOT EXISTS idx_monitor_run_domain_date ON jai_monitor_run (domain, run_date DESC)`
+  );
+  // one row per (job, product, day) — re-runs upsert in place (idempotent)
+  await lbQuery(
+    `CREATE UNIQUE INDEX IF NOT EXISTS uq_monitor_run_day ON jai_monitor_run (job_id, product, run_date)`
+  );
 }

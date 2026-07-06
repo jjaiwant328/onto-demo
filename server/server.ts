@@ -6,6 +6,7 @@ import {
   demoSnapshotSql,
   isDemoProduct,
   DEMO_PRODUCTS,
+  DEMO_DOMAINS,
 } from '../shared/demoDomains';
 import { lbQuery, ensureLakebaseTables, lakebaseConfigured } from './lakebase';
 
@@ -1194,6 +1195,277 @@ createApp({
         } catch (e) {
           res.json({ ok: false, error: humanizeSqlError(e) || 'verification failed' });
         }
+      });
+
+      // ======================================================================
+      // Domain-level MONITORING JOB builder (Action Center).
+      // Aggregate-only by construction: computation runs ONLY demoAggregateSql
+      // (one summary row per product) and stores results in jai_monitor_run,
+      // which has NO decision/recommendation columns. It never proposes or takes
+      // action — that stays in action_log. Everything keys on `domain`.
+      // ======================================================================
+      const monitorJobId = (domain: string) => `jai_monitor_${domain}`;
+      const monitorJobName = (domain: string) => `jai_monitor_${domain}_daily`;
+      const monitorDomain = (name: string) => DEMO_DOMAINS.find((d) => d.name === name);
+      // the aggregate column aliases a product's aggregate_select emits (AS <key>)
+      const metricKeys = (productName: string): string[] => {
+        const sql = demoAggregateSql(productName) ?? '';
+        const keys: string[] = [];
+        const re = /\bAS\s+([A-Za-z0-9_]+)/gi;
+        let m: RegExpExecArray | null;
+        while ((m = re.exec(sql)) !== null) keys.push(m[1]);
+        return keys;
+      };
+
+      // Shared run helper — mirrored by the Phase-2 scheduled Databricks Job.
+      // Loops all products in the domain, runs the aggregate SQL, and upserts one
+      // jai_monitor_run row per (job, product, day). Returns per-product results.
+      const runMonitorJob = async (
+        domain: string,
+        trigger: 'scheduled' | 'on_demand'
+      ): Promise<{ ok: boolean; run_id?: string; results?: Record<string, unknown>[]; error?: string }> => {
+        const dom = monitorDomain(domain);
+        if (!dom) return { ok: false, error: 'unknown domain' };
+        const jobId = monitorJobId(domain);
+        const runDate = new Date().toISOString().slice(0, 10);
+        const runId = `jai_run_${Date.now().toString(36)}_${randomUUID().slice(0, 8)}`;
+
+        // 1) compute aggregate stats per product
+        const results: Record<string, unknown>[] = [];
+        for (const p of dom.products) {
+          const aggSql = demoAggregateSql(p.product_name);
+          if (!aggSql) {
+            results.push({ product: p.product_name, status: 'error', error: 'no aggregate SQL' });
+            continue;
+          }
+          try {
+            const rows = await runSql(aggSql);
+            const stats = rows[0] ?? {};
+            // headline count = first numeric aggregate column (generalizes across domains)
+            const firstNum = Object.values(stats).find((v) => typeof v === 'number' || (!isNaN(Number(v)) && v !== null && v !== ''));
+            const total = Number(firstNum ?? 0) || 0;
+            results.push({
+              product: p.product_name,
+              display_name: p.display_name,
+              status: total > 0 ? 'breach' : 'ok',
+              exception_total: total,
+              metrics: stats,
+            });
+          } catch (e) {
+            results.push({ product: p.product_name, status: 'error', error: humanizeSqlError(e) });
+          }
+        }
+
+        // 2) optional ONE domain-level narrative (aggregate-only; no actions)
+        let llmSummary: string | null = null;
+        if (hasLlm) {
+          const prompt =
+            `You are a monitoring analyst for the "${dom.label}" domain. Below are AGGREGATE health ` +
+            `metrics for each data product (one summary row each). Write a 1-2 sentence AGGREGATE status ` +
+            `summary of the domain's health — cite the key counts. Do NOT propose actions, do NOT resolve ` +
+            `anything, do NOT list individual rows. Plain text only.\n\n${JSON.stringify(results).slice(0, 8000)}`;
+          llmSummary = await llmComplete(prompt, 400);
+        }
+
+        // 3) upsert one row per product (idempotent per day)
+        try {
+          for (const r of results) {
+            await lbQuery(
+              `INSERT INTO jai_monitor_run (run_id, job_id, domain, run_ts, run_date, trigger, product, ` +
+                `metrics_json, exception_total, status, error, llm_summary, created_at) ` +
+                `VALUES ($1,$2,$3, now(), $4::date, $5, $6, $7, $8, $9, $10, $11, now()) ` +
+                `ON CONFLICT (job_id, product, run_date) DO UPDATE SET ` +
+                `run_id = EXCLUDED.run_id, run_ts = EXCLUDED.run_ts, trigger = EXCLUDED.trigger, ` +
+                `metrics_json = EXCLUDED.metrics_json, exception_total = EXCLUDED.exception_total, ` +
+                `status = EXCLUDED.status, error = EXCLUDED.error, llm_summary = EXCLUDED.llm_summary`,
+              [
+                runId,
+                jobId,
+                domain,
+                runDate,
+                trigger,
+                String(r.product),
+                JSON.stringify(r.metrics ?? {}),
+                Number(r.exception_total ?? 0) || 0,
+                String(r.status ?? 'ok'),
+                r.error ? String(r.error) : null,
+                llmSummary,
+              ]
+            );
+          }
+        } catch (e) {
+          return { ok: false, error: humanizeSqlError(e) };
+        }
+        return { ok: true, run_id: runId, results };
+      };
+
+      // GET saved definition for a domain (or null).
+      app.get('/api/monitor-job', async (req, res) => {
+        const domain = String(req.query.domain ?? '').trim();
+        if (!domain) {
+          res.json({ job: null });
+          return;
+        }
+        try {
+          const rows = await lbQuery(
+            `SELECT job_id, domain, domain_label, job_name, schedule_cron, schedule_tz, products_json, ` +
+              `aggregates_json, summary_prompt, enabled, version, created_by, ` +
+              `to_char(updated_at, 'YYYY-MM-DD HH24:MI:SS') AS updated_at ` +
+              `FROM jai_monitor_job WHERE domain = $1 LIMIT 1`,
+            [domain]
+          );
+          res.json({ job: rows[0] ?? null });
+        } catch (err) {
+          res.json({ job: null, error: humanizeSqlError(err) });
+        }
+      });
+
+      // Upsert (save/revise) a domain's monitoring definition; bumps version.
+      app.post('/api/monitor-job', async (req, res) => {
+        const b = (req.body ?? {}) as {
+          domain?: string;
+          schedule_cron?: string;
+          schedule_tz?: string;
+          aggregates_json?: unknown;
+          summary_prompt?: string;
+          enabled?: boolean;
+        };
+        const domain = String(b.domain ?? '').trim();
+        const dom = monitorDomain(domain);
+        if (!dom) {
+          res.status(400).json({ ok: false, error: 'unknown or non-data-backed domain' });
+          return;
+        }
+        const jobId = monitorJobId(domain);
+        const jobName = monitorJobName(domain);
+        const products = dom.products.map((p) => p.product_name);
+        const agg =
+          b.aggregates_json == null
+            ? '[]'
+            : typeof b.aggregates_json === 'string'
+              ? b.aggregates_json
+              : JSON.stringify(b.aggregates_json);
+        try {
+          const who = await whoami();
+          const rows = await lbQuery<{ version: number }>(
+            `INSERT INTO jai_monitor_job (job_id, domain, domain_label, job_name, schedule_cron, schedule_tz, ` +
+              `products_json, aggregates_json, summary_prompt, enabled, version, created_by, created_at, updated_at) ` +
+              `VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10, 1, $11, now(), now()) ` +
+              `ON CONFLICT (domain) DO UPDATE SET ` +
+              `job_name = EXCLUDED.job_name, schedule_cron = EXCLUDED.schedule_cron, ` +
+              `schedule_tz = EXCLUDED.schedule_tz, products_json = EXCLUDED.products_json, ` +
+              `aggregates_json = EXCLUDED.aggregates_json, summary_prompt = EXCLUDED.summary_prompt, ` +
+              `enabled = EXCLUDED.enabled, version = jai_monitor_job.version + 1, updated_at = now() ` +
+              `RETURNING version`,
+            [
+              jobId,
+              domain,
+              dom.label,
+              jobName,
+              String(b.schedule_cron ?? '0 0 7 * * ?'),
+              String(b.schedule_tz ?? 'America/New_York'),
+              JSON.stringify(products),
+              agg,
+              b.summary_prompt ? String(b.summary_prompt) : null,
+              b.enabled === false ? false : true,
+              who,
+            ]
+          );
+          res.json({ ok: true, job_id: jobId, job_name: jobName, version: rows[0]?.version ?? 1 });
+        } catch (err) {
+          res.json({ ok: false, error: humanizeSqlError(err) });
+        }
+      });
+
+      // Chat builder — helps the user assemble an AGGREGATE monitoring spec.
+      // Guardrailed: may only propose metrics/thresholds, never actions.
+      app.post('/api/monitor-chat', async (req, res) => {
+        const b = (req.body ?? {}) as {
+          domain?: string;
+          question?: string;
+          history?: { role: string; content: string }[];
+          currentSpec?: unknown;
+        };
+        const dom = monitorDomain(String(b.domain ?? ''));
+        if (!dom) {
+          res.status(400).json({ answer: 'Unknown domain.', spec: null });
+          return;
+        }
+        if (!hasLlm) {
+          res.json({ answer: 'The assistant is unavailable (no serving endpoint configured).', spec: null, llm: false });
+          return;
+        }
+        const catalog = dom.products
+          .map((p) => `- ${p.product_name} (${p.display_name}): metrics [${metricKeys(p.product_name).join(', ')}]`)
+          .join('\n');
+        const hist = Array.isArray(b.history)
+          ? b.history.slice(-6).map((h) => `${h.role}: ${h.content}`).join('\n')
+          : '';
+        const prompt =
+          `You are helping define a DAILY AGGREGATE monitoring job for the "${dom.label}" domain. It runs ` +
+          `across ALL products in the domain and stores only aggregate counts — it must NEVER resolve issues, ` +
+          `take action, or reference individual rows. Your job is ONLY to help the user choose which aggregate ` +
+          `metrics (and optional numeric thresholds) to watch per product.\n\n` +
+          `AVAILABLE PRODUCTS AND METRIC KEYS (use ONLY these keys):\n${catalog}\n\n` +
+          (b.currentSpec ? `CURRENT SPEC:\n${JSON.stringify(b.currentSpec).slice(0, 4000)}\n\n` : '') +
+          (hist ? `CONVERSATION:\n${hist}\n\n` : '') +
+          `USER: ${String(b.question ?? '')}\n\n` +
+          `Reply with a short plain-text explanation, then a fenced \`\`\`json block containing the updated spec: ` +
+          `{"aggregates":[{"product_name","metrics":[{"key","label"}],"threshold":{"metric","op":">"|">="|"<"|"<=","value":number}?}]}. ` +
+          `Only include products/metric keys from the list above.`;
+        const content = await llmComplete(prompt, 1500);
+        const spec = extractJsonObject(content ?? '');
+        // strip the fenced json from the displayed answer
+        const answer = (content ?? '').replace(/```(?:json)?[\s\S]*?```/g, '').trim() || 'Updated the monitoring spec below.';
+        res.json({ answer, spec: spec ?? null, llm: true });
+      });
+
+      // Run the domain's aggregates now (on-demand) and store the results.
+      app.post('/api/monitor-run', async (req, res) => {
+        const b = (req.body ?? {}) as { domain?: string; trigger?: string };
+        const trigger = b.trigger === 'scheduled' ? 'scheduled' : 'on_demand';
+        const out = await runMonitorJob(String(b.domain ?? ''), trigger);
+        res.json(out);
+      });
+
+      // List recent run outputs for a domain (newest first).
+      app.get('/api/monitor-runs', async (req, res) => {
+        const domain = String(req.query.domain ?? '').trim();
+        const limit = Math.min(Math.max(Number(req.query.limit ?? 60) || 60, 1), 500);
+        if (!domain) {
+          res.json({ runs: [] });
+          return;
+        }
+        try {
+          const rows = await lbQuery(
+            `SELECT run_id, job_id, domain, to_char(run_ts, 'YYYY-MM-DD HH24:MI:SS') AS run_ts, ` +
+              `to_char(run_date, 'YYYY-MM-DD') AS run_date, trigger, product, metrics_json, ` +
+              `exception_total, status, error, llm_summary ` +
+              `FROM jai_monitor_run WHERE domain = $1 ORDER BY run_ts DESC LIMIT ${limit}`,
+            [domain]
+          );
+          res.json({ runs: rows });
+        } catch (err) {
+          res.json({ runs: [], error: humanizeSqlError(err) });
+        }
+      });
+
+      // Preview the generated aggregate SQL per product (no execution).
+      app.get('/api/monitor-preview', (req, res) => {
+        const dom = monitorDomain(String(req.query.domain ?? ''));
+        if (!dom) {
+          res.json({ products: [] });
+          return;
+        }
+        res.json({
+          job_name: monitorJobName(dom.name),
+          products: dom.products.map((p) => ({
+            product_name: p.product_name,
+            display_name: p.display_name,
+            metric_keys: metricKeys(p.product_name),
+            sql: demoAggregateSql(p.product_name),
+          })),
+        });
       });
     });
   },

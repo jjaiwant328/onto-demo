@@ -1113,6 +1113,7 @@ function AttachLinksCard({
   domainLabel: string;
   schemaLabel: string;
 }) {
+  const { refreshGraphLinks } = useProduct();
   const [links, setLinks] = useState<ProductLink[]>([]);
   const [kind, setKind] = useState<'genie' | 'dashboard'>('dashboard');
   const [url, setUrl] = useState('');
@@ -1129,7 +1130,11 @@ function AttachLinksCard({
     };
   }, [product]);
 
-  const reload = async () => setLinks(await fetchProductLinks(product));
+  const reload = async () => {
+    setLinks(await fetchProductLinks(product));
+    // keep the enterprise/ontology graph overlay in sync with the new link set
+    void refreshGraphLinks();
+  };
   const doAttach = async (linkType: 'genie' | 'dashboard', u: string, lbl?: string) => {
     if (!u.trim()) return;
     setBusy(true);

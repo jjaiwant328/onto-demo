@@ -49,6 +49,7 @@ import {
   type LogContext,
   type LoggedAction,
 } from '../lib/actionLog';
+import { MonitorJobBuilder } from '../components/MonitorJobBuilder';
 
 export function ActionCenter() {
   const navigate = useNavigate();
@@ -110,6 +111,7 @@ export function ActionCenter() {
         <TabsList>
           <TabsTrigger value="actions">Actions</TabsTrigger>
           <TabsTrigger value="log">Action Log</TabsTrigger>
+          {dataAvailable && <TabsTrigger value="monitor">Monitoring Job</TabsTrigger>}
         </TabsList>
 
         <TabsContent value="actions" className="space-y-6 mt-4">
@@ -147,6 +149,16 @@ export function ActionCenter() {
         <TabsContent value="log" className="mt-4">
           <ActionLogTracker product={selectedProduct.display_name} />
         </TabsContent>
+
+        {dataAvailable && (
+          <TabsContent value="monitor" className="mt-4">
+            <MonitorJobBuilder
+              key={`monitor-${selectedDomain?.name ?? ''}`}
+              domain={selectedDomain?.name ?? ''}
+              domainLabel={selectedDomain?.label ?? ''}
+            />
+          </TabsContent>
+        )}
       </Tabs>
     </div>
   );
