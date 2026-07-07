@@ -962,7 +962,6 @@ export function OntologyStudio() {
           product={selectedProduct.display_name}
           productName={selectedProduct.product_name}
           domainName={selectedDomain?.name ?? ''}
-          domainLabel={selectedDomain?.label ?? selectedDomain?.name ?? ''}
           schemaLabel={schemaLabel}
         />
       )}
@@ -1106,6 +1105,20 @@ const SAMPLE_LINKS: {
     url: 'https://fe-vm-jai-classic-ws.cloud.databricks.com/dashboardsv3/01f179a5593014b99153f9403cd82bf3/published',
     label: 'Executive Command Center (QSR Supply Chain)',
   },
+  {
+    // store-level operations — most relevant to the Restaurant Operations layer
+    match: (d) => d === 'qsr_restaurant_operations' || d === 'qsr_demand_inventory_waste',
+    link_type: 'dashboard',
+    url: 'https://fe-vm-jai-classic-ws.cloud.databricks.com/dashboardsv3/01f179a92a0315c9b0d51c0d224bb24c/published',
+    label: 'Operations Center — store-level risk & actions',
+  },
+  {
+    // event → reasoning → recommendation → outcome timeline (all control-tower domains)
+    match: (d) => d.startsWith('qsr_') && d !== 'qsr_demo',
+    link_type: 'dashboard',
+    url: 'https://fe-vm-jai-classic-ws.cloud.databricks.com/dashboardsv3/01f179a92a8611349e20a8175975d141/published',
+    label: 'Executive Decision Timeline',
+  },
 ];
 
 // Phase 5 — ontology reasoning rules for the selected QSR control-tower domain.
@@ -1162,13 +1175,11 @@ function AttachLinksCard({
   product,
   productName,
   domainName,
-  domainLabel,
   schemaLabel,
 }: {
   product: string;
   productName: string;
   domainName: string;
-  domainLabel: string;
   schemaLabel: string;
 }) {
   const { refreshGraphLinks } = useProduct();
@@ -1218,8 +1229,7 @@ function AttachLinksCard({
     await reload();
   };
 
-  const sample = SAMPLE_LINKS.find((s) => s.match(domainName));
-  const sampleAttached = sample ? links.some((l) => l.url === sample.url) : false;
+  const samples = SAMPLE_LINKS.filter((s) => s.match(domainName));
 
   return (
     <Card className="shadow-sm">
@@ -1233,29 +1243,37 @@ function AttachLinksCard({
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-3">
-        {/* suggested prebuilt dashboard for this domain */}
-        {sample && (
-          <div className="flex flex-wrap items-center gap-2 rounded-md border border-dashed bg-muted/20 px-3 py-2 text-sm">
-            <Sparkles className="h-4 w-4 text-primary shrink-0" />
-            <span className="font-medium">Suggested for {domainLabel || domainName}:</span>
-            <span className="text-muted-foreground">{sample.label}</span>
-            {sampleAttached ? (
-              <Badge variant="outline" className="ml-auto text-[10px] text-success">
-                <Check className="h-3 w-3 mr-1" /> attached
+        {/* suggested prebuilt dashboards/spaces for this domain */}
+        {samples.map((sample) => {
+          const attached = links.some((l) => l.url === sample.url);
+          return (
+            <div
+              key={sample.url}
+              className="flex flex-wrap items-center gap-2 rounded-md border border-dashed bg-muted/20 px-3 py-2 text-sm"
+            >
+              <Sparkles className="h-4 w-4 text-primary shrink-0" />
+              <Badge variant="secondary" className="text-[10px] shrink-0">
+                {sample.link_type === 'genie' ? 'Genie' : 'Dashboard'}
               </Badge>
-            ) : (
-              <Button
-                size="sm"
-                variant="outline"
-                className="ml-auto gap-1.5"
-                disabled={busy}
-                onClick={() => void doAttach(sample.link_type, sample.url, sample.label)}
-              >
-                <Plus className="h-3.5 w-3.5" /> Attach sample
-              </Button>
-            )}
-          </div>
-        )}
+              <span className="text-muted-foreground">{sample.label}</span>
+              {attached ? (
+                <Badge variant="outline" className="ml-auto text-[10px] text-success">
+                  <Check className="h-3 w-3 mr-1" /> attached
+                </Badge>
+              ) : (
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="ml-auto gap-1.5"
+                  disabled={busy}
+                  onClick={() => void doAttach(sample.link_type, sample.url, sample.label)}
+                >
+                  <Plus className="h-3.5 w-3.5" /> Attach
+                </Button>
+              )}
+            </div>
+          );
+        })}
 
         {/* currently attached links */}
         {links.length > 0 && (

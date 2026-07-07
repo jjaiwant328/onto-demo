@@ -35,6 +35,8 @@ export function Copilot() {
   const { selectedProduct, components, isolationKey } = useProduct();
   const { addAction } = useActions();
   const dataAvailable = Boolean(selectedProduct.dataAvailable) && isDemoProduct(selectedProduct.product_name);
+  // QSR control-tower products (sc_*) → Executive Copilot mode (structured answers)
+  const execMode = selectedProduct.product_name.startsWith('sc_');
   const [useData, setUseData] = useState(true); // grounds on real backing data when available
   const [open, setOpen] = useState(false);
   const [llmAvailable, setLlmAvailable] = useState<boolean | null>(null);
@@ -69,6 +71,14 @@ export function Copilot() {
     const anchorTable = components.tables.find((t) => t.role === 'fact') ?? components.tables[0];
     const measure = components.measures[0]?.measure ?? components.kpis[0];
     const chips: string[] = [];
+    // Executive Copilot (control-tower products): lead with role-based exec prompts
+    if (execMode) {
+      chips.push('Summarize the top supply-chain risks right now.');
+      chips.push('Which restaurants require intervention today?');
+      chips.push('Which supplier disruption has the largest downstream impact?');
+      chips.push('What action has the highest projected business impact?');
+      return chips.slice(0, 4);
+    }
     // for data-backed products, lead with data-questions against the real rows
     if (dataAvailable) {
       const dataChip: Record<string, string> = {
@@ -90,7 +100,7 @@ export function Copilot() {
     else if (dimShort) chips.push(`What are the key dimensions of ${dimShort}?`);
     else if (factShort) chips.push(`What are the key dimensions of ${factShort}?`);
     return chips.slice(0, 4);
-  }, [selectedProduct, components, dataAvailable]);
+  }, [selectedProduct, components, dataAvailable, execMode]);
 
   const send = async (question?: string) => {
     const q = (question ?? input).trim();
@@ -108,6 +118,7 @@ export function Copilot() {
           product: selectedProduct.product_name,
           live: components.live,
           useData: dataAvailable && useData,
+          execMode,
           productContext: componentsSummary(components),
           history,
         }),

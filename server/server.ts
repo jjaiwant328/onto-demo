@@ -697,6 +697,7 @@ createApp({
           product?: string;
           live?: boolean;
           useData?: boolean;
+          execMode?: boolean; // Executive Copilot — structured exec answer
         };
         const question = (b.question ?? '').trim();
         if (!question) {
@@ -741,11 +742,18 @@ createApp({
           .slice(-6)
           .map((h) => `${h.role}: ${h.content}`)
           .join('\n');
+        const execInstr = b.execMode
+          ? `You are an EXECUTIVE COPILOT for a supply-chain control tower. Structure the answer as ` +
+            `short labeled lines — "Explanation:", "Evidence:" (cite the counts/numbers from the ` +
+            `snapshot), "Recommendation:", "Confidence:" (Low/Medium/High), "Business impact:" (a ` +
+            `qualitative or $ estimate). Keep each to one sentence. `
+          : `Be concise (2-5 sentences). `;
         const prompt =
           `You are the Ontology Copilot for a governed data-product app. Answer the user's question ` +
           `GROUNDED ONLY in the product context (ontology classes, measures/KPIs + formulas, ` +
           `relationships) and any live snapshot provided — do not invent tables, columns, or numbers. ` +
-          `Be concise (2-5 sentences). If the user is asking to DO something operational (e.g. fix a ` +
+          execInstr +
+          `If the user is asking to DO something operational (e.g. fix a ` +
           `store, adjust staffing), you MAY additionally propose ONE action as a fenced \`\`\`json ` +
           `block with {priority, issue, root_cause, recommended_action, confidence}. Otherwise omit it.` +
           `\n\nPRODUCT (${b.product ?? ''}) CONTEXT:\n${b.productContext ?? ''}${snapshot}` +
