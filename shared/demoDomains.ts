@@ -28,6 +28,9 @@ export type DemoProduct = {
   // SELECT list (over the exception-filtered rows) that produces ONE summary row
   // of aggregate stats — counts by category/severity, averages, worst offenders.
   aggregate_select: string;
+  // catalog.schema the backing `table` lives in; defaults to DEMO_BACKING_CATALOG_SCHEMA
+  // (jai_ontos.qsr_demo). The QSR control-tower products override this to qsr_sc.
+  backing_schema?: string;
 };
 
 export type DemoDomain = {
@@ -37,7 +40,22 @@ export type DemoDomain = {
   products: DemoProduct[];
 };
 
+// An ontology reasoning rule (Phase 5): a business rule expressed over ontology
+// concepts. Illustrative/declarative — the app surfaces these, it does not
+// execute them (decisions stay aggregate-level; no action is taken).
+export type ReasoningRule = {
+  id: string;
+  domain: string; // DemoDomain.name it belongs to
+  name: string;
+  if_conditions: string[];
+  then_conclusion: string;
+  concepts: string[]; // ontology concepts / signals the rule reasons over
+  evidence?: string; // where the signal shows up in the spine (table/column)
+};
+
 const SCHEMA = DEMO_BACKING_CATALOG_SCHEMA;
+// backing schema for the QSR Supply Chain Control Tower spine (slice 1 data-gen)
+export const QSR_SC_SCHEMA = 'jai_ontos.qsr_sc';
 
 export const DEMO_DOMAINS: DemoDomain[] = [
   {
@@ -247,9 +265,268 @@ export const DEMO_SCHEMA: Record<string, { name: string; type: string }[]> = {
   ],
 };
 
-// flat product lookup by product_name (used by the server exception endpoint)
+// ── QSR Supply Chain Control Tower — 3 ontology layers over the jai_ontos.qsr_sc
+// spine (slice 1). Data-backed (badged "Data Avlbl"); the ontology/graph derive
+// from these fact/dim tables. Backing schema = QSR_SC_SCHEMA. ──────────────────
+const SC = QSR_SC_SCHEMA;
+export const QSR_SC_DOMAINS: DemoDomain[] = [
+  {
+    name: 'qsr_demand_inventory_waste',
+    label: 'Demand, Inventory & Waste',
+    description:
+      'Ontology layer 1 — demand signals, inventory position, and waste across restaurants and ingredients.',
+    products: [
+      {
+        product_name: 'sc_inventory_stockout',
+        display_name: 'Inventory & Stockout Risk',
+        business_outcome: 'Flag restaurant/ingredient positions at stockout risk before service is impacted.',
+        table: 'jai_inventory_event',
+        backing_schema: SC,
+        fact_tables: [`${SC}.jai_inventory_event`],
+        dim_tables: [`${SC}.jai_dim_restaurant`, `${SC}.jai_dim_ingredient`],
+        kpis: ['at_risk_items', 'days_of_supply'],
+        exception_where: 'stockout_risk = true',
+        exception_order_by: 'days_of_supply ASC',
+        issue: 'Ingredient positions at stockout risk (low days_of_supply, or supplier-outage impacted).',
+        action_hint: 'Expedite replenishment / find alternate supply for the lowest days_of_supply positions.',
+        aggregate_select:
+          'count(*) AS at_risk_items, ' +
+          'round(avg(days_of_supply),1) AS avg_days_of_supply, ' +
+          'round(min(days_of_supply),1) AS worst_days_of_supply, ' +
+          'sum(CASE WHEN impacted_by_supplier_outage THEN 1 ELSE 0 END) AS outage_driven, ' +
+          'count(distinct restaurant_id) AS restaurants_affected',
+      },
+      {
+        product_name: 'sc_waste',
+        display_name: 'Waste Events',
+        business_outcome: 'Reduce waste by surfacing high-dollar waste and its drivers (weather, shelf life).',
+        table: 'jai_waste_event',
+        backing_schema: SC,
+        fact_tables: [`${SC}.jai_waste_event`],
+        dim_tables: [`${SC}.jai_dim_restaurant`, `${SC}.jai_dim_ingredient`],
+        kpis: ['waste_units', 'waste_usd'],
+        exception_where: 'waste_usd > 120',
+        exception_order_by: 'waste_usd DESC',
+        issue: 'High-dollar waste events; weather-driven traffic drops and short shelf life are common drivers.',
+        action_hint: 'Adjust thaw/production plans for the highest-waste stores; review weather-impacted regions.',
+        aggregate_select:
+          'count(*) AS waste_events, ' +
+          'round(sum(waste_usd),0) AS total_waste_usd, ' +
+          'round(avg(waste_units),1) AS avg_waste_units, ' +
+          'count(distinct restaurant_id) AS restaurants_affected, ' +
+          'count(distinct region) AS regions_affected',
+      },
+      {
+        product_name: 'sc_forecast_demand',
+        display_name: 'Forecast & Demand Surge',
+        business_outcome: 'Anticipate demand surges (heat wave, promotions) to align production.',
+        table: 'jai_forecast',
+        backing_schema: SC,
+        fact_tables: [`${SC}.jai_forecast`],
+        dim_tables: [`${SC}.jai_dim_restaurant`, `${SC}.jai_dim_calendar`],
+        kpis: ['forecast_transactions', 'beverage_demand_index'],
+        exception_where: 'heat_wave_active = true OR promo_active = true',
+        exception_order_by: 'beverage_demand_index DESC',
+        issue: 'Demand-surge days driven by heat wave or promotion (elevated beverage demand index).',
+        action_hint: 'Pre-position beverage/high-demand items for surge days; confirm production uplift.',
+        aggregate_select:
+          'count(*) AS surge_days, ' +
+          'round(avg(beverage_demand_index),2) AS avg_beverage_index, ' +
+          'round(max(beverage_demand_index),2) AS peak_beverage_index, ' +
+          'count(distinct restaurant_id) AS restaurants_affected',
+      },
+    ],
+  },
+  {
+    name: 'qsr_supplier_distribution',
+    label: 'Supplier & Distribution',
+    description:
+      'Ontology layer 2 — suppliers, purchase orders, distribution-center capacity, and lead-time risk.',
+    products: [
+      {
+        product_name: 'sc_po_fulfillment',
+        display_name: 'Purchase Order Fulfillment',
+        business_outcome: 'Track late purchase orders and the suppliers/outages driving them.',
+        table: 'jai_purchase_order',
+        backing_schema: SC,
+        fact_tables: [`${SC}.jai_purchase_order`],
+        dim_tables: [`${SC}.jai_dim_supplier`, `${SC}.jai_dim_distribution_center`],
+        kpis: ['late_pos', 'days_late'],
+        exception_where: "status = 'late'",
+        exception_order_by: 'days_late DESC',
+        issue: 'Purchase orders are late; a single-source supplier outage is a major driver.',
+        action_hint: 'Escalate the most-late POs; activate alternate suppliers for outage-impacted lines.',
+        aggregate_select:
+          'count(*) AS late_pos, ' +
+          'count(distinct supplier_id) AS suppliers_affected, ' +
+          'round(avg(days_late),1) AS avg_days_late, ' +
+          'max(days_late) AS worst_days_late, ' +
+          'sum(CASE WHEN impacted_by_outage THEN 1 ELSE 0 END) AS outage_driven',
+      },
+      {
+        product_name: 'sc_supplier_risk',
+        display_name: 'Supplier Risk',
+        business_outcome: 'Surface single-source and low-reliability suppliers before they disrupt supply.',
+        table: 'jai_dim_supplier',
+        backing_schema: SC,
+        fact_tables: [`${SC}.jai_dim_supplier`],
+        dim_tables: [`${SC}.jai_dim_ingredient`],
+        kpis: ['on_time_rate', 'avg_lead_time_days'],
+        exception_where: 'single_source = true OR on_time_rate < 0.9',
+        exception_order_by: 'on_time_rate ASC',
+        issue: 'Suppliers that are single-source or below a 90% on-time rate — elevated dependency risk.',
+        action_hint: 'Qualify alternate suppliers for single-source lines; review contracts for chronic late suppliers.',
+        aggregate_select:
+          'count(*) AS at_risk_suppliers, ' +
+          'sum(CASE WHEN single_source THEN 1 ELSE 0 END) AS single_source_suppliers, ' +
+          'round(avg(on_time_rate),3) AS avg_on_time_rate, ' +
+          'round(max(avg_lead_time_days),1) AS worst_lead_time_days',
+      },
+      {
+        product_name: 'sc_dc_capacity',
+        display_name: 'Distribution Center Capacity',
+        business_outcome: 'Identify capacity-constrained distribution centers before they bottleneck.',
+        table: 'jai_dim_distribution_center',
+        backing_schema: SC,
+        fact_tables: [`${SC}.jai_dim_distribution_center`],
+        dim_tables: [`${SC}.jai_dim_restaurant`],
+        kpis: ['utilization_pct', 'capacity_cases'],
+        exception_where: 'utilization_pct > 0.85',
+        exception_order_by: 'utilization_pct DESC',
+        issue: 'Distribution centers running above 85% utilization — capacity constrained.',
+        action_hint: 'Rebalance volume to lower-utilization DCs; plan capacity for the most-constrained centers.',
+        aggregate_select:
+          'count(*) AS constrained_dcs, ' +
+          'round(avg(utilization_pct),3) AS avg_utilization, ' +
+          'round(max(utilization_pct),3) AS peak_utilization, ' +
+          'sum(capacity_cases) AS total_capacity_cases',
+      },
+    ],
+  },
+  {
+    name: 'qsr_restaurant_operations',
+    label: 'Restaurant Operations',
+    description:
+      'Ontology layer 3 — kitchen equipment health, maintenance, and labor/staffing at the restaurant.',
+    products: [
+      {
+        product_name: 'sc_equipment_health',
+        display_name: 'Equipment Health',
+        business_outcome: 'Catch failing/at-risk kitchen equipment before it disrupts production.',
+        table: 'jai_equipment_health',
+        backing_schema: SC,
+        fact_tables: [`${SC}.jai_equipment_health`],
+        dim_tables: [`${SC}.jai_equipment`, `${SC}.jai_dim_restaurant`],
+        kpis: ['health_score'],
+        exception_where: "status = 'Failure' OR health_score < 40",
+        exception_order_by: 'health_score ASC',
+        issue: 'Equipment readings in failure or low-health state (e.g. fryer failures) — production risk.',
+        action_hint: 'Dispatch maintenance to the lowest-health units; adjust production where equipment is down.',
+        aggregate_select:
+          'count(*) AS unhealthy_readings, ' +
+          'count(distinct restaurant_id) AS restaurants_affected, ' +
+          'round(avg(health_score),1) AS avg_health_score, ' +
+          'round(min(health_score),1) AS worst_health_score, ' +
+          "sum(CASE WHEN status='Failure' THEN 1 ELSE 0 END) AS failures",
+      },
+      {
+        product_name: 'sc_labor_staffing',
+        display_name: 'Labor & Staffing',
+        business_outcome: 'Flag understaffed shifts that degrade drive-thru service.',
+        table: 'jai_labor_shift',
+        backing_schema: SC,
+        fact_tables: [`${SC}.jai_labor_shift`],
+        dim_tables: [`${SC}.jai_dim_restaurant`, `${SC}.jai_dim_calendar`],
+        kpis: ['staffing_ratio'],
+        exception_where: 'staffing_ratio < 0.8',
+        exception_order_by: 'staffing_ratio ASC',
+        issue: 'Shifts running below 80% of planned staff — service degradation risk (labor shortage regions).',
+        action_hint: 'Shift labor to understaffed stores; prioritize hiring in chronically short regions.',
+        aggregate_select:
+          'count(*) AS understaffed_shifts, ' +
+          'count(distinct restaurant_id) AS restaurants_affected, ' +
+          'round(avg(staffing_ratio),2) AS avg_staffing_ratio, ' +
+          'round(min(staffing_ratio),2) AS worst_staffing_ratio',
+      },
+    ],
+  },
+];
+
+// Phase 5 — ontology reasoning rules for the QSR control tower (illustrative;
+// surfaced in Ontology Studio, not executed).
+export const QSR_SC_REASONING_RULES: ReasoningRule[] = [
+  {
+    id: 'RR1',
+    domain: 'qsr_demand_inventory_waste',
+    name: 'Heat wave drives beverage demand',
+    if_conditions: ['Temperature > 90°F (heat-wave signal)', 'Promotion active or peak daypart'],
+    then_conclusion: 'Increase beverage demand → pre-position beverage inventory',
+    concepts: ['WeatherEvent', 'Promotion', 'Forecast', 'Ingredient(Beverage)'],
+    evidence: 'jai_weather_daily.temp_f, jai_forecast.beverage_demand_index',
+  },
+  {
+    id: 'RR2',
+    domain: 'qsr_demand_inventory_waste',
+    name: 'Shelf life below forecast consumption → waste risk',
+    if_conditions: ['Shelf-life remaining < forecast consumption window'],
+    then_conclusion: 'Waste risk HIGH → reduce thaw/production plan',
+    concepts: ['Ingredient(ShelfLife)', 'Forecast', 'WasteEvent'],
+    evidence: 'jai_inventory_event.at_waste_risk, jai_dim_ingredient.shelf_life_days',
+  },
+  {
+    id: 'RR3',
+    domain: 'qsr_demand_inventory_waste',
+    name: 'Snowstorm suppresses traffic → over-production waste',
+    if_conditions: ['Snowstorm in region', 'Production schedule not adjusted'],
+    then_conclusion: 'Excess inventory → elevated waste',
+    concepts: ['WeatherEvent', 'Restaurant', 'WasteEvent'],
+    evidence: 'jai_weather_daily.condition, jai_waste_event.waste_reason',
+  },
+  {
+    id: 'RR4',
+    domain: 'qsr_supplier_distribution',
+    name: 'Supplier delay + no alternate → stockout risk',
+    if_conditions: ['Supplier delay / outage', 'Ingredient is single-source'],
+    then_conclusion: 'Restaurant stockout risk → expedite / activate alternate supplier',
+    concepts: ['Supplier(single_source)', 'PurchaseOrder', 'InventoryPosition'],
+    evidence: 'jai_dim_supplier.single_source, jai_purchase_order.days_late, jai_inventory_event.stockout_risk',
+  },
+  {
+    id: 'RR5',
+    domain: 'qsr_supplier_distribution',
+    name: 'DC utilization high → capacity constraint',
+    if_conditions: ['Distribution-center utilization > 85%'],
+    then_conclusion: 'Capacity constrained → rebalance volume to other DCs',
+    concepts: ['DistributionCenter', 'Shipment'],
+    evidence: 'jai_dim_distribution_center.utilization_pct',
+  },
+  {
+    id: 'RR6',
+    domain: 'qsr_restaurant_operations',
+    name: 'Fryer failure → production down',
+    if_conditions: ['Pressure fryer in failure state'],
+    then_conclusion: 'Menu-item availability risk → dispatch maintenance, adjust production',
+    concepts: ['Equipment', 'EquipmentHealth', 'Production', 'MenuItem'],
+    evidence: "jai_equipment_health.status = 'Failure'",
+  },
+  {
+    id: 'RR7',
+    domain: 'qsr_restaurant_operations',
+    name: 'Labor shortage → service degradation',
+    if_conditions: ['Staffing ratio < 0.8'],
+    then_conclusion: 'Drive-thru service degradation → reallocate labor',
+    concepts: ['LaborShift', 'Restaurant', 'Queue'],
+    evidence: 'jai_labor_shift.staffing_ratio, jai_labor_shift.labor_shortage',
+  },
+];
+
+// all data-backed domains (qsr_demo + qsr_sc control tower)
+export const ALL_DEMO_DOMAINS: DemoDomain[] = [...DEMO_DOMAINS, ...QSR_SC_DOMAINS];
+
+// flat product lookup by product_name (used by the server exception endpoint) —
+// spans BOTH the qsr_demo demo domains and the qsr_sc control-tower domains.
 export const DEMO_PRODUCTS: Record<string, DemoProduct & { domainLabel: string }> = Object.fromEntries(
-  DEMO_DOMAINS.flatMap((d) => d.products.map((p) => [p.product_name, { ...p, domainLabel: d.label }]))
+  ALL_DEMO_DOMAINS.flatMap((d) => d.products.map((p) => [p.product_name, { ...p, domainLabel: d.label }]))
 );
 
 // is a product_name one of the data-backed demo products?
@@ -261,8 +538,9 @@ export function isDemoProduct(productName: string | undefined): boolean {
 export function demoExceptionSql(productName: string, limit = 25): string | null {
   const p = DEMO_PRODUCTS[productName];
   if (!p) return null;
+  const schema = p.backing_schema ?? DEMO_BACKING_CATALOG_SCHEMA;
   const order = p.exception_order_by ? ` ORDER BY ${p.exception_order_by}` : '';
-  return `SELECT * FROM ${DEMO_BACKING_CATALOG_SCHEMA}.${p.table} WHERE ${p.exception_where}${order} LIMIT ${limit}`;
+  return `SELECT * FROM ${schema}.${p.table} WHERE ${p.exception_where}${order} LIMIT ${limit}`;
 }
 
 // aggregate summary stats over the exception-filtered rows (ONE row). Used to
@@ -270,16 +548,18 @@ export function demoExceptionSql(productName: string, limit = 25): string | null
 export function demoAggregateSql(productName: string): string | null {
   const p = DEMO_PRODUCTS[productName];
   if (!p) return null;
-  return `SELECT ${p.aggregate_select} FROM ${DEMO_BACKING_CATALOG_SCHEMA}.${p.table} WHERE ${p.exception_where}`;
+  const schema = p.backing_schema ?? DEMO_BACKING_CATALOG_SCHEMA;
+  return `SELECT ${p.aggregate_select} FROM ${schema}.${p.table} WHERE ${p.exception_where}`;
 }
 
 // a compact "snapshot" query set for the copilot (counts + top rows per product)
 export function demoSnapshotSql(productName: string, topN = 10): { count: string; top: string } | null {
   const p = DEMO_PRODUCTS[productName];
   if (!p) return null;
+  const schema = p.backing_schema ?? DEMO_BACKING_CATALOG_SCHEMA;
   const order = p.exception_order_by ? ` ORDER BY ${p.exception_order_by}` : '';
   return {
-    count: `SELECT count(*) AS exception_count FROM ${DEMO_BACKING_CATALOG_SCHEMA}.${p.table} WHERE ${p.exception_where}`,
-    top: `SELECT * FROM ${DEMO_BACKING_CATALOG_SCHEMA}.${p.table} WHERE ${p.exception_where}${order} LIMIT ${topN}`,
+    count: `SELECT count(*) AS exception_count FROM ${schema}.${p.table} WHERE ${p.exception_where}`,
+    top: `SELECT * FROM ${schema}.${p.table} WHERE ${p.exception_where}${order} LIMIT ${topN}`,
   };
 }

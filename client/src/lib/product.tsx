@@ -12,6 +12,7 @@ import type { ReactNode } from 'react';
 import catalogJson from '../data/catalog.json';
 import schemaJson from '../data/schema.json';
 import schemaQsrJson from '../data/schema.qsr.json';
+import schemaQsrScJson from '../data/schema.qsr_sc.json';
 import {
   deriveProduct,
   buildEnterpriseGraph,
@@ -32,12 +33,13 @@ import {
   type OntologyOverride,
 } from './ontologyOverrides';
 import { buildCatalog } from './catalogGen';
-import { DEMO_DOMAINS, DEMO_SCHEMA } from '../../../shared/demoDomains';
+import { DEMO_DOMAINS, DEMO_SCHEMA, QSR_SC_DOMAINS } from '../../../shared/demoDomains';
 import { combineSchemas, type SchemaEntry, type ConformanceInfo } from './combineSchemas';
 
 const DEFAULT_CATALOG = catalogJson as unknown as Catalog;
 const DEFAULT_SCHEMA = schemaJson as unknown as Schema;
 const QSR_SCHEMA = schemaQsrJson as unknown as Schema;
+const QSR_SC_SCHEMA_JSON = schemaQsrScJson as unknown as Schema;
 
 const CURATED_SCHEMA_ID = 'fc_entdata_gold';
 // scope sentinel: "All domains" / "All products" (the default, broadest scope)
@@ -199,6 +201,7 @@ function builtinSchemas(): RegistrySchema[] {
       curated: true,
     },
     { id: 'qsr_scd', label: 'QSR Supply Chain', schema: QSR_SCHEMA, bundled: true },
+    { id: 'qsr_sc', label: 'QSR Supply Chain Control Tower', schema: QSR_SC_SCHEMA_JSON, bundled: true },
   ];
 }
 
@@ -441,13 +444,17 @@ export function ProductProvider({ children }: { children: ReactNode }) {
       ? llmCatalog.catalog
       : heuristicCatalog;
 
-  // Overlay the two DATA-BACKED demo domains when the QSR schema is active. These
+  // Overlay the DATA-BACKED demo domains when a backing schema is active. These
   // are real, query-backed domains (badged "Data Avlbl") prepended ahead of the
-  // generated QSR domains, which are left as-is. Config lives in shared/demoDomains.
+  // generated domains, which are left as-is. Config lives in shared/demoDomains:
+  //  • qsr_scd  → the qsr_demo demo domains (DQ / Demand)
+  //  • qsr_sc   → the QSR Supply Chain Control Tower domains (3 ontology layers)
   const qsrActive = selectedSchemaIds.includes('qsr_scd');
+  const qsrScActive = selectedSchemaIds.includes('qsr_sc');
   const baseCatalog = useMemo(() => {
-    if (!qsrActive) return generatedCatalog;
-    const demoDomains: CatalogDomain[] = DEMO_DOMAINS.map((d) => ({
+    const source = qsrActive ? DEMO_DOMAINS : qsrScActive ? QSR_SC_DOMAINS : null;
+    if (!source) return generatedCatalog;
+    const demoDomains: CatalogDomain[] = source.map((d) => ({
       name: d.name,
       label: d.label,
       description: d.description,
@@ -467,7 +474,7 @@ export function ProductProvider({ children }: { children: ReactNode }) {
     const existing = new Set(demoDomains.map((d) => d.name));
     const rest = generatedCatalog.domains.filter((d) => !existing.has(d.name));
     return { domains: [...demoDomains, ...rest] };
-  }, [qsrActive, generatedCatalog]);
+  }, [qsrActive, qsrScActive, generatedCatalog]);
 
   // ---- session domain edits (delete / combine / unmerge) on top of baseCatalog ----
   // Stored as an ordered list of operations, scoped to the current dataset `sig`

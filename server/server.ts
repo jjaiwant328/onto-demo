@@ -6,7 +6,7 @@ import {
   demoSnapshotSql,
   isDemoProduct,
   DEMO_PRODUCTS,
-  DEMO_DOMAINS,
+  ALL_DEMO_DOMAINS,
 } from '../shared/demoDomains';
 import { lbQuery, ensureLakebaseTables, lakebaseConfigured } from './lakebase';
 
@@ -1206,7 +1206,7 @@ createApp({
       // ======================================================================
       const monitorJobId = (domain: string) => `jai_monitor_${domain}`;
       const monitorJobName = (domain: string) => `jai_monitor_${domain}_daily`;
-      const monitorDomain = (name: string) => DEMO_DOMAINS.find((d) => d.name === name);
+      const monitorDomain = (name: string) => ALL_DEMO_DOMAINS.find((d) => d.name === name);
       // the aggregate column aliases a product's aggregate_select emits (AS <key>)
       const metricKeys = (productName: string): string[] => {
         const sql = demoAggregateSql(productName) ?? '';

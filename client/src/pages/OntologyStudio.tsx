@@ -49,6 +49,7 @@ import {
   type ValidationResult,
 } from '../lib/ontologyOverrides';
 import { fetchProductLinks, attachLink, deleteLink, type ProductLink } from '../lib/productLinks';
+import { QSR_SC_REASONING_RULES, type ReasoningRule } from '../../../shared/demoDomains';
 
 // compact relative time ("3m ago", "2h ago", "5d ago")
 function relativeTime(iso: string): string {
@@ -375,6 +376,8 @@ export function OntologyStudio() {
           </div>
         </div>
       )}
+
+      <ReasoningRulesCard domainName={selectedDomain?.name ?? ''} />
 
       <Card className="shadow-sm">
         <CardHeader>
@@ -1097,6 +1100,54 @@ const SAMPLE_LINKS: {
     label: 'Demand Forecasting & Planning (sample AI/BI dashboard)',
   },
 ];
+
+// Phase 5 — ontology reasoning rules for the selected QSR control-tower domain.
+// Illustrative business rules over ontology concepts (IF → THEN); the app surfaces
+// them, it does not execute them (decisions stay aggregate-level; no action taken).
+function ReasoningRulesCard({ domainName }: { domainName: string }) {
+  const rules = QSR_SC_REASONING_RULES.filter((r: ReasoningRule) => r.domain === domainName);
+  if (rules.length === 0) return null;
+  return (
+    <Card className="shadow-sm border-primary/30">
+      <CardHeader>
+        <CardTitle className="flex items-center gap-2">
+          <Sparkles className="h-4 w-4 text-primary" /> Reasoning rules
+          <Badge variant="secondary">{rules.length}</Badge>
+        </CardTitle>
+        <CardDescription>
+          Business rules over this domain's ontology concepts. Illustrative — surfaced for explainability;
+          they are not executed and take no action.
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-2">
+        {rules.map((r) => (
+          <div key={r.id} className="rounded-md border p-3 text-sm space-y-1.5">
+            <div className="flex items-center gap-2">
+              <Badge variant="outline" className="text-[10px]">{r.id}</Badge>
+              <span className="font-medium">{r.name}</span>
+            </div>
+            <div className="text-xs">
+              <span className="text-muted-foreground">IF </span>
+              {r.if_conditions.join(' AND ')}
+              <span className="text-muted-foreground"> → THEN </span>
+              <span className="font-medium">{r.then_conclusion}</span>
+            </div>
+            <div className="flex flex-wrap gap-1">
+              {r.concepts.map((c) => (
+                <Badge key={c} variant="secondary" className="text-[10px]">{c}</Badge>
+              ))}
+            </div>
+            {r.evidence && (
+              <div className="text-[11px] text-muted-foreground">
+                Signal: <code>{r.evidence}</code>
+              </div>
+            )}
+          </div>
+        ))}
+      </CardContent>
+    </Card>
+  );
+}
 
 // Step 6 — attach a Genie Space or AI/BI dashboard to the selected product. The
 // attached links surface as first-class nodes in the ontology / enterprise map.
