@@ -1306,15 +1306,21 @@ createApp({
           }
         }
 
-        // 2) optional ONE domain-level narrative (aggregate-only; no actions)
+        // 2) optional ONE domain-level narrative (aggregate-only; no actions).
+        // Best-effort: an LLM failure must NOT abort the run (the aggregate counts
+        // are the real deliverable) — otherwise the whole request 500s as HTML.
         let llmSummary: string | null = null;
         if (hasLlm) {
-          const prompt =
-            `You are a monitoring analyst for the "${dom.label}" domain. Below are AGGREGATE health ` +
-            `metrics for each data product (one summary row each). Write a 1-2 sentence AGGREGATE status ` +
-            `summary of the domain's health — cite the key counts. Do NOT propose actions, do NOT resolve ` +
-            `anything, do NOT list individual rows. Plain text only.\n\n${JSON.stringify(results).slice(0, 8000)}`;
-          llmSummary = await llmComplete(prompt, 400);
+          try {
+            const prompt =
+              `You are a monitoring analyst for the "${dom.label}" domain. Below are AGGREGATE health ` +
+              `metrics for each data product (one summary row each). Write a 1-2 sentence AGGREGATE status ` +
+              `summary of the domain's health — cite the key counts. Do NOT propose actions, do NOT resolve ` +
+              `anything, do NOT list individual rows. Plain text only.\n\n${JSON.stringify(results).slice(0, 8000)}`;
+            llmSummary = await llmComplete(prompt, 400);
+          } catch {
+            llmSummary = null;
+          }
         }
 
         // 3) upsert one row per product (idempotent per day)
@@ -1463,19 +1469,27 @@ createApp({
           `Reply with a short plain-text explanation, then a fenced \`\`\`json block containing the updated spec: ` +
           `{"aggregates":[{"product_name","metrics":[{"key","label"}],"threshold":{"metric","op":">"|">="|"<"|"<=","value":number}?}]}. ` +
           `Only include products/metric keys from the list above.`;
-        const content = await llmComplete(prompt, 1500);
-        const spec = extractJsonObject(content ?? '');
-        // strip the fenced json from the displayed answer
-        const answer = (content ?? '').replace(/```(?:json)?[\s\S]*?```/g, '').trim() || 'Updated the monitoring spec below.';
-        res.json({ answer, spec: spec ?? null, llm: true });
+        try {
+          const content = await llmComplete(prompt, 1500);
+          const spec = extractJsonObject(content ?? '');
+          // strip the fenced json from the displayed answer
+          const answer = (content ?? '').replace(/```(?:json)?[\s\S]*?```/g, '').trim() || 'Updated the monitoring spec below.';
+          res.json({ answer, spec: spec ?? null, llm: true });
+        } catch (err) {
+          res.json({ answer: `The assistant hit an error: ${humanizeSqlError(err)}`, spec: null, llm: false });
+        }
       });
 
       // Run the domain's aggregates now (on-demand) and store the results.
       app.post('/api/monitor-run', async (req, res) => {
         const b = (req.body ?? {}) as { domain?: string; trigger?: string };
         const trigger = b.trigger === 'scheduled' ? 'scheduled' : 'on_demand';
-        const out = await runMonitorJob(String(b.domain ?? ''), trigger);
-        res.json(out);
+        try {
+          const out = await runMonitorJob(String(b.domain ?? ''), trigger);
+          res.json(out);
+        } catch (err) {
+          res.json({ ok: false, error: humanizeSqlError(err) });
+        }
       });
 
       // List recent run outputs for a domain (newest first).

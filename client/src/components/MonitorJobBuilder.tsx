@@ -27,7 +27,7 @@ import {
   TableHeader,
   TableRow,
 } from '@databricks/appkit-ui/react';
-import { Send, Bot, Sparkles, Loader2, Save, Play, CalendarClock, ShieldCheck } from 'lucide-react';
+import { Send, Bot, Sparkles, Loader2, Save, Play, CalendarClock, ShieldCheck, MessageSquare, Zap } from 'lucide-react';
 import {
   fetchMonitorJob,
   saveMonitorJob,
@@ -40,6 +40,7 @@ import {
   type MonitorRun,
   type MonitorPreview,
 } from '../lib/monitorJob';
+import { fetchProductLinks, type ProductLink } from '../lib/productLinks';
 
 type Msg = { role: 'user' | 'assistant'; content: string };
 
@@ -57,6 +58,9 @@ export function MonitorJobBuilder({ domain, domainLabel }: { domain: string; dom
   const [version, setVersion] = useState<number | null>(null);
   const [saving, setSaving] = useState(false);
   const [running, setRunning] = useState(false);
+  // Genie / dashboard links attached in the ontology (Ontology Studio / Further
+  // analysis) — used to make each monitored exception investigable.
+  const [links, setLinks] = useState<ProductLink[]>([]);
   const scrollEnd = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -90,7 +94,21 @@ export function MonitorJobBuilder({ domain, domainLabel }: { domain: string; dom
       }
     })();
     void loadRuns();
+    void fetchProductLinks().then(setLinks); // all links; matched per product below
   }, [domain, loadRuns]);
+
+  // product_name → attached links. Links are keyed by product DISPLAY name and a
+  // domain label, while monitor runs carry the internal product_name — bridge via
+  // the preview's product list, and fall back to any domain-scoped link.
+  const linksForProduct = useCallback(
+    (productName: string): ProductLink[] => {
+      const disp = preview?.products.find((p) => p.product_name === productName)?.display_name;
+      const byProduct = links.filter((l) => l.product && (l.product === disp || l.product === productName));
+      if (byProduct.length) return byProduct;
+      return links.filter((l) => l.domain && l.domain === domainLabel);
+    },
+    [links, preview, domainLabel]
+  );
 
   useEffect(() => {
     scrollEnd.current?.scrollIntoView({ behavior: 'smooth' });
@@ -319,10 +337,14 @@ export function MonitorJobBuilder({ domain, domainLabel }: { domain: string; dom
                     <TableHead className="text-right">Exceptions</TableHead>
                     <TableHead>Status</TableHead>
                     <TableHead>Trigger</TableHead>
+                    <TableHead>Investigate</TableHead>
                   </TableRow>
                 </TableHeader>
                 <TableBody>
-                  {runs.map((r) => (
+                  {runs.map((r) => {
+                    const rowLinks = linksForProduct(r.product);
+                    const breach = r.status === 'breach' && (r.exception_total ?? 0) > 0;
+                    return (
                     <TableRow key={r.run_id + r.product}>
                       <TableCell className="text-xs">{r.run_date}</TableCell>
                       <TableCell className="text-xs font-medium">{r.product}</TableCell>
@@ -336,10 +358,38 @@ export function MonitorJobBuilder({ domain, domainLabel }: { domain: string; dom
                         </Badge>
                       </TableCell>
                       <TableCell className="text-xs text-muted-foreground">{r.trigger}</TableCell>
+                      <TableCell>
+                        {rowLinks.length > 0 ? (
+                          <div className="flex flex-wrap gap-1">
+                            {rowLinks.map((l) => (
+                              <Button
+                                key={l.link_id}
+                                size="sm"
+                                variant={breach ? 'outline' : 'ghost'}
+                                className="h-7 gap-1.5 text-xs"
+                                onClick={() => window.open(l.url, '_blank')}
+                              >
+                                {l.link_type === 'dashboard' ? <Zap className="h-3.5 w-3.5" /> : <MessageSquare className="h-3.5 w-3.5" />}
+                                {l.link_type === 'dashboard' ? 'Dashboard' : 'Genie'}
+                              </Button>
+                            ))}
+                          </div>
+                        ) : (
+                          <span className="text-[11px] text-muted-foreground italic">
+                            attach a Genie space in the ontology
+                          </span>
+                        )}
+                      </TableCell>
                     </TableRow>
-                  ))}
+                    );
+                  })}
                 </TableBody>
               </Table>
+              <p className="mt-2 text-[11px] text-muted-foreground">
+                Monitoring is aggregate-only — it flags breaches but never resolves them. Use the
+                linked Genie space / dashboard to investigate, then drive any action from the Actions
+                tab. Links come from the ontology (attach them in Ontology Studio or Further analysis).
+              </p>
             </>
           )}
         </CardContent>
