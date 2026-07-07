@@ -2,7 +2,7 @@
 // selected product's tables, with column mappings (role badges) and validation.
 // Validation queries the warehouse only for `live` products; others are clearly
 // labelled schema-derived (no live serving layer).
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   Card,
   CardContent,
@@ -45,11 +45,19 @@ import {
   suggestRelationships,
   validateOntology,
   verifyViewSql,
+  checkServingView,
   type SuggestedRelationship,
   type ValidationResult,
 } from '../lib/ontologyOverrides';
 import { fetchProductLinks, attachLink, deleteLink, type ProductLink } from '../lib/productLinks';
-import { QSR_SC_REASONING_RULES, type ReasoningRule } from '../../../shared/demoDomains';
+import { artifactDownloadUrl, type StoredArtifact } from '../lib/ontologyArtifact';
+import {
+  fetchBusinessRules,
+  saveBusinessRule,
+  deleteBusinessRule,
+  evaluateBusinessRule,
+  type BusinessRule,
+} from '../lib/businessRules';
 
 // compact relative time ("3m ago", "2h ago", "5d ago")
 function relativeTime(iso: string): string {
@@ -165,6 +173,10 @@ export function OntologyStudio() {
     scopedDomains,
     selectedSchemaIds,
     schemaEntries,
+    activeSchemaLabel,
+    artifact,
+    artifactStale,
+    regenerateArtifact,
   } = useProduct();
   const { classes, mappings, relationships, live } = components;
 
@@ -927,6 +939,14 @@ export function OntologyStudio() {
           </div>
         </CardHeader>
         <CardContent className="space-y-2">
+          <div className="flex items-start gap-1.5 rounded-md bg-muted/40 p-2 text-xs text-muted-foreground">
+            <Info className="h-3.5 w-3.5 mt-0.5 shrink-0 text-primary" />
+            <span>
+              This preview <span className="font-medium">regenerates live</span> as you confirm relationships above —
+              it currently joins <span className="font-medium">{served.joins}</span> confirmed relationship
+              {served.joins === 1 ? '' : 's'}. Re-run the DDL after confirming changes to update the governed view.
+            </span>
+          </div>
           <div className="text-xs text-muted-foreground">
             Target: <code>{served.name}</code> · {served.note}
           </div>
@@ -956,6 +976,15 @@ export function OntologyStudio() {
         </CardContent>
       </Card>
 
+      {/* ontology artifact (OWL/TTL + JSON-LD) — the file that drives the Ontology Explorer */}
+      <OntologyArtifactCard
+        artifact={artifact}
+        stale={artifactStale}
+        onRegenerate={regenerateArtifact}
+        schemaLabel={activeSchemaLabel}
+        productName={selectedProduct.product_name}
+      />
+
       {/* item 6 — Attach Genie / Dashboard (surfaces in the ontology map) */}
       {selectedProduct && (
         <AttachLinksCard
@@ -984,6 +1013,8 @@ export function OntologyStudio() {
               tableCount={classes.length}
               columnCount={mappings.length}
               sourceCatalog={activeSourceCatalog}
+              servingObject={contract.serving_object}
+              onServingPresent={(present) => void regenerateArtifact({ servingViewPresent: present })}
             />
           )}
         </CardContent>
@@ -996,11 +1027,29 @@ function SchemaDerivedNotice({
   tableCount,
   columnCount,
   sourceCatalog,
+  servingObject,
+  onServingPresent,
 }: {
   tableCount: number;
   columnCount: number;
   sourceCatalog?: string | null;
+  servingObject?: string;
+  onServingPresent?: (present: boolean) => void;
 }) {
+  // live check: does the governed serving view actually exist in the warehouse?
+  const [present, setPresent] = useState<boolean | null>(null);
+  const [checking, setChecking] = useState(false);
+  const runCheck = useCallback(async () => {
+    if (!servingObject) return;
+    setChecking(true);
+    const r = await checkServingView(servingObject);
+    setChecking(false);
+    setPresent(r.present);
+    onServingPresent?.(r.present);
+  }, [servingObject, onServingPresent]);
+  useEffect(() => {
+    void runCheck();
+  }, [runCheck]);
   return (
     <div className="space-y-3">
       <div className="flex items-start gap-2 rounded-md bg-muted/50 p-3 text-sm">
@@ -1029,13 +1078,21 @@ function SchemaDerivedNotice({
           <CheckRow label={`Source tables resolved (${tableCount})`} ok={tableCount > 0} />
           <CheckRow label={`Columns resolved from schema (${columnCount})`} ok={columnCount > 0} />
           <CheckRow
-            label="Governed serving view present"
-            ok={false}
-            warn
-            tooltip="A governed serving view is a stable, contract-backed view (e.g. jai_ontos.demo_schema.jai_<product>_serving) that conforms the raw source tables into the product's business shape. This product is still schema-derived straight from source tables — no serving view exists yet, so downstream consumers are reading raw tables that can change. Generate + run the serving view (above) to clear this warning."
+            label={`Governed serving view present${checking ? ' (checking…)' : ''}`}
+            ok={present === true}
+            warn={present !== true}
+            tooltip={`Checks the warehouse for ${servingObject ?? 'the serving object'}. Green once the view exists (create it from the serving-view card above, then Recheck). A permission error reads as "cannot verify", not absent.`}
           />
         </TableBody>
       </Table>
+      <div className="flex items-center gap-2">
+        <Button size="sm" variant="outline" className="gap-1.5" disabled={checking || !servingObject} onClick={() => void runCheck()}>
+          {checking ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <ShieldCheck className="h-3.5 w-3.5" />}
+          Recheck serving view
+        </Button>
+        {present === true && <span className="text-xs text-success">Present in the warehouse.</span>}
+        {present === false && <span className="text-xs text-muted-foreground">Not found (or no access) — create it, then Recheck.</span>}
+      </div>
     </div>
   );
 }
@@ -1121,49 +1178,269 @@ const SAMPLE_LINKS: {
   },
 ];
 
-// Phase 5 — ontology reasoning rules for the selected QSR control-tower domain.
-// Illustrative business rules over ontology concepts (IF → THEN); the app surfaces
-// them, it does not execute them (decisions stay aggregate-level; no action taken).
+// Business/reasoning rules for the selected domain — persisted in Lakebase
+// (jai_business_rules), editable, and optionally evaluatable against the backing
+// data for a live match count. Rules feed the ontology artifact.
+const EMPTY_RULE = { name: '', if_conditions: '', then_conclusion: '', concepts: '', evidence: '', eval_table: '', eval_sql: '' };
 function ReasoningRulesCard({ domainName }: { domainName: string }) {
-  const rules = QSR_SC_REASONING_RULES.filter((r: ReasoningRule) => r.domain === domainName);
-  if (rules.length === 0) return null;
+  const { regenerateArtifact } = useProduct();
+  const [rules, setRules] = useState<BusinessRule[]>([]);
+  const [editing, setEditing] = useState<string | null>(null); // rule_id | 'new' | null
+  const [form, setForm] = useState({ ...EMPTY_RULE });
+  const [busy, setBusy] = useState(false);
+  const [evalRes, setEvalRes] = useState<Record<string, string>>({});
+
+  const reload = async () => {
+    const rs = await fetchBusinessRules(domainName);
+    setRules(rs);
+    // feed rules into the ontology artifact (TTL annotations)
+    void regenerateArtifact({
+      rules: rs.map((r) => ({ id: r.rule_id, name: r.name, if_conditions: r.if_conditions, then_conclusion: r.then_conclusion, concepts: r.concepts, evidence: r.evidence })),
+    });
+  };
+  useEffect(() => {
+    let cancelled = false;
+    void fetchBusinessRules(domainName).then((rs) => {
+      if (!cancelled) setRules(rs);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [domainName]);
+
+  if (!domainName) return null;
+
+  const startEdit = (r?: BusinessRule) => {
+    setEditing(r?.rule_id ?? 'new');
+    setForm(
+      r
+        ? {
+            name: r.name,
+            if_conditions: r.if_conditions.join('; '),
+            then_conclusion: r.then_conclusion,
+            concepts: r.concepts.join(', '),
+            evidence: r.evidence ?? '',
+            eval_table: r.eval_table ?? '',
+            eval_sql: r.eval_sql ?? '',
+          }
+        : { ...EMPTY_RULE }
+    );
+  };
+  const save = async () => {
+    if (!form.name.trim()) return;
+    setBusy(true);
+    await saveBusinessRule({
+      rule_id: editing && editing !== 'new' ? editing : undefined,
+      domain: domainName,
+      name: form.name.trim(),
+      if_conditions: form.if_conditions.split(';').map((s) => s.trim()).filter(Boolean),
+      then_conclusion: form.then_conclusion.trim(),
+      concepts: form.concepts.split(',').map((s) => s.trim()).filter(Boolean),
+      evidence: form.evidence.trim(),
+      eval_table: form.eval_table.trim() || undefined,
+      eval_sql: form.eval_sql.trim() || undefined,
+    });
+    setBusy(false);
+    setEditing(null);
+    await reload();
+  };
+  const remove = async (id: string) => {
+    setBusy(true);
+    await deleteBusinessRule(id);
+    setBusy(false);
+    await reload();
+  };
+  const evaluate = async (r: BusinessRule) => {
+    if (!r.eval_table || !r.eval_sql) return;
+    setEvalRes((p) => ({ ...p, [r.rule_id]: '…' }));
+    const res = await evaluateBusinessRule(r.eval_table, r.eval_sql);
+    setEvalRes((p) => ({ ...p, [r.rule_id]: res.ok ? `${res.matches} rows match now` : `error: ${res.error ?? ''}` }));
+  };
+
   return (
     <Card className="shadow-sm border-primary/30">
-      <CardHeader>
-        <CardTitle className="flex items-center gap-2">
-          <Sparkles className="h-4 w-4 text-primary" /> Reasoning rules
-          <Badge variant="secondary">{rules.length}</Badge>
-        </CardTitle>
-        <CardDescription>
-          Business rules over this domain's ontology concepts. Illustrative — surfaced for explainability;
-          they are not executed and take no action.
-        </CardDescription>
+      <CardHeader className="flex flex-row items-center justify-between gap-2">
+        <div>
+          <CardTitle className="flex items-center gap-2">
+            <Sparkles className="h-4 w-4 text-primary" /> Business rules
+            <Badge variant="secondary">{rules.length}</Badge>
+          </CardTitle>
+          <CardDescription>
+            Captured business rules over this domain's ontology concepts (IF → THEN), persisted so they
+            apply consistently. Optionally evaluate a rule against the live data for a current match count.
+          </CardDescription>
+        </div>
+        <Button size="sm" variant="outline" className="gap-1.5 shrink-0" onClick={() => startEdit()}>
+          <Plus className="h-3.5 w-3.5" /> Add rule
+        </Button>
       </CardHeader>
       <CardContent className="space-y-2">
-        {rules.map((r) => (
-          <div key={r.id} className="rounded-md border p-3 text-sm space-y-1.5">
-            <div className="flex items-center gap-2">
-              <Badge variant="outline" className="text-[10px]">{r.id}</Badge>
-              <span className="font-medium">{r.name}</span>
-            </div>
-            <div className="text-xs">
-              <span className="text-muted-foreground">IF </span>
-              {r.if_conditions.join(' AND ')}
-              <span className="text-muted-foreground"> → THEN </span>
-              <span className="font-medium">{r.then_conclusion}</span>
-            </div>
-            <div className="flex flex-wrap gap-1">
-              {r.concepts.map((c) => (
-                <Badge key={c} variant="secondary" className="text-[10px]">{c}</Badge>
-              ))}
-            </div>
-            {r.evidence && (
-              <div className="text-[11px] text-muted-foreground">
-                Signal: <code>{r.evidence}</code>
+        {editing === 'new' && (
+          <RuleEditor form={form} setForm={setForm} busy={busy} onSave={save} onCancel={() => setEditing(null)} />
+        )}
+        {rules.length === 0 && editing !== 'new' && (
+          <div className="text-sm text-muted-foreground">No rules for this domain yet — add one.</div>
+        )}
+        {rules.map((r) =>
+          editing === r.rule_id ? (
+            <RuleEditor key={r.rule_id} form={form} setForm={setForm} busy={busy} onSave={save} onCancel={() => setEditing(null)} />
+          ) : (
+            <div key={r.rule_id} className="rounded-md border p-3 text-sm space-y-1.5">
+              <div className="flex items-center gap-2">
+                <Badge variant="outline" className="text-[10px]">{r.origin === 'seed' ? 'seed' : 'custom'}</Badge>
+                <span className="font-medium">{r.name}</span>
+                <div className="ml-auto flex items-center gap-1">
+                  {r.eval_table && r.eval_sql && (
+                    <Button size="sm" variant="ghost" className="h-7 px-2 text-xs" onClick={() => void evaluate(r)}>
+                      Evaluate
+                    </Button>
+                  )}
+                  <Button size="icon" variant="ghost" className="h-7 w-7" title="Edit" onClick={() => startEdit(r)}>
+                    <BookText className="h-3.5 w-3.5" />
+                  </Button>
+                  <Button size="icon" variant="ghost" className="h-7 w-7 text-destructive" title="Delete" disabled={busy} onClick={() => void remove(r.rule_id)}>
+                    <Trash2 className="h-3.5 w-3.5" />
+                  </Button>
+                </div>
               </div>
-            )}
+              <div className="text-xs">
+                <span className="text-muted-foreground">IF </span>
+                {r.if_conditions.join(' AND ')}
+                <span className="text-muted-foreground"> → THEN </span>
+                <span className="font-medium">{r.then_conclusion}</span>
+              </div>
+              <div className="flex flex-wrap items-center gap-1">
+                {r.concepts.map((c) => (
+                  <Badge key={c} variant="secondary" className="text-[10px]">{c}</Badge>
+                ))}
+                {evalRes[r.rule_id] && (
+                  <Badge variant="outline" className="text-[10px] text-primary">{evalRes[r.rule_id]}</Badge>
+                )}
+              </div>
+              {r.evidence && (
+                <div className="text-[11px] text-muted-foreground">Signal: <code>{r.evidence}</code></div>
+              )}
+            </div>
+          )
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
+function RuleEditor({
+  form,
+  setForm,
+  busy,
+  onSave,
+  onCancel,
+}: {
+  form: typeof EMPTY_RULE;
+  setForm: (f: typeof EMPTY_RULE) => void;
+  busy: boolean;
+  onSave: () => void;
+  onCancel: () => void;
+}) {
+  const set = (k: keyof typeof EMPTY_RULE) => (e: React.ChangeEvent<HTMLInputElement>) => setForm({ ...form, [k]: e.target.value });
+  return (
+    <div className="rounded-md border border-primary/40 p-3 space-y-2 bg-muted/20">
+      <Input className="text-xs" placeholder="Rule name" value={form.name} onChange={set('name')} />
+      <Input className="text-xs" placeholder="IF conditions (semicolon-separated)" value={form.if_conditions} onChange={set('if_conditions')} />
+      <Input className="text-xs" placeholder="THEN conclusion" value={form.then_conclusion} onChange={set('then_conclusion')} />
+      <Input className="text-xs" placeholder="Ontology concepts (comma-separated)" value={form.concepts} onChange={set('concepts')} />
+      <Input className="text-xs" placeholder="Evidence / signal (optional)" value={form.evidence} onChange={set('evidence')} />
+      <div className="flex gap-2">
+        <Input className="text-xs" placeholder="Eval table (e.g. jai_ontos.qsr_sc.jai_inventory_event)" value={form.eval_table} onChange={set('eval_table')} />
+        <Input className="text-xs" placeholder="Eval WHERE predicate (optional)" value={form.eval_sql} onChange={set('eval_sql')} />
+      </div>
+      <div className="flex justify-end gap-2">
+        <Button size="sm" variant="ghost" onClick={onCancel}>Cancel</Button>
+        <Button size="sm" disabled={busy || !form.name.trim()} onClick={onSave}>Save rule</Button>
+      </div>
+    </div>
+  );
+}
+
+// The generated ontology artifact (OWL/TTL + JSON-LD). This IS the file that
+// drives the Ontology Explorer (Graph Explorer tab 2 reads its graph); it
+// regenerates as curation / links / rules change, and is downloadable.
+function OntologyArtifactCard({
+  artifact,
+  stale,
+  onRegenerate,
+  schemaLabel,
+  productName,
+}: {
+  artifact: StoredArtifact | null;
+  stale: boolean;
+  onRegenerate: () => Promise<void>;
+  schemaLabel: string;
+  productName: string;
+}) {
+  const [busy, setBusy] = useState(false);
+  const regen = async () => {
+    setBusy(true);
+    await onRegenerate();
+    setBusy(false);
+  };
+  return (
+    <Card className="shadow-sm">
+      <CardHeader className="flex flex-row items-center justify-between gap-4">
+        <div className="min-w-0">
+          <CardTitle className="flex items-center gap-2">
+            <FileCode className="h-4 w-4 text-primary" /> Ontology artifact (OWL/TTL + JSON-LD)
+          </CardTitle>
+          <CardDescription>
+            A portable OWL ontology generated from this product's curated ontology — classes, datatype
+            properties, confirmed relationships, rules, and attached links. The Ontology Explorer is
+            rendered from this artifact; it refreshes as you curate, attach links, or edit rules.
+          </CardDescription>
+        </div>
+        <div className="flex items-center gap-2 shrink-0">
+          <Button size="sm" variant="outline" className="gap-1.5" disabled={busy} onClick={() => void regen()}>
+            {busy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Sparkles className="h-3.5 w-3.5" />}
+            {artifact ? 'Regenerate' : 'Generate'}
+          </Button>
+        </div>
+      </CardHeader>
+      <CardContent className="space-y-2">
+        {artifact ? (
+          <>
+            <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+              <Badge variant="secondary" className="text-[10px]">{artifact.class_count ?? 0} classes</Badge>
+              <Badge variant="secondary" className="text-[10px]">{artifact.objprop_count ?? 0} object properties</Badge>
+              <span>IRI <code>{artifact.iri}</code></span>
+              <span>· generated {artifact.generated_at}</span>
+              {stale && (
+                <Badge variant="outline" className="text-[10px] text-amber-600">
+                  <AlertTriangle className="h-3 w-3 mr-1" /> stale — regenerate to refresh
+                </Badge>
+              )}
+            </div>
+            <div className="flex items-center gap-2">
+              <a
+                className="text-xs text-primary hover:underline inline-flex items-center gap-1"
+                href={artifactDownloadUrl(schemaLabel, productName, 'ttl')}
+              >
+                <ExternalLink className="h-3 w-3" /> Download .ttl
+              </a>
+              <a
+                className="text-xs text-primary hover:underline inline-flex items-center gap-1"
+                href={artifactDownloadUrl(schemaLabel, productName, 'jsonld')}
+              >
+                <ExternalLink className="h-3 w-3" /> Download .jsonld
+              </a>
+              {artifact.volume_path && (
+                <span className="text-[11px] text-muted-foreground">· mirrored to <code>{artifact.volume_path}</code></span>
+              )}
+            </div>
+          </>
+        ) : (
+          <div className="text-sm text-muted-foreground">
+            No artifact generated yet — click Generate to emit the OWL/TTL file and drive the Ontology
+            Explorer from it.
           </div>
-        ))}
+        )}
       </CardContent>
     </Card>
   );

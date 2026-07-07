@@ -117,6 +117,16 @@ export async function validateOntology(args: {
   }
 }
 
+// ---- check whether a governed serving view actually exists in the warehouse ----
+export async function checkServingView(object: string): Promise<{ present: boolean; error?: string }> {
+  try {
+    const resp = await fetch(`/api/serving-view-check?object=${encodeURIComponent(object)}`);
+    return await resp.json();
+  } catch (e) {
+    return { present: false, error: String(e) };
+  }
+}
+
 // ---- verify a generated serving-view's SQL compiles against the warehouse ----
 export async function verifyViewSql(sql: string): Promise<{ ok: boolean; error?: string }> {
   try {

@@ -31,7 +31,7 @@ import {
   TooltipProvider,
   Input,
 } from '@databricks/appkit-ui/react';
-import { ArrowRight, Info, Search, Check, X } from 'lucide-react';
+import { ArrowRight, Info, Search } from 'lucide-react';
 import { useProduct } from '../lib/product';
 import { deriveProduct } from '../lib/deriveComponents';
 import { CatalogLoadingSkeleton } from '../components/LoadingSkeleton';
@@ -52,8 +52,6 @@ export function SemanticExplorer() {
     saveOntologyOverride,
     deleteOntologyOverride,
   } = useProduct();
-  const edgeOverride = (ref: string, action: 'confirm' | 'reject') =>
-    ontologyOverrides.find((o) => o.kind === 'edge_status' && o.ref === ref && o.action === action);
 
   // aggregate relationships + measures + mappings across the SCOPED products
   // (all → every product; a domain → its products; a single product → just it).
@@ -162,7 +160,11 @@ export function SemanticExplorer() {
       <Card className="shadow-sm">
         <CardHeader>
           <CardTitle>Relationships (lineage / foreign keys)</CardTitle>
-          <CardDescription>Shared-key joins inferred from the schema</CardDescription>
+          <CardDescription>
+            Shared-key joins inferred from the schema — a read-only scoped rollup. Confirm/reject is
+            curated in <span className="font-medium">Ontology Studio</span> (the single writer); this view
+            reflects that status.
+          </CardDescription>
         </CardHeader>
         <CardContent className="space-y-4">
           {shownRelationships.length === 0 ? (
@@ -175,10 +177,9 @@ export function SemanticExplorer() {
             <>
               <div className="flex flex-wrap gap-2">
                 {shownRelationships.map((r, i) => {
-                  const ref = `${r.from.join(',')}>${r.to}:${r.predicate}`;
-                  const confirmOv = edgeOverride(ref, 'confirm');
-                  const rejectOv = edgeOverride(ref, 'reject');
                   const conf = r.status === 'confirmed' ? 100 : Math.round((r.confidence ?? 0.6) * 100);
+                  const statusLabel =
+                    r.status === 'confirmed' ? 'Confirmed' : r.status === 'rejected' ? 'Rejected' : 'Suggested';
                   return (
                     <div
                       key={`${r.predicate}-${i}`}
@@ -197,45 +198,12 @@ export function SemanticExplorer() {
                         <ArrowRight className="h-3.5 w-3.5" />
                       </span>
                       <span className="font-medium">{r.to}</span>
-                      <Badge variant="outline" className="text-[10px]">
-                        {r.origin ?? 'heuristic'} · {conf}%
+                      <Badge
+                        variant={r.status === 'confirmed' ? 'default' : 'outline'}
+                        className="text-[10px]"
+                      >
+                        {statusLabel} · {conf}%
                       </Badge>
-                      <button
-                        type="button"
-                        title="Confirm (trusted)"
-                        className={`hover:text-emerald-600 ${r.status === 'confirmed' ? 'text-emerald-600' : 'text-muted-foreground'}`}
-                        onClick={() =>
-                          confirmOv
-                            ? void deleteOntologyOverride(confirmOv.id)
-                            : void saveOntologyOverride({
-                                product: selectedProduct.product_name,
-                                kind: 'edge_status',
-                                ref,
-                                action: 'confirm',
-                                value: { predicate: r.predicate },
-                              })
-                        }
-                      >
-                        <Check className="h-3.5 w-3.5" />
-                      </button>
-                      <button
-                        type="button"
-                        title="Reject (hide)"
-                        className={`hover:text-destructive ${r.status === 'rejected' ? 'text-destructive' : 'text-muted-foreground'}`}
-                        onClick={() =>
-                          rejectOv
-                            ? void deleteOntologyOverride(rejectOv.id)
-                            : void saveOntologyOverride({
-                                product: selectedProduct.product_name,
-                                kind: 'edge_status',
-                                ref,
-                                action: 'reject',
-                                value: { predicate: r.predicate },
-                              })
-                        }
-                      >
-                        <X className="h-3.5 w-3.5" />
-                      </button>
                     </div>
                   );
                 })}

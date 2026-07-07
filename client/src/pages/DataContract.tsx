@@ -17,7 +17,7 @@ import {
   TableHeader,
   TableRow,
 } from '@databricks/appkit-ui/react';
-import { FileDown, CheckCircle2, KeyRound } from 'lucide-react';
+import { FileDown, CheckCircle2, KeyRound, Info } from 'lucide-react';
 import { useProduct } from '../lib/product';
 import { deriveContract } from '../lib/contract';
 
@@ -44,6 +44,18 @@ export function DataContract() {
         >
           <FileDown className="h-4 w-4" /> Export PDF
         </Button>
+      </div>
+
+      <div className="flex items-start gap-2 rounded-md bg-muted/50 p-3 text-sm">
+        <Info className="h-4 w-4 mt-0.5 text-muted-foreground shrink-0" />
+        <span className="text-muted-foreground">
+          A <span className="font-medium">data contract</span> is the governance handshake for this product:
+          the governed <span className="font-medium">serving object</span>, its <span className="font-medium">grain</span>,
+          schema (keys + types), <span className="font-medium">quality checks</span>, freshness SLA, scope, and lineage.
+          It's <span className="font-medium">derived and read-only</span> here (curated for the live flagship) — no action
+          is required. <span className="font-medium">Export PDF</span> produces a shareable brief (contract + ontology +
+          lineage + approved actions) to hand to data owners / consumers.
+        </span>
       </div>
 
       <Card className="shadow-sm">

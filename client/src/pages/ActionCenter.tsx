@@ -260,12 +260,16 @@ function ActionLogTracker({ product }: { product: string }) {
 // Data-backed exceptions: for a "Data Avlbl" product, a "Use Data Avlbl" toggle
 // runs the product's exception SQL against the backing schema (server-side) and
 // LLM-enriches each real row into a prioritized action.
+type PlaybookEntry = { root_cause: string; recommended_action: string; source: 'db' | 'guidance' };
 type DataExResult = {
   actions: Record<string, unknown>[];
   stats: Record<string, unknown> | null;
   rows: Record<string, unknown>[];
   llm?: boolean;
   note?: string;
+  sql?: { aggregate?: string; rows?: string };
+  full_count?: number;
+  playbook?: PlaybookEntry[];
 };
 
 function DataExceptionsPanel({
@@ -278,10 +282,28 @@ function DataExceptionsPanel({
   const [useData, setUseData] = useState(true);
   const [loading, setLoading] = useState(false);
   const [showRows, setShowRows] = useState(false);
+  const [showSql, setShowSql] = useState(false);
+  const [allRows, setAllRows] = useState<Record<string, unknown>[] | null>(null);
+  const [loadingRows, setLoadingRows] = useState(false);
   // rehydrate from the per-scope cache so results survive tab navigation
   const [result, setResult] = useState<DataExResult | null>(
     () => getScopeCache<DataExResult>('dataExceptions') ?? null
   );
+  const loadAllRows = async () => {
+    setLoadingRows(true);
+    try {
+      const r = await fetch('/api/exception-rows', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ product: selectedProduct.product_name, limit: 1000 }),
+      });
+      const d = await r.json();
+      setAllRows(Array.isArray(d?.rows) ? d.rows : []);
+      setShowRows(true);
+    } finally {
+      setLoadingRows(false);
+    }
+  };
 
   const generate = async () => {
     setLoading(true);
@@ -297,6 +319,9 @@ function DataExceptionsPanel({
         stats?: Record<string, unknown> | null;
         llm?: boolean;
         reason?: string;
+        sql?: { aggregate?: string; rows?: string };
+        full_count?: number;
+        playbook?: PlaybookEntry[];
       };
       const actions = d.actions ?? [];
       const items: ActionItem[] = actions.map((a, i) => ({
@@ -317,6 +342,9 @@ function DataExceptionsPanel({
         stats: d.stats ?? null,
         rows: d.rows ?? [],
         llm: d.llm,
+        sql: d.sql,
+        full_count: d.full_count,
+        playbook: d.playbook,
         note: actions.length
           ? `${actions.length} aggregate action(s) from the backing data${d.llm ? ' (LLM-summarized)' : ''}.`
           : `No exceptions returned${d.reason ? ` — ${d.reason}` : ''}.`,
@@ -358,26 +386,82 @@ function DataExceptionsPanel({
         </div>
 
         {stats && (
-          <div className="flex flex-wrap gap-2">
-            {Object.entries(stats).map(([k, v]) => (
-              <Badge key={k} variant="outline" className="font-normal">
-                {k.replace(/_/g, ' ')}: <span className="font-medium ml-1">{String(v)}</span>
-              </Badge>
+          <div className="space-y-1">
+            <div className="flex items-center gap-1.5">
+              <Badge variant="secondary" className="text-[10px]">Data-derived</Badge>
+              <span className="text-[11px] text-muted-foreground">real SQL aggregates over the backing table</span>
+            </div>
+            <div className="flex flex-wrap gap-2">
+              {Object.entries(stats).map(([k, v]) => (
+                <Badge key={k} variant="outline" className="font-normal">
+                  {k.replace(/_/g, ' ')}: <span className="font-medium ml-1">{String(v)}</span>
+                </Badge>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* exact query behind the numbers (drill-through) */}
+        {result?.sql && (
+          <div>
+            <Button size="sm" variant="ghost" className="text-xs gap-1.5" onClick={() => setShowSql((s) => !s)}>
+              <Database className="h-3.5 w-3.5" /> {showSql ? 'Hide' : 'Show'} supporting query
+            </Button>
+            {showSql && (
+              <div className="mt-1 space-y-1">
+                <div className="text-[11px] text-muted-foreground">Aggregate (the stat numbers):</div>
+                <pre className="text-[11px] bg-muted rounded-md p-2 overflow-x-auto whitespace-pre-wrap">{result.sql.aggregate}</pre>
+                <div className="text-[11px] text-muted-foreground">Exception rows:</div>
+                <pre className="text-[11px] bg-muted rounded-md p-2 overflow-x-auto whitespace-pre-wrap">{result.sql.rows}</pre>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* prescriptive playbook — honest DB-backed vs guidance (renders even w/o LLM) */}
+        {result?.playbook && result.playbook.length > 0 && (
+          <div className="rounded-md border p-3 space-y-2">
+            <div className="flex items-center gap-1.5">
+              <span className="text-xs font-medium">Playbook — root cause → action</span>
+              <Badge variant="secondary" className="text-[10px]">AI guidance</Badge>
+            </div>
+            {result.playbook.map((p, i) => (
+              <div key={i} className="text-xs space-y-0.5">
+                <div>
+                  <Badge variant="outline" className={`text-[9px] mr-1 ${p.source === 'db' ? 'text-success' : 'text-muted-foreground'}`}>
+                    {p.source === 'db' ? 'DB-backed' : 'Guidance'}
+                  </Badge>
+                  <span className="text-muted-foreground">Why: </span>{p.root_cause}
+                </div>
+                <div className="pl-1"><span className="text-muted-foreground">Do: </span><span className="font-medium">{p.recommended_action}</span></div>
+              </div>
             ))}
+            <div className="text-[10px] text-muted-foreground">
+              Root cause / recommended action are AI + curated guidance; the counts above are data-derived. Open the attached Genie space (Further analysis panel) to drill deeper.
+            </div>
           </div>
         )}
 
         {result && result.rows.length > 0 && (
           <div>
-            <Button size="sm" variant="ghost" className="text-xs" onClick={() => setShowRows((s) => !s)}>
-              {showRows ? 'Hide' : 'Show'} representative rows ({result.rows.length})
-            </Button>
-            {showRows && (
-              <div className="mt-2 overflow-x-auto rounded-md border">
+            <div className="flex items-center gap-2">
+              <Button size="sm" variant="ghost" className="text-xs" onClick={() => setShowRows((s) => !s)}>
+                {showRows ? 'Hide' : 'Show'} rows ({(allRows ?? result.rows).length}
+                {result.full_count != null && result.full_count > (allRows ?? result.rows).length ? ` of ${result.full_count}` : ''})
+              </Button>
+              {result.full_count != null && !allRows && result.full_count > result.rows.length && (
+                <Button size="sm" variant="ghost" className="text-xs gap-1.5" disabled={loadingRows} onClick={() => void loadAllRows()}>
+                  {loadingRows ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : null}
+                  Load all {result.full_count} exception rows
+                </Button>
+              )}
+            </div>
+            {showRows && (allRows ?? result.rows).length > 0 && (
+              <div className="mt-2 max-h-96 overflow-auto rounded-md border">
                 <table className="text-xs w-full">
                   <thead>
                     <tr className="bg-muted/50">
-                      {Object.keys(result.rows[0]).map((c) => (
+                      {Object.keys((allRows ?? result.rows)[0]).map((c) => (
                         <th key={c} className="text-left px-2 py-1 font-medium">
                           {c}
                         </th>
@@ -385,7 +469,7 @@ function DataExceptionsPanel({
                     </tr>
                   </thead>
                   <tbody>
-                    {result.rows.map((r, i) => (
+                    {(allRows ?? result.rows).map((r, i) => (
                       <tr key={i} className="border-t">
                         {Object.values(r).map((v, j) => (
                           <td key={j} className="px-2 py-1 whitespace-nowrap">

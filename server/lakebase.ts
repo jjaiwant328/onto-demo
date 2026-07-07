@@ -180,4 +180,40 @@ export async function ensureLakebaseTables(): Promise<void> {
   await lbQuery(
     `CREATE UNIQUE INDEX IF NOT EXISTS uq_monitor_run_day ON jai_monitor_run (job_id, product, run_date)`
   );
+  // Generated ontology artifact per product (OWL/TTL + JSON-LD + cytoscape graph).
+  // Canonical source the Ontology Explorer reads; also mirrored to a UC Volume.
+  await lbQuery(`CREATE TABLE IF NOT EXISTS jai_ontology_artifact (
+    artifact_id text PRIMARY KEY,
+    schema_label text,
+    product text,
+    product_label text,
+    iri text,
+    ttl text,
+    jsonld text,
+    graph_json text,
+    model_json text,
+    volume_path text,
+    class_count int,
+    objprop_count int,
+    generated_by text,
+    generated_at timestamptz
+  )`);
+  // Domain-level business/reasoning rules (seeded from QSR_SC_REASONING_RULES,
+  // then user-editable). Captures rules so they can be applied consistently.
+  await lbQuery(`CREATE TABLE IF NOT EXISTS jai_business_rules (
+    rule_id text PRIMARY KEY,
+    domain text NOT NULL,
+    name text,
+    if_conditions text,
+    then_conclusion text,
+    concepts text,
+    evidence text,
+    eval_sql text,
+    eval_table text,
+    enabled boolean DEFAULT true,
+    origin text,
+    created_by text,
+    created_at timestamptz,
+    updated_at timestamptz
+  )`);
 }

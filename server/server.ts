@@ -7,7 +7,14 @@ import {
   isDemoProduct,
   DEMO_PRODUCTS,
   ALL_DEMO_DOMAINS,
+  QSR_SC_REASONING_RULES,
 } from '../shared/demoDomains';
+import {
+  serializeTtl,
+  serializeJsonLd,
+  artifactCounts,
+  type OntologyArtifact,
+} from '../shared/ontologyArtifact';
 import { lbQuery, ensureLakebaseTables, lakebaseConfigured } from './lakebase';
 
 // The serving plugin is wired to a Foundation Model endpoint (alias "llm",
@@ -159,6 +166,24 @@ createApp({
         }
       } catch (err) {
         console.error('[lakebase] product_links migration skipped:', String(err));
+      }
+      // seed business rules from the static const on first run (then table is canonical)
+      try {
+        const existing = await lbQuery<{ n: string }>(`SELECT count(*)::text AS n FROM jai_business_rules`);
+        if (Number(existing[0]?.n ?? '0') === 0) {
+          for (const r of QSR_SC_REASONING_RULES) {
+            await lbQuery(
+              `INSERT INTO jai_business_rules (rule_id, domain, name, if_conditions, then_conclusion, concepts, ` +
+                `evidence, enabled, origin, created_at, updated_at) ` +
+                `VALUES ($1,$2,$3,$4,$5,$6,$7, true, 'seed', now(), now()) ON CONFLICT (rule_id) DO NOTHING`,
+              [r.id, r.domain, r.name, JSON.stringify(r.if_conditions), r.then_conclusion,
+               JSON.stringify(r.concepts ?? []), r.evidence ?? '']
+            ).catch((e) => console.error('[lakebase] seed rule failed:', String(e)));
+          }
+          console.log(`[lakebase] seeded ${QSR_SC_REASONING_RULES.length} business rule(s)`);
+        }
+      } catch (err) {
+        console.error('[lakebase] business-rules seed skipped:', String(err));
       }
     };
     void initLakebase();
@@ -645,16 +670,24 @@ createApp({
           res.json({ actions: [], rows: [], stats, llm: hasLlm, reason: 'no exceptions found' });
           return;
         }
+        // supporting-data + prescriptive playbook returned on every response so the
+        // panel can drill to the exact query and render guidance even without the LLM
+        const extra = {
+          sql: { aggregate: aggSql, rows: rowSql },
+          full_count: total,
+          playbook: meta.playbook ?? [],
+        };
         if (!hasLlm) {
-          // deterministic fallback: ONE aggregate action from the config framing
+          // deterministic fallback grounded in the curated playbook (renders w/o a model)
+          const pb = meta.playbook ?? [];
           res.json({
             actions: [
               {
                 id: `dx-${product}-agg`,
                 priority: 'HIGH',
                 issue: `${total} exception(s) — ${meta.issue}`,
-                root_cause: 'Aggregate of data-backed exception rows.',
-                recommended_action: meta.action_hint,
+                root_cause: pb[0]?.root_cause ?? 'Aggregate of data-backed exception rows.',
+                recommended_action: pb[0]?.recommended_action ?? meta.action_hint,
                 confidence: 0.6,
                 stats,
               },
@@ -662,9 +695,13 @@ createApp({
             rows,
             stats,
             llm: false,
+            ...extra,
           });
           return;
         }
+        const playbookText = (meta.playbook ?? [])
+          .map((p) => `- (${p.source}) ${p.root_cause} → ${p.recommended_action}`)
+          .join('\n');
         const prompt =
           `You are an ops analyst for the data product "${meta.display_name}" ` +
           `(domain: ${meta.domainLabel}). Below are AGGREGATE stats over the real exception rows ` +
@@ -673,16 +710,19 @@ createApp({
           `"12 DQ tests failing (4 critical) across 5 tables — triage critical failures". Return ONLY a ` +
           `JSON array; each item: {id, priority ("HIGH"|"MEDIUM"|"LOW"), issue, root_cause, ` +
           `recommended_action, confidence (0..1)}. Put the concrete counts in "issue". Bucket priority ` +
-          `by severity/impact. Keep root_cause and recommended_action to one sentence each. A good ` +
-          `action looks like: ${meta.action_hint}\n\nAGGREGATE STATS:\n${JSON.stringify(stats)}\n\n` +
+          `by severity/impact. Keep root_cause and recommended_action to one sentence each. ` +
+          (playbookText
+            ? `GROUND your root_cause/recommended_action in this curated playbook and do not contradict it:\n${playbookText}\n\n`
+            : `A good action looks like: ${meta.action_hint}\n\n`) +
+          `AGGREGATE STATS:\n${JSON.stringify(stats)}\n\n` +
           `REPRESENTATIVE ROWS:\n${JSON.stringify(rows).slice(0, 12000)}`;
         const content = await llmComplete(prompt, 2000);
         const json = extractJsonArray(content ?? '');
         if (json) {
-          res.json({ actions: json.slice(0, 6), rows, stats, llm: true, product });
+          res.json({ actions: json.slice(0, 6), rows, stats, llm: true, product, ...extra });
           return;
         }
-        res.json({ actions: [], rows, stats, llm: false, reason: 'model returned no usable JSON' });
+        res.json({ actions: [], rows, stats, llm: false, reason: 'model returned no usable JSON', ...extra });
       });
 
       // ---- Feature 2: Ontology Copilot ----
@@ -1476,6 +1516,237 @@ createApp({
             sql: demoAggregateSql(p.product_name),
           })),
         });
+      });
+
+      // ================= Ontology artifact (OWL/TTL + JSON-LD) =================
+      const artifactId = (schema: string, product: string) => `${schema}:${product}`;
+      // POST — client sends the assembled OntologyArtifact model; server serializes,
+      // mirrors to the UC Volume (best-effort), and upserts the canonical row.
+      app.post('/api/ontology-artifact', async (req, res) => {
+        const b = (req.body ?? {}) as { schema_label?: string; product?: string; model?: OntologyArtifact };
+        const schema = String(b.schema_label ?? '').trim();
+        const product = String(b.product ?? '').trim();
+        const model = b.model;
+        if (!schema || !product || !model) {
+          res.status(400).json({ ok: false, error: 'schema_label, product, model required' });
+          return;
+        }
+        let ttl = '';
+        let jsonld = '';
+        try {
+          ttl = serializeTtl(model);
+          jsonld = JSON.stringify(serializeJsonLd(model), null, 2);
+        } catch (e) {
+          res.json({ ok: false, error: `serialize failed: ${String(e)}` });
+          return;
+        }
+        const volPath = `${VOLUME_BASE}/${product}.ttl`;
+        let volumeWarning: string | undefined;
+        try {
+          await volumePut(volPath, ttl);
+          await volumePut(`${VOLUME_BASE}/${product}.jsonld`, jsonld);
+        } catch (e) {
+          volumeWarning = `volume mirror skipped: ${String(e).slice(0, 120)}`;
+        }
+        const counts = artifactCounts(model);
+        try {
+          const who = await whoami();
+          await lbQuery(
+            `INSERT INTO jai_ontology_artifact (artifact_id, schema_label, product, product_label, iri, ` +
+              `ttl, jsonld, graph_json, model_json, volume_path, class_count, objprop_count, generated_by, generated_at) ` +
+              `VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13, now()) ` +
+              `ON CONFLICT (artifact_id) DO UPDATE SET product_label=EXCLUDED.product_label, iri=EXCLUDED.iri, ` +
+              `ttl=EXCLUDED.ttl, jsonld=EXCLUDED.jsonld, graph_json=EXCLUDED.graph_json, model_json=EXCLUDED.model_json, ` +
+              `volume_path=EXCLUDED.volume_path, class_count=EXCLUDED.class_count, objprop_count=EXCLUDED.objprop_count, ` +
+              `generated_by=EXCLUDED.generated_by, generated_at=now()`,
+            [
+              artifactId(schema, product),
+              schema,
+              product,
+              String(model.productLabel ?? product),
+              String(model.iri ?? ''),
+              ttl,
+              jsonld,
+              JSON.stringify(model.graph ?? null),
+              JSON.stringify(model),
+              volPath,
+              counts.class_count,
+              counts.objprop_count,
+              who,
+            ]
+          );
+          res.json({ ok: true, artifact_id: artifactId(schema, product), volume_path: volPath, ttl_bytes: ttl.length, volume_warning: volumeWarning });
+        } catch (err) {
+          res.json({ ok: false, error: humanizeSqlError(err) });
+        }
+      });
+
+      // GET — the stored artifact (viewer + export read this)
+      app.get('/api/ontology-artifact', async (req, res) => {
+        const schema = String(req.query.schema ?? '').trim();
+        const product = String(req.query.product ?? '').trim();
+        if (!schema || !product) {
+          res.json({ artifact: null });
+          return;
+        }
+        try {
+          const rows = await lbQuery(
+            `SELECT artifact_id, schema_label, product, product_label, iri, graph_json, model_json, ` +
+              `volume_path, class_count, objprop_count, generated_by, ` +
+              `to_char(generated_at, 'YYYY-MM-DD HH24:MI:SS') AS generated_at ` +
+              `FROM jai_ontology_artifact WHERE artifact_id = $1 LIMIT 1`,
+            [artifactId(schema, product)]
+          );
+          res.json({ artifact: rows[0] ?? null });
+        } catch (err) {
+          res.json({ artifact: null, error: humanizeSqlError(err) });
+        }
+      });
+
+      // GET download — stream the stored TTL or JSON-LD as an attachment
+      app.get('/api/ontology-artifact/download', async (req, res) => {
+        const schema = String(req.query.schema ?? '').trim();
+        const product = String(req.query.product ?? '').trim();
+        const format = String(req.query.format ?? 'ttl') === 'jsonld' ? 'jsonld' : 'ttl';
+        try {
+          const rows = await lbQuery<{ ttl: string; jsonld: string }>(
+            `SELECT ttl, jsonld FROM jai_ontology_artifact WHERE artifact_id = $1 LIMIT 1`,
+            [artifactId(schema, product)]
+          );
+          if (rows.length === 0) {
+            res.status(404).json({ error: 'artifact not found — generate it first' });
+            return;
+          }
+          const body = format === 'jsonld' ? rows[0].jsonld : rows[0].ttl;
+          res.setHeader('Content-Type', format === 'jsonld' ? 'application/ld+json' : 'text/turtle');
+          res.setHeader('Content-Disposition', `attachment; filename="${product}.${format}"`);
+          res.send(body ?? '');
+        } catch (err) {
+          res.status(200).json({ error: humanizeSqlError(err) });
+        }
+      });
+
+      // ================= Governed serving-view live check =================
+      app.get('/api/serving-view-check', async (req, res) => {
+        const object = String(req.query.object ?? '').trim();
+        const m = object.match(/^([A-Za-z0-9_]+)\.([A-Za-z0-9_]+)\.([A-Za-z0-9_]+)$/);
+        if (!m) {
+          res.json({ present: false, error: 'need a 3-part catalog.schema.view name' });
+          return;
+        }
+        const [, cat, sch, view] = m;
+        try {
+          const rows = await runSql(
+            `SELECT count(*) AS n FROM ${cat}.information_schema.tables WHERE table_schema='${sch}' AND table_name='${view}'`
+          );
+          const n = Number(rows[0]?.n ?? rows[0]?.N ?? 0) || 0;
+          res.json({ present: n > 0, object });
+        } catch (e) {
+          // permission/other error → "cannot verify", not "absent"
+          res.json({ present: false, object, error: humanizeSqlError(e) });
+        }
+      });
+
+      // ================= Business / reasoning rules =================
+      app.get('/api/business-rules', async (req, res) => {
+        const domain = String(req.query.domain ?? '').trim();
+        if (!domain) {
+          res.json({ rules: [] });
+          return;
+        }
+        try {
+          const rows = await lbQuery(
+            `SELECT rule_id, domain, name, if_conditions, then_conclusion, concepts, evidence, eval_sql, eval_table, enabled, origin ` +
+              `FROM jai_business_rules WHERE domain = $1 ORDER BY rule_id`,
+            [domain]
+          );
+          res.json({ rules: rows });
+        } catch (err) {
+          res.json({ rules: [], error: humanizeSqlError(err) });
+        }
+      });
+      app.post('/api/business-rule', async (req, res) => {
+        const b = (req.body ?? {}) as {
+          rule_id?: string; domain?: string; name?: string; if_conditions?: unknown;
+          then_conclusion?: string; concepts?: unknown; evidence?: string; eval_sql?: string; eval_table?: string; enabled?: boolean;
+        };
+        const domain = String(b.domain ?? '').trim();
+        if (!domain || !b.name) {
+          res.status(400).json({ ok: false, error: 'domain and name required' });
+          return;
+        }
+        const ruleId = String(b.rule_id ?? '').trim() || `rr_${Date.now().toString(36)}_${randomUUID().slice(0, 8)}`;
+        const asJson = (v: unknown) => (typeof v === 'string' ? v : JSON.stringify(v ?? []));
+        try {
+          const who = await whoami();
+          await lbQuery(
+            `INSERT INTO jai_business_rules (rule_id, domain, name, if_conditions, then_conclusion, concepts, evidence, ` +
+              `eval_sql, eval_table, enabled, origin, created_by, created_at, updated_at) ` +
+              `VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'user',$11, now(), now()) ` +
+              `ON CONFLICT (rule_id) DO UPDATE SET name=EXCLUDED.name, if_conditions=EXCLUDED.if_conditions, ` +
+              `then_conclusion=EXCLUDED.then_conclusion, concepts=EXCLUDED.concepts, evidence=EXCLUDED.evidence, ` +
+              `eval_sql=EXCLUDED.eval_sql, eval_table=EXCLUDED.eval_table, enabled=EXCLUDED.enabled, updated_at=now()`,
+            [ruleId, domain, String(b.name), asJson(b.if_conditions), String(b.then_conclusion ?? ''),
+             asJson(b.concepts), String(b.evidence ?? ''), b.eval_sql ? String(b.eval_sql) : null,
+             b.eval_table ? String(b.eval_table) : null, b.enabled === false ? false : true, who]
+          );
+          res.json({ ok: true, rule_id: ruleId });
+        } catch (err) {
+          res.json({ ok: false, error: humanizeSqlError(err) });
+        }
+      });
+      app.post('/api/delete-business-rule', async (req, res) => {
+        const id = String((req.body as { rule_id?: string })?.rule_id ?? '').trim();
+        if (!id) {
+          res.status(400).json({ ok: false, error: 'rule_id required' });
+          return;
+        }
+        try {
+          await lbQuery(`DELETE FROM jai_business_rules WHERE rule_id = $1`, [id]);
+          res.json({ ok: true });
+        } catch (err) {
+          res.json({ ok: false, error: humanizeSqlError(err) });
+        }
+      });
+      // Evaluate a rule's IF-condition against its backing table (prescriptive tie-in)
+      app.post('/api/evaluate-business-rule', async (req, res) => {
+        const b = (req.body ?? {}) as { eval_table?: string; eval_sql?: string };
+        const table = String(b.eval_table ?? '').trim();
+        const where = String(b.eval_sql ?? '').trim();
+        if (!/^[A-Za-z0-9_]+(\.[A-Za-z0-9_]+){1,2}$/.test(table) || !where) {
+          res.json({ ok: false, error: 'need eval_table (qualified) and eval_sql (WHERE predicate)' });
+          return;
+        }
+        // reject mutating / multi-statement predicates
+        if (/;|\b(insert|update|delete|drop|create|alter|merge|grant|truncate)\b/i.test(where)) {
+          res.json({ ok: false, error: 'eval_sql must be a read-only WHERE predicate' });
+          return;
+        }
+        try {
+          const rows = await runSql(`SELECT count(*) AS matches FROM ${table} WHERE ${where}`);
+          res.json({ ok: true, matches: Number(rows[0]?.matches ?? 0) || 0 });
+        } catch (e) {
+          res.json({ ok: false, error: humanizeSqlError(e) });
+        }
+      });
+
+      // ================= Action Center: full exception rows (drill-through) =====
+      app.post('/api/exception-rows', async (req, res) => {
+        const b = (req.body ?? {}) as { product?: string; limit?: number };
+        const product = String(b.product ?? '').trim();
+        const limit = Math.min(Math.max(Number(b.limit ?? 200) || 200, 1), 1000);
+        const sql = demoExceptionSql(product, limit);
+        const aggregate = demoAggregateSql(product);
+        if (!sql) {
+          res.status(400).json({ rows: [], error: 'not a data-backed product' });
+          return;
+        }
+        try {
+          const rows = await runSql(sql);
+          res.json({ rows, sql, aggregate_sql: aggregate, count: rows.length });
+        } catch (e) {
+          res.json({ rows: [], sql, error: humanizeSqlError(e) });
+        }
       });
     });
   },

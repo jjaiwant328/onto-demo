@@ -31,6 +31,10 @@ export type DemoProduct = {
   // catalog.schema the backing `table` lives in; defaults to DEMO_BACKING_CATALOG_SCHEMA
   // (jai_ontos.qsr_demo). The QSR control-tower products override this to qsr_sc.
   backing_schema?: string;
+  // curated prescriptive playbook (QSR layer): grounds the LLM and renders even
+  // without a model. `source` is honest: 'db' = derivable from the data,
+  // 'guidance' = operational best-practice not in the database.
+  playbook?: { root_cause: string; recommended_action: string; source: 'db' | 'guidance' }[];
 };
 
 export type DemoDomain = {
@@ -289,6 +293,10 @@ export const QSR_SC_DOMAINS: DemoDomain[] = [
         exception_order_by: 'days_of_supply ASC',
         issue: 'Ingredient positions at stockout risk (low days_of_supply, or supplier-outage impacted).',
         action_hint: 'Expedite replenishment / find alternate supply for the lowest days_of_supply positions.',
+        playbook: [
+          { root_cause: 'A single-source supplier outage is blocking replenishment (impacted_by_supplier_outage = true on the at-risk rows).', recommended_action: 'Activate the qualified alternate supplier for the affected ingredient lines and expedite an emergency shipment to the DC serving those restaurants.', source: 'db' },
+          { root_cause: 'Demand ran ahead of forecast so days_of_supply fell below the safety threshold.', recommended_action: 'Raise safety stock for high-variance SKUs and pull the next replenishment forward.', source: 'guidance' },
+        ],
         aggregate_select:
           'count(*) AS at_risk_items, ' +
           'round(avg(days_of_supply),1) AS avg_days_of_supply, ' +
@@ -356,6 +364,10 @@ export const QSR_SC_DOMAINS: DemoDomain[] = [
         exception_order_by: 'days_late DESC',
         issue: 'Purchase orders are late; a single-source supplier outage is a major driver.',
         action_hint: 'Escalate the most-late POs; activate alternate suppliers for outage-impacted lines.',
+        playbook: [
+          { root_cause: 'Outage-impacted POs (impacted_by_outage = true) concentrate on one single-source supplier.', recommended_action: 'Escalate with that supplier and split volume to a secondary source for the most-late POs (highest days_late first).', source: 'db' },
+          { root_cause: 'Chronic lateness from suppliers with on_time_rate below target.', recommended_action: 'Trigger a supplier scorecard review and add a backup supplier to the contract.', source: 'guidance' },
+        ],
         aggregate_select:
           'count(*) AS late_pos, ' +
           'count(distinct supplier_id) AS suppliers_affected, ' +
@@ -422,6 +434,10 @@ export const QSR_SC_DOMAINS: DemoDomain[] = [
         exception_order_by: 'health_score ASC',
         issue: 'Equipment readings in failure or low-health state (e.g. fryer failures) — production risk.',
         action_hint: 'Dispatch maintenance to the lowest-health units; adjust production where equipment is down.',
+        playbook: [
+          { root_cause: 'A pressure fryer is in a failure state at an affected restaurant (status = Failure).', recommended_action: 'Dispatch field maintenance today and shift affected menu-item production to a backup line until restored.', source: 'db' },
+          { root_cause: 'Units trending toward failure (declining health_score) without a scheduled service.', recommended_action: 'Schedule preventive maintenance for units below the health threshold before they fail.', source: 'guidance' },
+        ],
         aggregate_select:
           'count(*) AS unhealthy_readings, ' +
           'count(distinct restaurant_id) AS restaurants_affected, ' +

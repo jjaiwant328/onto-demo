@@ -34,6 +34,14 @@ import {
 } from './ontologyOverrides';
 import { buildCatalog } from './catalogGen';
 import { DEMO_DOMAINS, DEMO_SCHEMA, QSR_SC_DOMAINS } from '../../../shared/demoDomains';
+import {
+  assembleArtifactInput,
+  artifactSignature,
+  generateArtifact,
+  fetchArtifact,
+  type StoredArtifact,
+  type ArtifactRuleInput,
+} from './ontologyArtifact';
 import { combineSchemas, type SchemaEntry, type ConformanceInfo } from './combineSchemas';
 
 const DEFAULT_CATALOG = catalogJson as unknown as Catalog;
@@ -148,6 +156,10 @@ export type ProductContextValue = {
   // re-fetch product links (Genie/dashboard) overlaid on the enterprise graph.
   // Call after attaching/detaching a link so the graph reflects it without a reload.
   refreshGraphLinks: () => Promise<void>;
+  // generated ontology artifact (OWL/TTL + JSON-LD + graph) for the selected product
+  artifact: StoredArtifact | null;
+  artifactStale: boolean;
+  regenerateArtifact: (opts?: { rules?: ArtifactRuleInput[]; servingViewPresent?: boolean }) => Promise<void>;
   // token that changes whenever the active schema selection changes; session-
   // scoped panels (Action queue, Copilot conversation) reset on it so no
   // schema's state leaks into another.
@@ -1045,6 +1057,69 @@ export function ProductProvider({ children }: { children: ReactNode }) {
     () => applyOntologyOverrides(deriveProduct(selectedProduct, schema), ontologyOverrides),
     [selectedProduct, schema, ontologyOverrides]
   );
+
+  // ---- ontology artifact (OWL/TTL + JSON-LD + graph) per selected product ----
+  const [artifact, setArtifact] = useState<StoredArtifact | null>(null);
+  // extras supplied by Ontology Studio (rules, live serving-view presence)
+  const [artifactExtras, setArtifactExtras] = useState<{
+    rules?: ArtifactRuleInput[];
+    servingViewPresent?: boolean;
+  }>({});
+  const servingObject = `jai_ontos.demo_schema.jai_${selectedProduct.product_name}_serving`;
+  const productLinksForArtifact = useMemo(
+    () => graphLinks.filter((l) => l.product === selectedProduct.display_name),
+    [graphLinks, selectedProduct]
+  );
+  const currentArtifactModel = useMemo(
+    () =>
+      assembleArtifactInput({
+        components,
+        links: productLinksForArtifact,
+        rules: artifactExtras.rules,
+        servingObject,
+        servingViewPresent: artifactExtras.servingViewPresent,
+      }),
+    [components, productLinksForArtifact, artifactExtras, servingObject]
+  );
+  const artifactStale = useMemo(() => {
+    if (!artifact?.model_json) return true;
+    try {
+      return artifactSignature(currentArtifactModel) !== artifactSignature(JSON.parse(artifact.model_json));
+    } catch {
+      return true;
+    }
+  }, [artifact, currentArtifactModel]);
+  useEffect(() => {
+    let cancelled = false;
+    void fetchArtifact(activeSchemaLabel, selectedProduct.product_name).then((a) => {
+      if (!cancelled) setArtifact(a);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [activeSchemaLabel, selectedProduct.product_name]);
+  const regenerateArtifact = useCallback(
+    async (opts?: { rules?: ArtifactRuleInput[]; servingViewPresent?: boolean }) => {
+      if (opts) setArtifactExtras((prev) => ({ ...prev, ...opts }));
+      const model = assembleArtifactInput({
+        components,
+        links: productLinksForArtifact,
+        rules: opts?.rules ?? artifactExtras.rules,
+        servingObject,
+        servingViewPresent: opts?.servingViewPresent ?? artifactExtras.servingViewPresent,
+      });
+      await generateArtifact(activeSchemaLabel, selectedProduct.product_name, model);
+      setArtifact(await fetchArtifact(activeSchemaLabel, selectedProduct.product_name));
+    },
+    [components, productLinksForArtifact, artifactExtras, servingObject, activeSchemaLabel, selectedProduct.product_name]
+  );
+  // auto-refresh: if an artifact already exists and drifts stale (curation / link /
+  // dashboard / rule change), regenerate it after a short debounce.
+  useEffect(() => {
+    if (!artifact || !artifactStale) return;
+    const t = setTimeout(() => void regenerateArtifact(), 1000);
+    return () => clearTimeout(t);
+  }, [artifact, artifactStale, regenerateArtifact]);
   const enterpriseGraph = useMemo(
     () => buildEnterpriseGraph(catalog, schema, conformance?.conformedTables, graphLinks),
     [catalog, schema, conformance, graphLinks]
@@ -1118,6 +1193,9 @@ export function ProductProvider({ children }: { children: ReactNode }) {
     enterpriseGraph,
     enterpriseHighlight,
     refreshGraphLinks,
+    artifact,
+    artifactStale,
+    regenerateArtifact,
     isolationKey: sig,
     syncScopeFromSections,
     setSyncScopeFromSections,

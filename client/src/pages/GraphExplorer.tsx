@@ -169,8 +169,23 @@ export function GraphExplorer() {
     syncScopeFromSections,
     catalogLoading,
     rebuilding,
+    artifact,
   } = useProduct();
-  const ontoData = components.ontologyGraph;
+  // Ontology + lineage tab is DRIVEN BY THE GENERATED ARTIFACT when present
+  // (the round-trip: derive → emit artifact → viewer consumes graph_json),
+  // falling back to the live derived graph before an artifact exists.
+  const ontoData = useMemo(() => {
+    if (artifact?.graph_json) {
+      try {
+        const g = JSON.parse(artifact.graph_json) as typeof components.ontologyGraph;
+        if (g && Array.isArray(g.elements) && g.elements.length) return g;
+      } catch {
+        /* fall back to live */
+      }
+    }
+    return components.ontologyGraph;
+  }, [artifact, components.ontologyGraph]);
+  const fromArtifact = Boolean(artifact?.graph_json);
   const productKey = selectedProduct.product_name;
 
   const [tab, setTab] = useState<'explore' | 'onto'>('explore');
@@ -317,7 +332,7 @@ export function GraphExplorer() {
           <Info className="h-3.5 w-3.5 mt-0.5 shrink-0" />
           {isExplore
             ? 'Explore: the full enterprise map (enterprise → domains → products → shared tables → metric views). Your domain/product selection is highlighted; the rest stays visible but dimmed. Click any node to center it and ring its neighbors (green = incoming, red = outgoing) and travel — even across a shared dimension to another product. Back / Overview returns to the full map.'
-            : 'Ontology + lineage: a per-product bird’s-eye map (source tables → serving view → product → KPIs). Click a node to highlight its connections. Drag to pan, scroll to zoom.'}
+            : `Ontology + lineage: a per-product bird’s-eye map (source tables → serving view → product → KPIs). Click a node to highlight its connections. Drag to pan, scroll to zoom.${fromArtifact ? ' Rendered from the generated ontology artifact (OWL/TTL).' : ''}`}
         </p>
       </div>
 
@@ -435,7 +450,7 @@ export function GraphExplorer() {
               </TabsContent>
               <TabsContent value="onto" className="m-0">
                 <CytoscapeCanvas
-                  key={`onto-${productKey}`}
+                  key={`onto-${productKey}-${artifact?.generated_at ?? 'live'}`}
                   elements={ontoData.elements}
                   style={ontoStyle}
                   layout={ONTO_LAYOUT}
