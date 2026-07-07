@@ -2,7 +2,7 @@
 // selected product's tables, with column mappings (role badges) and validation.
 // Validation queries the warehouse only for `live` products; others are clearly
 // labelled schema-derived (no live serving layer).
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Card,
   CardContent,
@@ -210,6 +210,9 @@ export function OntologyStudio() {
   // serving-view SQL live verification (EXPLAIN dry-run against the warehouse)
   const [viewCheck, setViewCheck] = useState<{ ok: boolean; error?: string } | null>(null);
   const [verifying, setVerifying] = useState(false);
+  // when the governed view already exists we collapse the DDL card (item 4); this
+  // lets the user expand it on demand to re-copy / re-verify.
+  const [showServingDdl, setShowServingDdl] = useState(false);
   // dismissible "How this works" stepper
   const [showSteps, setShowSteps] = useState(() => {
     try {
@@ -270,13 +273,17 @@ export function OntologyStudio() {
       product: selectedProduct.product_name,
       tables: productTables,
     });
-    // hide ones the user already rejected or already added
-    const rejected = new Set(
+    // hide ones the user already rejected or already accepted (added) — both
+    // are persisted as relationship overrides keyed by `${from}|${predicate}|${to}`,
+    // so an accepted suggestion never re-surfaces on the next Suggest run.
+    const excluded = new Set(
       ontologyOverrides
-        .filter((o) => o.kind === 'relationship' && o.action === 'reject')
+        .filter((o) => o.kind === 'relationship' && (o.action === 'reject' || o.action === 'add'))
         .map((o) => o.ref)
     );
-    const filtered = s.filter((x) => !rejected.has(`${x.from}|${x.predicate}|${x.to}`));
+    // also exclude anything already present as a confirmed/derived relationship
+    for (const r of relationships) excluded.add(`${r.from[0]}|${r.predicate}|${r.to}`);
+    const filtered = s.filter((x) => !excluded.has(`${x.from}|${x.predicate}|${x.to}`));
     setSuggestions(filtered);
     setSuggestNote(
       filtered.length
@@ -345,6 +352,34 @@ export function OntologyStudio() {
     setViewCheck(await verifyViewSql(served.sql));
     setVerifying(false);
   };
+
+  // Governed serving-view presence — ONE stable check per serving object, lifted
+  // out of SchemaDerivedNotice (whose internal check re-ran on every render because
+  // it depended on an inline callback prop → the flicker loop). Results flow down.
+  const servingObject = contract.serving_object;
+  const [servingPresent, setServingPresent] = useState<boolean | null>(null);
+  const [servingChecking, setServingChecking] = useState(false);
+  const recheckServing = useCallback(async () => {
+    if (!servingObject) {
+      setServingPresent(null);
+      return;
+    }
+    setServingChecking(true);
+    const r = await checkServingView(servingObject);
+    setServingChecking(false);
+    setServingPresent(r.present);
+  }, [servingObject]);
+  useEffect(() => {
+    void recheckServing();
+  }, [recheckServing]);
+  // feed the flag into the artifact, but only when presence actually flips — the
+  // ref guard means a changing regenerateArtifact identity never re-triggers it.
+  const lastServingFed = useRef<boolean | null>(null);
+  useEffect(() => {
+    if (servingPresent === null || lastServingFed.current === servingPresent) return;
+    lastServingFed.current = servingPresent;
+    void regenerateArtifact({ servingViewPresent: servingPresent });
+  }, [servingPresent, regenerateArtifact]);
 
   if (catalogLoading) return <CatalogLoadingSkeleton label="Generating ontology…" />;
   if (rebuilding) return <CatalogLoadingSkeleton label="Rebuilding…" />;
@@ -466,8 +501,8 @@ export function OntologyStudio() {
           {roles.length > 0 && (
             <ToggleGroup
               type="multiple"
-              value={shownRoles}
-              onValueChange={(v) => setActiveRoles(v.length ? v : roles)}
+              value={activeRoles}
+              onValueChange={(v) => setActiveRoles(v)}
               variant="outline"
               size="sm"
             >
@@ -903,41 +938,74 @@ export function OntologyStudio() {
         )}
       </Card>
 
-      {/* item 3 — Generate serving view + contract (deferred DDL; preview/copy) */}
+      {/* item 3 — Generate serving view + contract (deferred DDL; preview/copy).
+          Collapses to a compact confirmation once the governed view exists (item 4). */}
+      {(() => {
+        const collapsed = servingPresent === true && !showServingDdl;
+        return (
       <Card className="shadow-sm">
         <CardHeader className="flex flex-row items-center justify-between gap-4">
           <div className="min-w-0">
             <CardTitle className="flex items-center gap-2">
               <FileCode className="h-4 w-4 text-primary" /> Serving view + contract
+              {servingPresent === true && (
+                <Badge variant="default" className="gap-1">
+                  <CheckCircle2 className="h-3 w-3" /> view exists
+                </Badge>
+              )}
             </CardTitle>
             <CardDescription>
-              A conformed <code>CREATE VIEW</code> from the fact table + confirmed relationships, plus
-              the derived data contract. Executing the DDL is deferred (needs a one-time CREATE grant):
-              preview, verify, and copy here; it is also in the exported brief.
+              {collapsed ? (
+                <>
+                  The governed view <code>{served.name}</code> already exists in the warehouse — no
+                  action needed. Expand to re-copy or re-verify the DDL after confirming new relationships.
+                </>
+              ) : (
+                <>
+                  A conformed <code>CREATE VIEW</code> from the fact table + confirmed relationships, plus
+                  the derived data contract. Executing the DDL is deferred (needs a one-time CREATE grant):
+                  preview, verify, and copy here; it is also in the exported brief.
+                </>
+              )}
             </CardDescription>
           </div>
           <div className="flex items-center gap-2 shrink-0">
-            <Button
-              size="sm"
-              variant="outline"
-              className="gap-1.5"
-              disabled={verifying}
-              title="Dry-run the view's SELECT (EXPLAIN) against the warehouse — no view is created"
-              onClick={() => void runVerifyView()}
-            >
-              {verifying ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <ShieldCheck className="h-3.5 w-3.5" />}
-              Verify
-            </Button>
-            <Button
-              size="sm"
-              variant="outline"
-              className="gap-1.5"
-              onClick={() => void navigator.clipboard?.writeText(served.sql)}
-            >
-              Copy SQL
-            </Button>
+            {servingPresent === true && (
+              <Button
+                size="sm"
+                variant="ghost"
+                className="gap-1.5"
+                onClick={() => setShowServingDdl((v) => !v)}
+              >
+                {collapsed ? 'Show DDL' : 'Hide DDL'}
+              </Button>
+            )}
+            {!collapsed && (
+              <>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="gap-1.5"
+                  disabled={verifying}
+                  title="Dry-run the view's SELECT (EXPLAIN) against the warehouse — no view is created"
+                  onClick={() => void runVerifyView()}
+                >
+                  {verifying ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <ShieldCheck className="h-3.5 w-3.5" />}
+                  Verify
+                </Button>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="gap-1.5"
+                  onClick={() => void navigator.clipboard?.writeText(served.sql)}
+                >
+                  Copy SQL
+                </Button>
+              </>
+            )}
           </div>
         </CardHeader>
+        {!collapsed && (
         <CardContent className="space-y-2">
           <div className="flex items-start gap-1.5 rounded-md bg-muted/40 p-2 text-xs text-muted-foreground">
             <Info className="h-3.5 w-3.5 mt-0.5 shrink-0 text-primary" />
@@ -974,7 +1042,10 @@ export function OntologyStudio() {
             Contract serving object: <code>{contract.serving_object}</code> · grain: {contract.grain}
           </div>
         </CardContent>
+        )}
       </Card>
+        );
+      })()}
 
       {/* ontology artifact (OWL/TTL + JSON-LD) — the file that drives the Ontology Explorer */}
       <OntologyArtifactCard
@@ -1014,7 +1085,9 @@ export function OntologyStudio() {
               columnCount={mappings.length}
               sourceCatalog={activeSourceCatalog}
               servingObject={contract.serving_object}
-              onServingPresent={(present) => void regenerateArtifact({ servingViewPresent: present })}
+              present={servingPresent}
+              checking={servingChecking}
+              onRecheck={() => void recheckServing()}
             />
           )}
         </CardContent>
@@ -1028,28 +1101,20 @@ function SchemaDerivedNotice({
   columnCount,
   sourceCatalog,
   servingObject,
-  onServingPresent,
+  present,
+  checking,
+  onRecheck,
 }: {
   tableCount: number;
   columnCount: number;
   sourceCatalog?: string | null;
   servingObject?: string;
-  onServingPresent?: (present: boolean) => void;
+  // presence is checked once by the parent (stable) and passed in — this keeps
+  // the notice a pure view and avoids the render/check flicker loop.
+  present: boolean | null;
+  checking: boolean;
+  onRecheck: () => void;
 }) {
-  // live check: does the governed serving view actually exist in the warehouse?
-  const [present, setPresent] = useState<boolean | null>(null);
-  const [checking, setChecking] = useState(false);
-  const runCheck = useCallback(async () => {
-    if (!servingObject) return;
-    setChecking(true);
-    const r = await checkServingView(servingObject);
-    setChecking(false);
-    setPresent(r.present);
-    onServingPresent?.(r.present);
-  }, [servingObject, onServingPresent]);
-  useEffect(() => {
-    void runCheck();
-  }, [runCheck]);
   return (
     <div className="space-y-3">
       <div className="flex items-start gap-2 rounded-md bg-muted/50 p-3 text-sm">
@@ -1086,7 +1151,7 @@ function SchemaDerivedNotice({
         </TableBody>
       </Table>
       <div className="flex items-center gap-2">
-        <Button size="sm" variant="outline" className="gap-1.5" disabled={checking || !servingObject} onClick={() => void runCheck()}>
+        <Button size="sm" variant="outline" className="gap-1.5" disabled={checking || !servingObject} onClick={onRecheck}>
           {checking ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <ShieldCheck className="h-3.5 w-3.5" />}
           Recheck serving view
         </Button>

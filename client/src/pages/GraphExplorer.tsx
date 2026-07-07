@@ -32,6 +32,30 @@ import type { CyStyle } from '../lib/cytoscape';
 // canvas gets the majority of the screen
 const CANVAS_HEIGHT = 760;
 
+// Wrap long, underscore-heavy entity names so they fit inside a node box. Cytoscape's
+// `text-wrap: wrap` only breaks on whitespace/newlines — never inside an underscored
+// token like `jai_inventory_event` — so we greedily pack underscore-separated segments
+// into ~14-char lines (keeping the underscores as visible continuation markers).
+function wrapNodeLabel(raw: unknown): string {
+  const label = typeof raw === 'string' ? raw : String(raw ?? '');
+  if (label.length <= 16 || label.includes(' ')) return label;
+  const parts = label.split('_');
+  const lines: string[] = [];
+  let cur = '';
+  for (const p of parts) {
+    const next = cur ? `${cur}_${p}` : p;
+    if (next.length > 14 && cur) {
+      lines.push(`${cur}_`);
+      cur = p;
+    } else {
+      cur = next;
+    }
+  }
+  if (cur) lines.push(cur);
+  return lines.join('\n');
+}
+const labelMapper = (ele: { data: (k: string) => unknown }) => wrapNodeLabel(ele.data('label'));
+
 // ---------- Tab 1 (travel) stylesheet ---------------------------------------
 const travelStyle: CyStyle[] = [
   {
@@ -42,7 +66,7 @@ const travelStyle: CyStyle[] = [
       'background-opacity': 0.9,
       'border-width': 2,
       'border-color': '#ffffff',
-      label: 'data(label)',
+      label: labelMapper,
       'font-size': 11,
       'font-weight': 600,
       color: '#ffffff',
@@ -110,7 +134,7 @@ const ontoStyle: CyStyle[] = [
       shape: 'round-rectangle',
       'background-color': '#ffffff',
       'border-width': 2,
-      label: 'data(label)',
+      label: labelMapper,
       'font-size': 10,
       'font-weight': 600,
       color: '#0f172a',
