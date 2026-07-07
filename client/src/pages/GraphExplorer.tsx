@@ -151,6 +151,10 @@ const ontoStyle: CyStyle[] = [
   { selector: '.kind-view', style: { 'border-color': ONTO_KIND_COLOR.view } },
   { selector: '.kind-product', style: { 'border-color': ONTO_KIND_COLOR.product } },
   { selector: '.kind-kpi', style: { 'border-color': ONTO_KIND_COLOR.kpi } },
+  // attached tool links (Genie / AI-BI dashboard) — filled chips so they read as
+  // destinations, not entities
+  { selector: '.kind-genie', style: { 'border-color': ONTO_KIND_COLOR.genie, 'background-color': ONTO_KIND_COLOR.genie, color: '#ffffff' } },
+  { selector: '.kind-dashboard', style: { 'border-color': ONTO_KIND_COLOR.dashboard, 'background-color': ONTO_KIND_COLOR.dashboard, color: '#ffffff' } },
   {
     selector: '.onto-edge',
     style: {
@@ -194,21 +198,55 @@ export function GraphExplorer() {
     catalogLoading,
     rebuilding,
     artifact,
+    productLinks,
   } = useProduct();
   // Ontology + lineage tab is DRIVEN BY THE GENERATED ARTIFACT when present
   // (the round-trip: derive → emit artifact → viewer consumes graph_json),
-  // falling back to the live derived graph before an artifact exists.
+  // falling back to the live derived graph before an artifact exists. Attached
+  // Genie/dashboard links are overlaid LIVE from context so they appear (and
+  // update) the moment you attach one — independent of artifact regen timing.
   const ontoData = useMemo(() => {
+    let base = components.ontologyGraph;
     if (artifact?.graph_json) {
       try {
         const g = JSON.parse(artifact.graph_json) as typeof components.ontologyGraph;
-        if (g && Array.isArray(g.elements) && g.elements.length) return g;
+        if (g && Array.isArray(g.elements) && g.elements.length) base = g;
       } catch {
         /* fall back to live */
       }
     }
-    return components.ontologyGraph;
-  }, [artifact, components.ontologyGraph]);
+    if (!productLinks.length) return base;
+    const elements = [...base.elements];
+    const nodes = { ...base.nodes };
+    const productNode =
+      elements.find((e) => e.group === 'nodes' && String(e.classes ?? '').includes('kind-product'))?.data.id ??
+      'o:product';
+    productLinks.forEach((l, i) => {
+      const kind = l.link_type === 'dashboard' ? 'dashboard' : 'genie';
+      const id = `o:link:${kind}:${i}`;
+      const label = l.label || (kind === 'dashboard' ? 'AI/BI dashboard' : 'Genie Space');
+      elements.push({
+        group: 'nodes',
+        data: { id, label, kind },
+        classes: `onto-node kind-${kind}`,
+        position: { x: 80 + 4 * 250, y: 60 + i * 84 },
+      });
+      elements.push({
+        group: 'edges',
+        data: { id: `oe:link:${i}`, source: productNode, target: id, label: kind === 'dashboard' ? 'monitored by' : 'explore in' },
+        classes: 'onto-edge',
+      });
+      nodes[id] = {
+        id,
+        label,
+        kind,
+        kindLabel: kind === 'dashboard' ? 'AI/BI dashboard' : 'Genie Space',
+        detail: l.url,
+        openUrl: l.url,
+      };
+    });
+    return { elements, nodes };
+  }, [artifact, components.ontologyGraph, productLinks]);
   const fromArtifact = Boolean(artifact?.graph_json);
   const productKey = selectedProduct.product_name;
 

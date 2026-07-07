@@ -1,5 +1,5 @@
 import { createApp, analytics, server, serving, getWorkspaceClient } from '@databricks/appkit';
-import { randomUUID } from 'node:crypto';
+import { randomUUID, createHash } from 'node:crypto';
 import {
   demoExceptionSql,
   demoAggregateSql,
@@ -830,7 +830,10 @@ createApp({
           return;
         }
         const decidedBy = await whoami();
-        const actionId = `act_${Date.now().toString(36)}_${randomUUID().slice(0, 8)}`;
+        // Deterministic id from product+issue so re-deciding a regenerated (non-
+        // persisted) exception UPSERTS instead of creating a duplicate log row.
+        const dedupKey = `${String(b.product ?? '')}|${String(b.issue ?? '')}`;
+        const actionId = `act_${createHash('sha1').update(dedupKey).digest('hex').slice(0, 16)}`;
         const conf = typeof b.confidence === 'number' ? (b.confidence as number) : Number(b.confidence) || 0;
         try {
           await lbQuery(
@@ -838,7 +841,11 @@ createApp({
               `(action_id, created_at, updated_at, schema_label, domain, product, source, priority, ` +
               `issue, root_cause, recommended_action, confidence, decision, track_status, decided_by, ` +
               `decided_at, ref_entity, notes) VALUES (` +
-              `$1, now(), now(), $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'open', $12, now(), $13, $14)`,
+              `$1, now(), now(), $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'open', $12, now(), $13, $14) ` +
+              `ON CONFLICT (action_id) DO UPDATE SET updated_at = now(), priority = EXCLUDED.priority, ` +
+              `root_cause = EXCLUDED.root_cause, recommended_action = EXCLUDED.recommended_action, ` +
+              `confidence = EXCLUDED.confidence, decision = EXCLUDED.decision, decided_by = EXCLUDED.decided_by, ` +
+              `decided_at = now()`,
             [
               actionId,
               String(b.schema_label ?? ''),

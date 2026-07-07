@@ -188,6 +188,8 @@ export const ONTO_KIND_COLOR: Record<string, string> = {
   view: '#0891b2',
   product: '#7c3aed',
   kpi: '#16a34a',
+  genie: '#9333ea', // purple — Genie Space
+  dashboard: '#ea580c', // orange — AI/BI dashboard
 };
 export const ONTO_KIND_LABEL = KIND_LABEL;
 

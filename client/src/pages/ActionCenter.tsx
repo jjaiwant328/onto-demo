@@ -37,7 +37,7 @@ import {
   useAnalyticsQuery,
 } from '@databricks/appkit-ui/react';
 import { sql } from '@databricks/appkit-ui/js';
-import { CheckCircle2, XCircle, Pencil, Zap, AlertTriangle, Info, Database, Loader2, FileDown, MessageSquare, Sparkles } from 'lucide-react';
+import { CheckCircle2, XCircle, Pencil, Zap, AlertTriangle, Info, Database, Loader2, FileDown, MessageSquare, Sparkles, ChevronDown, ChevronRight } from 'lucide-react';
 import { useProduct } from '../lib/product';
 import { fetchProductLinks, attachLink, deleteLink, type ProductLink } from '../lib/productLinks';
 import { useActions, buildExceptionActions, mergeLlmActions, simulatedTrail, type ActionItem, type OpportunityRow } from '../lib/actions';
@@ -45,7 +45,6 @@ import { componentsSummary } from '../lib/summary';
 import {
   logAction,
   fetchActionLog,
-  updateActionStatus,
   type LogContext,
   type LoggedAction,
 } from '../lib/actionLog';
@@ -177,12 +176,13 @@ export function ActionCenter() {
   );
 }
 
-// Action Log tracker — lists logged actions with decision + track_status and
-// controls to advance open → in_progress → done.
+// Action Log tracker — lists persisted decisions (deduped by product+issue), each
+// row expandable to the full issue / root cause / recommended action detail.
 function ActionLogTracker({ product }: { product: string }) {
   const [rows, setRows] = useState<LoggedAction[]>([]);
   const [loading, setLoading] = useState(false);
   const [scopeToProduct, setScopeToProduct] = useState(true);
+  const [expandedId, setExpandedId] = useState<string | null>(null);
 
   const load = React.useCallback(async () => {
     setLoading(true);
@@ -195,20 +195,13 @@ function ActionLogTracker({ product }: { product: string }) {
     void load();
   }, [load]);
 
-  const advance = async (r: LoggedAction) => {
-    const next: LoggedAction['track_status'] =
-      r.track_status === 'open' ? 'in_progress' : r.track_status === 'in_progress' ? 'done' : 'done';
-    const ok = await updateActionStatus(r.action_id, next as 'open' | 'in_progress' | 'done');
-    if (ok) void load();
-  };
-
   return (
     <Card className="shadow-sm">
       <CardHeader>
         <div className="flex items-center justify-between gap-3">
           <div>
             <CardTitle className="text-base">Action log</CardTitle>
-            <CardDescription>Persisted decisions from jai_action_log — newest first.</CardDescription>
+            <CardDescription>Persisted decisions from jai_action_log — one row per issue (re-deciding updates it), newest first. Click an issue for detail.</CardDescription>
           </div>
           <div className="flex items-center gap-3">
             <label className="flex items-center gap-1.5 text-xs cursor-pointer">
@@ -231,37 +224,53 @@ function ActionLogTracker({ product }: { product: string }) {
             <TableHeader>
               <TableRow>
                 <TableHead>Issue</TableHead>
+                <TableHead>Source</TableHead>
                 <TableHead>Product</TableHead>
                 <TableHead>Decision</TableHead>
-                <TableHead>Track</TableHead>
                 <TableHead>By</TableHead>
-                <TableHead />
+                <TableHead>Decided</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
-              {rows.map((r) => (
-                <TableRow key={r.action_id}>
-                  <TableCell className="max-w-[280px]">
-                    <div className="font-medium truncate">{r.issue}</div>
-                    <div className="text-xs text-muted-foreground truncate">{r.recommended_action}</div>
+              {rows.map((r) => {
+                const open = expandedId === r.action_id;
+                return (
+                <React.Fragment key={r.action_id}>
+                <TableRow className="cursor-pointer" onClick={() => setExpandedId(open ? null : r.action_id)}>
+                  <TableCell className="max-w-[320px]">
+                    <div className="font-medium flex items-center gap-1">
+                      {open ? <ChevronDown className="h-3.5 w-3.5 shrink-0" /> : <ChevronRight className="h-3.5 w-3.5 shrink-0" />}
+                      <span className={open ? '' : 'truncate'}>{r.issue}</span>
+                    </div>
+                  </TableCell>
+                  <TableCell className="text-xs">
+                    {r.source ? <Badge variant="outline" className="text-[10px]">{r.source}</Badge> : null}
                   </TableCell>
                   <TableCell className="text-xs">{r.product}</TableCell>
                   <TableCell>
-                    <Badge variant={r.decision === 'rejected' ? 'outline' : 'default'}>{r.decision}</Badge>
-                  </TableCell>
-                  <TableCell>
-                    <Badge variant="secondary">{r.track_status}</Badge>
+                    <Badge variant={r.decision === 'rejected' ? 'outline' : r.decision === 'modified' ? 'secondary' : 'default'}>{r.decision}</Badge>
                   </TableCell>
                   <TableCell className="text-xs text-muted-foreground">{r.decided_by}</TableCell>
-                  <TableCell>
-                    {r.track_status !== 'done' && (
-                      <Button size="sm" variant="ghost" className="text-xs" onClick={() => advance(r)}>
-                        {r.track_status === 'open' ? 'Start' : 'Complete'}
-                      </Button>
-                    )}
-                  </TableCell>
+                  <TableCell className="text-xs text-muted-foreground">{r.decided_at ?? r.created_at}</TableCell>
                 </TableRow>
-              ))}
+                {open && (
+                  <TableRow>
+                    <TableCell colSpan={6} className="bg-muted/30">
+                      <div className="space-y-1.5 py-1 text-sm">
+                        {r.priority && (
+                          <div><span className="font-semibold">Priority: </span><Badge variant={priorityVariant(r.priority)} className="text-[10px]">{r.priority}</Badge>
+                          {typeof r.confidence === 'number' && <span className="ml-2 text-xs text-muted-foreground">confidence {Math.round((r.confidence ?? 0) * 100)}%</span>}</div>
+                        )}
+                        <div><span className="font-semibold">Issue: </span><span className="text-muted-foreground">{r.issue}</span></div>
+                        <div><span className="font-semibold">Root cause: </span><span className="text-muted-foreground">{r.root_cause || '—'}</span></div>
+                        <div><span className="font-semibold">Recommended action: </span><span className="text-muted-foreground">{r.recommended_action || '—'}</span></div>
+                      </div>
+                    </TableCell>
+                  </TableRow>
+                )}
+                </React.Fragment>
+                );
+              })}
             </TableBody>
           </Table>
         )}
@@ -876,6 +885,9 @@ function ActionCard({
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(action.recommended_action);
   const [logNote, setLogNote] = useState<string | null>(null);
+  // single most-relevant investigation link: prefer the Genie space (works for any
+  // exception), else the first dashboard.
+  const primaryLink = reviewLinks.find((l) => l.link_type === 'genie') ?? reviewLinks[0];
 
   const update = (patch: Partial<ActionItem>) =>
     setQueue((prev) => prev.map((q) => (q.id === action.id ? { ...q, ...patch } : q)));
@@ -907,7 +919,16 @@ function ActionCard({
         <div className="flex items-start justify-between gap-3">
           <CardTitle className="text-base flex items-center gap-2 flex-wrap">
             <Badge variant={priorityVariant(action.priority)}>{action.priority}</Badge>
-            {action.source === 'scenario' && <Badge variant="secondary">Scenario</Badge>}
+            {action.source === 'exception' && (
+              <Badge variant="default" className="gap-1">
+                <Database className="h-3 w-3" /> Data exception
+              </Badge>
+            )}
+            {action.source === 'scenario' && (
+              <Badge variant="secondary" className="gap-1">
+                <Zap className="h-3 w-3" /> Scenario
+              </Badge>
+            )}
             {action.source === 'copilot' && <Badge variant="secondary">Copilot</Badge>}
             {action.llm ? (
               <Badge variant="outline" className="gap-1 text-[10px] font-normal">
@@ -962,23 +983,22 @@ function ActionCard({
           </span>
         </div>
 
-        {/* review the supporting data before deciding */}
-        {reviewLinks.length > 0 && action.status !== 'approved' && (
+        {/* one most-relevant investigation link (the product's Genie space is the
+            general-purpose tool for any exception; else a dashboard) — the full set
+            lives once at the top of the page (Further analysis). */}
+        {primaryLink && action.status !== 'approved' && (
           <div className="flex flex-wrap items-center gap-2 pt-0.5">
             <span className="text-[11px] text-muted-foreground">Review before approving:</span>
-            {reviewLinks.map((l) => (
-              <Button
-                key={l.link_id}
-                size="sm"
-                variant="outline"
-                className="h-7 gap-1.5 text-xs"
-                onClick={() => window.open(l.url, '_blank')}
-              >
-                {l.link_type === 'dashboard' ? <Zap className="h-3.5 w-3.5" /> : <MessageSquare className="h-3.5 w-3.5" />}
-                {l.link_type === 'dashboard' ? 'Open dashboard' : 'Open in Genie'}
-                {l.label ? ` · ${l.label}` : ''}
-              </Button>
-            ))}
+            <Button
+              size="sm"
+              variant="outline"
+              className="h-7 gap-1.5 text-xs"
+              onClick={() => window.open(primaryLink.url, '_blank')}
+            >
+              {primaryLink.link_type === 'dashboard' ? <Zap className="h-3.5 w-3.5" /> : <MessageSquare className="h-3.5 w-3.5" />}
+              {primaryLink.link_type === 'dashboard' ? 'Open dashboard' : 'Open in Genie'}
+              {primaryLink.label ? ` · ${primaryLink.label}` : ''}
+            </Button>
           </div>
         )}
 

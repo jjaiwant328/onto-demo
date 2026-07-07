@@ -156,6 +156,9 @@ export type ProductContextValue = {
   // re-fetch product links (Genie/dashboard) overlaid on the enterprise graph.
   // Call after attaching/detaching a link so the graph reflects it without a reload.
   refreshGraphLinks: () => Promise<void>;
+  // attached Genie/dashboard links for the SELECTED product (live from Lakebase);
+  // overlaid onto the ontology+lineage graph so they appear/update without a reload.
+  productLinks: GraphProductLink[];
   // generated ontology artifact (OWL/TTL + JSON-LD + graph) for the selected product
   artifact: StoredArtifact | null;
   artifactStale: boolean;
@@ -1193,6 +1196,7 @@ export function ProductProvider({ children }: { children: ReactNode }) {
     enterpriseGraph,
     enterpriseHighlight,
     refreshGraphLinks,
+    productLinks: productLinksForArtifact,
     artifact,
     artifactStale,
     regenerateArtifact,

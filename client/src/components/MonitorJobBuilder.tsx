@@ -58,6 +58,8 @@ export function MonitorJobBuilder({ domain, domainLabel }: { domain: string; dom
   const [version, setVersion] = useState<number | null>(null);
   const [saving, setSaving] = useState(false);
   const [running, setRunning] = useState(false);
+  const [runNote, setRunNote] = useState<string | null>(null);
+  const [saveNote, setSaveNote] = useState<string | null>(null);
   // Genie / dashboard links attached in the ontology (Ontology Studio / Further
   // analysis) — used to make each monitored exception investigable.
   const [links, setLinks] = useState<ProductLink[]>([]);
@@ -129,6 +131,7 @@ export function MonitorJobBuilder({ domain, domainLabel }: { domain: string; dom
 
   const doSave = async () => {
     setSaving(true);
+    setSaveNote(null);
     const r = await saveMonitorJob({
       domain,
       schedule_cron: cron,
@@ -139,15 +142,36 @@ export function MonitorJobBuilder({ domain, domainLabel }: { domain: string; dom
     if (r.ok) {
       setVersion(r.version ?? null);
       if (r.job_name) setJobName(r.job_name);
+      const label = CRON_PRESETS.find((c) => c.value === cron)?.label ?? cron;
+      setSaveNote(`Saved v${r.version ?? 1} · scheduled "${label}" (${cron}). Definition persisted to jai_monitor_job.`);
+    } else {
+      setSaveNote(`Save failed: ${r.error ?? 'unknown'}`);
     }
   };
 
   const doRun = async () => {
     setRunning(true);
-    await runMonitorJob(domain, 'on_demand');
+    setRunNote(null);
+    const r = await runMonitorJob(domain, 'on_demand');
     await loadRuns();
     setRunning(false);
+    if (r.ok) {
+      const res = r.results ?? [];
+      const statusOf = (x: Record<string, unknown>) => String(x.status ?? '');
+      const breaches = res.filter((x) => statusOf(x) === 'breach').length;
+      const errs = res.filter((x) => statusOf(x) === 'error').length;
+      setRunNote(
+        `Batch run complete at ${new Date().toLocaleString()} — ${res.length} product(s), ` +
+          `${breaches} breach(es)${errs ? `, ${errs} error(s)` : ''}. Logged to jai_monitor_run` +
+          `${r.run_id ? ` (run ${r.run_id})` : ''}. See Run history below.`
+      );
+    } else {
+      setRunNote(`Run failed: ${r.error ?? 'unknown'}`);
+    }
   };
+
+  const scheduleLabel = CRON_PRESETS.find((c) => c.value === cron)?.label ?? cron;
+  const lastRun = runs[0]?.run_ts ?? null;
 
   const suggestions = [
     `Monitor the key aggregate metrics across all ${domainLabel} products`,
@@ -268,6 +292,36 @@ export function MonitorJobBuilder({ domain, domainLabel }: { domain: string; dom
             </div>
           </div>
 
+          {/* schedule + last-run status — everything about this job on one page */}
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 rounded-md border p-3 text-xs">
+            <div>
+              <div className="text-muted-foreground">Schedule</div>
+              <div className="font-medium">{scheduleLabel}</div>
+            </div>
+            <div>
+              <div className="text-muted-foreground">Status</div>
+              <div className="font-medium">{version != null ? `Saved v${version} · enabled` : 'Not saved yet'}</div>
+            </div>
+            <div>
+              <div className="text-muted-foreground">Last run</div>
+              <div className="font-medium">{lastRun ?? '—'}</div>
+            </div>
+            <div>
+              <div className="text-muted-foreground">Runs logged</div>
+              <div className="font-medium">{runs.length}</div>
+            </div>
+          </div>
+          {saveNote && (
+            <div className="flex items-start gap-1.5 rounded-md bg-muted/40 p-2 text-xs text-muted-foreground">
+              <Save className="h-3.5 w-3.5 mt-0.5 shrink-0 text-primary" /> {saveNote}
+            </div>
+          )}
+          {runNote && (
+            <div className="flex items-start gap-1.5 rounded-md bg-success/10 p-2 text-xs text-success">
+              <Play className="h-3.5 w-3.5 mt-0.5 shrink-0" /> {runNote}
+            </div>
+          )}
+
           {spec?.aggregates?.length ? (
             <div className="rounded-md border p-3 text-xs space-y-1">
               <div className="font-medium text-muted-foreground">Monitored aggregates</div>
@@ -343,6 +397,8 @@ export function MonitorJobBuilder({ domain, domainLabel }: { domain: string; dom
                 <TableBody>
                   {runs.map((r) => {
                     const rowLinks = linksForProduct(r.product);
+                    // one relevant destination per row (prefer the Genie space) — named
+                    const primary = rowLinks.find((l) => l.link_type === 'genie') ?? rowLinks[0];
                     const breach = r.status === 'breach' && (r.exception_total ?? 0) > 0;
                     return (
                     <TableRow key={r.run_id + r.product}>
@@ -359,21 +415,19 @@ export function MonitorJobBuilder({ domain, domainLabel }: { domain: string; dom
                       </TableCell>
                       <TableCell className="text-xs text-muted-foreground">{r.trigger}</TableCell>
                       <TableCell>
-                        {rowLinks.length > 0 ? (
-                          <div className="flex flex-wrap gap-1">
-                            {rowLinks.map((l) => (
-                              <Button
-                                key={l.link_id}
-                                size="sm"
-                                variant={breach ? 'outline' : 'ghost'}
-                                className="h-7 gap-1.5 text-xs"
-                                onClick={() => window.open(l.url, '_blank')}
-                              >
-                                {l.link_type === 'dashboard' ? <Zap className="h-3.5 w-3.5" /> : <MessageSquare className="h-3.5 w-3.5" />}
-                                {l.link_type === 'dashboard' ? 'Dashboard' : 'Genie'}
-                              </Button>
-                            ))}
-                          </div>
+                        {primary ? (
+                          <Button
+                            size="sm"
+                            variant={breach ? 'outline' : 'ghost'}
+                            className="h-7 gap-1.5 text-xs max-w-[220px]"
+                            title={primary.url}
+                            onClick={() => window.open(primary.url, '_blank')}
+                          >
+                            {primary.link_type === 'dashboard' ? <Zap className="h-3.5 w-3.5 shrink-0" /> : <MessageSquare className="h-3.5 w-3.5 shrink-0" />}
+                            <span className="truncate">
+                              {primary.label || (primary.link_type === 'dashboard' ? 'AI/BI dashboard' : 'Genie Space')}
+                            </span>
+                          </Button>
                         ) : (
                           <span className="text-[11px] text-muted-foreground italic">
                             attach a Genie space in the ontology
