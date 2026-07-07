@@ -147,6 +147,7 @@ export function Copilot() {
       root_cause: String(action.root_cause ?? ''),
       recommended_action: String(action.recommended_action ?? ''),
       confidence: typeof action.confidence === 'number' ? action.confidence : 0.5,
+      llm: true, // Copilot recommendations come from the model
       status: 'pending',
     };
     addAction(item);

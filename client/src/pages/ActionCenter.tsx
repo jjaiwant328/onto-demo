@@ -37,7 +37,7 @@ import {
   useAnalyticsQuery,
 } from '@databricks/appkit-ui/react';
 import { sql } from '@databricks/appkit-ui/js';
-import { CheckCircle2, XCircle, Pencil, Zap, AlertTriangle, Info, Database, Loader2, FileDown, MessageSquare } from 'lucide-react';
+import { CheckCircle2, XCircle, Pencil, Zap, AlertTriangle, Info, Database, Loader2, FileDown, MessageSquare, Sparkles } from 'lucide-react';
 import { useProduct } from '../lib/product';
 import { fetchProductLinks, attachLink, deleteLink, type ProductLink } from '../lib/productLinks';
 import { useActions, buildExceptionActions, mergeLlmActions, simulatedTrail, type ActionItem, type OpportunityRow } from '../lib/actions';
@@ -76,6 +76,17 @@ export function ActionCenter() {
     domain: selectedDomain?.label ?? '',
     product: selectedProduct.display_name,
   };
+
+  // Attached Genie / dashboard links for this product — lifted here so both the
+  // Further-analysis panel AND each action card ("Review before approving") share
+  // one source of truth and stay in sync after an attach/remove.
+  const [productLinks, setProductLinks] = useState<ProductLink[]>([]);
+  const reloadLinks = React.useCallback(async () => {
+    setProductLinks(await fetchProductLinks(selectedProduct.display_name));
+  }, [selectedProduct.display_name]);
+  useEffect(() => {
+    void reloadLinks();
+  }, [reloadLinks]);
 
   // Reset the Action Center whenever the SCOPE (schema/domain/product) changes so
   // no previous product's generated actions/analysis linger. Keyed like the
@@ -124,6 +135,8 @@ export function ActionCenter() {
               schemaLabel={schemaLabel}
               domain={selectedDomain?.label ?? ''}
               backingTables={selectedProduct.fact_tables ?? []}
+              links={productLinks}
+              onChanged={reloadLinks}
             />
           )}
 
@@ -143,7 +156,7 @@ export function ActionCenter() {
 
           <ScenarioPanel onActions={(items) => items.forEach(addAction)} />
 
-          <QueueList queue={queue} setQueue={setQueue} logCtx={logCtx} />
+          <QueueList queue={queue} setQueue={setQueue} logCtx={logCtx} reviewLinks={productLinks} />
         </TabsContent>
 
         <TabsContent value="log" className="mt-4">
@@ -334,6 +347,7 @@ function DataExceptionsPanel({
         root_cause: String(a.root_cause ?? ''),
         recommended_action: String(a.recommended_action ?? ''),
         confidence: typeof a.confidence === 'number' ? a.confidence : 0.6,
+        llm: Boolean(d.llm), // recommendation is LLM-summarized when the model ran
         status: 'pending',
       }));
       onSeed((prev) => [...items, ...prev.filter((p) => p.source !== 'exception')]);
@@ -497,24 +511,20 @@ function FurtherAnalysisPanel({
   schemaLabel,
   domain,
   backingTables,
+  links,
+  onChanged,
 }: {
   product: string;
   schemaLabel: string;
   domain: string;
   backingTables: string[];
+  links: ProductLink[];
+  onChanged: () => void | Promise<void>;
 }) {
-  const [links, setLinks] = useState<ProductLink[]>([]);
   const [showAttach, setShowAttach] = useState(false);
   const [url, setUrl] = useState('');
   const [label, setLabel] = useState('');
   const [note, setNote] = useState<string | null>(null);
-
-  const load = React.useCallback(async () => {
-    setLinks(await fetchProductLinks(product));
-  }, [product]);
-  useEffect(() => {
-    void load();
-  }, [load]);
 
   const attach = async () => {
     if (!url.trim()) return;
@@ -531,14 +541,14 @@ function FurtherAnalysisPanel({
       setLabel('');
       setShowAttach(false);
       setNote('Genie Space attached.');
-      void load();
+      void onChanged();
     } else {
       setNote(`Attach failed: ${r.error ?? 'unknown'}`);
     }
   };
 
   const remove = async (id: string) => {
-    if (await deleteLink(id)) void load();
+    if (await deleteLink(id)) void onChanged();
   };
 
   return (
@@ -753,6 +763,7 @@ function ScenarioPanel({ onActions }: { onActions: (items: ActionItem[]) => void
           root_cause: String(a.root_cause ?? ''),
           recommended_action: String(a.recommended_action ?? ''),
           confidence: typeof a.confidence === 'number' ? a.confidence : 0.5,
+          llm: true, // scenario actions are LLM-prioritized
           status: 'pending',
         }));
         onActions(items);
@@ -819,10 +830,12 @@ function QueueList({
   queue,
   setQueue,
   logCtx,
+  reviewLinks,
 }: {
   queue: ActionItem[];
   setQueue: React.Dispatch<React.SetStateAction<ActionItem[]>>;
   logCtx: LogContext;
+  reviewLinks: ProductLink[];
 }) {
   if (queue.length === 0) {
     return (
@@ -837,7 +850,7 @@ function QueueList({
   return (
     <div className="space-y-3">
       {queue.map((a) => (
-        <ActionCard key={a.id} action={a} setQueue={setQueue} logCtx={logCtx} />
+        <ActionCard key={a.id} action={a} setQueue={setQueue} logCtx={logCtx} reviewLinks={reviewLinks} />
       ))}
     </div>
   );
@@ -853,10 +866,12 @@ function ActionCard({
   action,
   setQueue,
   logCtx,
+  reviewLinks,
 }: {
   action: ActionItem;
   setQueue: React.Dispatch<React.SetStateAction<ActionItem[]>>;
   logCtx: LogContext;
+  reviewLinks: ProductLink[];
 }) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(action.recommended_action);
@@ -890,10 +905,19 @@ function ActionCard({
     <Card className="shadow-sm">
       <CardHeader className="pb-2">
         <div className="flex items-start justify-between gap-3">
-          <CardTitle className="text-base flex items-center gap-2">
+          <CardTitle className="text-base flex items-center gap-2 flex-wrap">
             <Badge variant={priorityVariant(action.priority)}>{action.priority}</Badge>
             {action.source === 'scenario' && <Badge variant="secondary">Scenario</Badge>}
             {action.source === 'copilot' && <Badge variant="secondary">Copilot</Badge>}
+            {action.llm ? (
+              <Badge variant="outline" className="gap-1 text-[10px] font-normal">
+                <Sparkles className="h-3 w-3" /> AI (LLM) recommendation
+              </Badge>
+            ) : (
+              <Badge variant="secondary" className="gap-1 text-[10px] font-normal">
+                <Database className="h-3 w-3" /> Data-derived (heuristic)
+              </Badge>
+            )}
             <span>{action.issue}</span>
           </CardTitle>
           <StatusBadge status={action.status} />
@@ -927,10 +951,41 @@ function ActionCard({
           )}
         </div>
 
+        {/* honest provenance split: the numbers are data, the prose is guidance */}
+        <div className="flex items-start gap-1.5 text-[11px] text-muted-foreground">
+          <Info className="h-3 w-3 mt-0.5 shrink-0" />
+          <span>
+            Issue, priority{action.opportunity_usd ? ' and $ opportunity' : ''} are{' '}
+            <span className="font-medium">data-derived</span>; root cause and recommended action are{' '}
+            <span className="font-medium">{action.llm ? 'AI (LLM) guidance' : 'heuristic guidance (no model)'}</span> —
+            review before approving.
+          </span>
+        </div>
+
+        {/* review the supporting data before deciding */}
+        {reviewLinks.length > 0 && action.status !== 'approved' && (
+          <div className="flex flex-wrap items-center gap-2 pt-0.5">
+            <span className="text-[11px] text-muted-foreground">Review before approving:</span>
+            {reviewLinks.map((l) => (
+              <Button
+                key={l.link_id}
+                size="sm"
+                variant="outline"
+                className="h-7 gap-1.5 text-xs"
+                onClick={() => window.open(l.url, '_blank')}
+              >
+                {l.link_type === 'dashboard' ? <Zap className="h-3.5 w-3.5" /> : <MessageSquare className="h-3.5 w-3.5" />}
+                {l.link_type === 'dashboard' ? 'Open dashboard' : 'Open in Genie'}
+                {l.label ? ` · ${l.label}` : ''}
+              </Button>
+            ))}
+          </div>
+        )}
+
         {action.trail && action.status === 'approved' && (
           <div className="rounded-md bg-success/10 border border-success/30 p-2 text-xs space-y-0.5">
             {action.trail.map((t, i) => (
-              <div key={i} className="text-success-foreground/90">
+              <div key={i} className="text-success font-medium">
                 {t}
               </div>
             ))}
