@@ -1099,6 +1099,13 @@ const SAMPLE_LINKS: {
     url: 'https://fe-vm-jai-classic-ws.cloud.databricks.com/dashboardsv3/01f1780f38a51b0ead8949891f7172e3/published',
     label: 'Demand Forecasting & Planning (sample AI/BI dashboard)',
   },
+  {
+    // QSR Supply Chain Control Tower domains → the Executive Command Center dashboard
+    match: (d) => d.startsWith('qsr_') && d !== 'qsr_demo',
+    link_type: 'dashboard',
+    url: 'https://fe-vm-jai-classic-ws.cloud.databricks.com/dashboardsv3/01f179a5593014b99153f9403cd82bf3/published',
+    label: 'Executive Command Center (QSR Supply Chain)',
+  },
 ];
 
 // Phase 5 — ontology reasoning rules for the selected QSR control-tower domain.
