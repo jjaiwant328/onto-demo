@@ -536,6 +536,17 @@ export const QSR_SC_REASONING_RULES: ReasoningRule[] = [
   },
 ];
 
+// Curated QSR subclass taxonomy: a class (by short name) → a superclass label
+// and the subclasses it specializes into. Emitted as rdfs:subClassOf axioms in
+// the ontology artifact (e.g. Ingredient → Chicken/Produce/Sauce/…). QSR layer;
+// engine stays generic (products without a taxonomy entry emit no subclasses).
+export const QSR_SUBCLASS_TAXONOMY: Record<string, { superclass: string; subclasses: string[] }> = {
+  jai_dim_ingredient: {
+    superclass: 'Ingredient',
+    subclasses: ['Chicken', 'Produce', 'Sauce', 'Beverage', 'Packaging', 'Dairy', 'Bread'],
+  },
+};
+
 // all data-backed domains (qsr_demo + qsr_sc control tower)
 export const ALL_DEMO_DOMAINS: DemoDomain[] = [...DEMO_DOMAINS, ...QSR_SC_DOMAINS];
 

@@ -4,8 +4,11 @@
 import {
   buildArtifactModel,
   type ArtifactInput,
+  type ArtifactClass,
+  type ArtifactSubclass,
   type OntologyArtifact,
 } from '../../../shared/ontologyArtifact';
+import { QSR_SUBCLASS_TAXONOMY } from '../../../shared/demoDomains';
 import type { DerivedComponents } from './deriveComponents';
 
 export type StoredArtifact = {
@@ -41,17 +44,31 @@ export function assembleArtifactInput(args: {
   servingViewPresent?: boolean;
 }): OntologyArtifact {
   const c = args.components;
+  const baseClasses: ArtifactClass[] = c.classes.map((k) => ({
+    name: k.class,
+    label: k.label,
+    comment: k.comment,
+    role: k.role,
+    definition: k.definition,
+    synonyms: k.synonyms,
+  }));
+  // curated subclass axioms: for any class in the taxonomy, emit its subclasses
+  // (e.g. jai_dim_ingredient → Chicken/Produce/…) and declare them as classes.
+  const subclassAxioms: ArtifactSubclass[] = [];
+  const subclassClasses: ArtifactClass[] = [];
+  for (const k of c.classes) {
+    const tax = QSR_SUBCLASS_TAXONOMY[k.class];
+    if (!tax) continue;
+    for (const sub of tax.subclasses) {
+      subclassAxioms.push({ child: sub, parent: k.class });
+      subclassClasses.push({ name: sub, label: sub, role: 'subclass', comment: `${tax.superclass} subclass` });
+    }
+  }
   const input: ArtifactInput = {
     product: c.productName,
     productLabel: c.productLabel,
-    classes: c.classes.map((k) => ({
-      name: k.class,
-      label: k.label,
-      comment: k.comment,
-      role: k.role,
-      definition: k.definition,
-      synonyms: k.synonyms,
-    })),
+    classes: [...baseClasses, ...subclassClasses],
+    subclassAxioms,
     datatypeProps: c.mappings.map((m) => ({
       domainClass: m.class,
       property: m.property,
