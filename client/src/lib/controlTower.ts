@@ -22,7 +22,18 @@ export type ControlTowerSummary = {
   issues_total: number;
   high: number;
   medium: number;
+  computed_at?: string | null;
 };
+
+// force a snapshot recompute (Refresh button); returns how many products refreshed
+export async function refreshControlTower(): Promise<{ ok: boolean; refreshed?: number; error?: string }> {
+  try {
+    const r = await fetch('/api/control-tower-refresh', { method: 'POST' });
+    return await r.json();
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : String(e) };
+  }
+}
 
 export async function fetchControlTowerSummary(domain?: string): Promise<ControlTowerSummary> {
   try {
@@ -35,9 +46,10 @@ export async function fetchControlTowerSummary(domain?: string): Promise<Control
       issues_total: Number(d?.issues_total ?? 0),
       high: Number(d?.high ?? 0),
       medium: Number(d?.medium ?? 0),
+      computed_at: d?.computed_at ?? null,
     };
   } catch {
-    return { products: [], health_score: 0, issues_total: 0, high: 0, medium: 0 };
+    return { products: [], health_score: 0, issues_total: 0, high: 0, medium: 0, computed_at: null };
   }
 }
 

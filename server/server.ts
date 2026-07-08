@@ -1765,133 +1765,153 @@ createApp({
       const sqlStr = (v: unknown) => `'${String(v ?? '').replace(/'/g, "''")}'`;
       // stat keys that signal a CRITICAL sub-count within a product's aggregate
       const CRITICAL_KEYS = ['critical_items', 'failures', 'outage_driven', 'severely_late', 'single_source_suppliers'];
-
-      // Cross-product "what needs attention today" over the QSR supply-chain spine.
-      // Runs each data-backed product's aggregate (the same SQL the Action Center and
-      // monitoring use) and returns a headline number + severity per product, plus a
-      // composite network-health score. Optional ?domain= narrows to one layer.
-      app.get('/api/control-tower-summary', async (req, res) => {
-        const domainFilter = String(req.query.domain ?? '').trim();
-        const products: { p: (typeof DEMO_PRODUCTS)[string]; domainName: string; domainLabel: string }[] = [];
-        for (const d of ALL_DEMO_DOMAINS) {
-          if (domainFilter && d.name !== domainFilter) continue;
-          for (const p of d.products) {
-            if (p.backing_schema !== QSR_SC_SCHEMA) continue; // supply-chain, data-backed
-            products.push({ p: { ...p, domainLabel: d.label }, domainName: d.name, domainLabel: d.label });
-          }
-        }
-        const cards = await Promise.all(
-          products.map(async ({ p, domainName, domainLabel }) => {
-            const sql = demoAggregateSql(p.product_name);
-            try {
-              const rows = sql ? await runSql(sql) : [];
-              const stats = (rows[0] ?? {}) as Record<string, unknown>;
-              const entries = Object.entries(stats);
-              const [headlineMetric, headlineRaw] = entries[0] ?? ['count', 0];
-              const headline = Number(headlineRaw) || 0;
-              const criticalKey = CRITICAL_KEYS.find((k) => Number(stats[k] ?? 0) > 0);
-              const severity = criticalKey ? 'high' : headline > 0 ? 'medium' : 'ok';
-              return {
-                product_name: p.product_name,
-                display_name: p.display_name,
-                business_outcome: p.business_outcome,
-                domain: domainName,
-                domain_label: domainLabel,
-                headline_metric: headlineMetric,
-                headline_value: headline,
-                critical_metric: criticalKey ?? null,
-                critical_value: criticalKey ? Number(stats[criticalKey] ?? 0) : 0,
-                kpis: stats,
-                severity,
-              };
-            } catch (err) {
-              return {
-                product_name: p.product_name,
-                display_name: p.display_name,
-                domain: domainName,
-                domain_label: domainLabel,
-                severity: 'unknown',
-                error: humanizeSqlError(err),
-                kpis: {},
-                headline_metric: '',
-                headline_value: 0,
-              };
-            }
-          })
-        );
-        const high = cards.filter((c) => c.severity === 'high').length;
-        const medium = cards.filter((c) => c.severity === 'medium').length;
-        // composite 0-100: start healthy, dock per product needing attention
-        const healthScore = Math.max(0, Math.min(100, 100 - high * 12 - medium * 5));
-        res.json({ products: cards, health_score: healthScore, issues_total: high + medium, high, medium });
-      });
-
-      // supply-chain (data-backed) products with their domain, reused by the inbox/ask
+      const humanizeKey = (k: string) => (k || '').replace(/_/g, ' ');
+      const QSR_GENIE_SPACE_ID = process.env.QSR_GENIE_SPACE_ID || '01f17a4306e818a183ff3f10237d5a56';
+      // supply-chain (data-backed) products with their domain
       const scProducts = () =>
         ALL_DEMO_DOMAINS.flatMap((d) =>
           d.products.filter((p) => p.backing_schema === QSR_SC_SCHEMA).map((p) => ({ p, domainName: d.name, domainLabel: d.label }))
         );
-      const humanizeKey = (k: string) => (k || '').replace(/_/g, ' ');
-      const QSR_GENIE_SPACE_ID = process.env.QSR_GENIE_SPACE_ID || '01f17a4306e818a183ff3f10237d5a56';
+
+      // Recompute the pre-aggregated snapshot: run each product's aggregate ONCE and
+      // upsert a single row per product. This is the ONLY path that scans the fact
+      // tables — the Home / Inbox / Ask all READ the snapshot, so those reads stay
+      // fast at any data volume. Invoked on demand (Refresh) or on a schedule.
+      const refreshControlTowerSnapshot = async (): Promise<number> => {
+        let n = 0;
+        for (const { p, domainName } of scProducts()) {
+          const sql = demoAggregateSql(p.product_name);
+          if (!sql) continue;
+          try {
+            const stats = ((await runSql(sql))[0] ?? {}) as Record<string, unknown>;
+            const [metric, raw] = Object.entries(stats)[0] ?? ['count', 0];
+            const headline = Number(raw) || 0;
+            const criticalKey = CRITICAL_KEYS.find((k) => Number(stats[k] ?? 0) > 0);
+            const severity = criticalKey ? 'high' : headline > 0 ? 'medium' : 'ok';
+            await lbQuery(
+              `INSERT INTO jai_control_tower_snapshot (product_name, domain, headline_metric, headline_value, ` +
+                `critical_metric, critical_value, severity, metrics_json, computed_at) ` +
+                `VALUES ($1,$2,$3,$4,$5,$6,$7,$8, now()) ON CONFLICT (product_name) DO UPDATE SET ` +
+                `domain=EXCLUDED.domain, headline_metric=EXCLUDED.headline_metric, headline_value=EXCLUDED.headline_value, ` +
+                `critical_metric=EXCLUDED.critical_metric, critical_value=EXCLUDED.critical_value, ` +
+                `severity=EXCLUDED.severity, metrics_json=EXCLUDED.metrics_json, computed_at=now()`,
+              [p.product_name, domainName, metric, headline, criticalKey ?? null,
+                criticalKey ? Number(stats[criticalKey] ?? 0) : 0, severity, JSON.stringify(stats)]
+            );
+            n++;
+          } catch {
+            /* skip a product that fails to aggregate */
+          }
+        }
+        return n;
+      };
+
+      type SnapRow = { product_name: string; domain: string; headline_metric: string; headline_value: number; critical_metric: string | null; critical_value: number; severity: string; metrics_json: string; computed_at: string };
+      // read the snapshot, building it lazily the first time it's empty
+      const readSnapshot = async (): Promise<SnapRow[]> => {
+        const q =
+          `SELECT product_name, domain, headline_metric, headline_value, critical_metric, critical_value, ` +
+          `severity, metrics_json, to_char(computed_at,'YYYY-MM-DD HH24:MI:SS') AS computed_at ` +
+          `FROM jai_control_tower_snapshot`;
+        let rows = (await lbQuery(q)) as unknown as SnapRow[];
+        if (!rows.length) {
+          await refreshControlTowerSnapshot();
+          rows = (await lbQuery(q)) as unknown as SnapRow[];
+        }
+        return rows;
+      };
+      const parseKpis = (s: string): Record<string, unknown> => {
+        try {
+          return JSON.parse(s || '{}');
+        } catch {
+          return {};
+        }
+      };
+
+      // Cross-product "what needs attention today" — READS the pre-aggregated snapshot
+      // (fast; no live fact-table scan). Optional ?domain= narrows to one layer.
+      app.get('/api/control-tower-summary', async (req, res) => {
+        const domainFilter = String(req.query.domain ?? '').trim();
+        try {
+          const rows = await readSnapshot();
+          const cards = rows
+            .map((r) => {
+              const meta = DEMO_PRODUCTS[r.product_name];
+              if (!meta) return null;
+              if (domainFilter && r.domain !== domainFilter) return null;
+              return {
+                product_name: r.product_name,
+                display_name: meta.display_name,
+                business_outcome: meta.business_outcome,
+                domain: r.domain,
+                domain_label: meta.domainLabel,
+                headline_metric: r.headline_metric,
+                headline_value: Number(r.headline_value) || 0,
+                critical_metric: r.critical_metric,
+                critical_value: Number(r.critical_value) || 0,
+                kpis: parseKpis(r.metrics_json),
+                severity: r.severity,
+              };
+            })
+            .filter((c): c is NonNullable<typeof c> => c !== null);
+          const high = cards.filter((c) => c.severity === 'high').length;
+          const medium = cards.filter((c) => c.severity === 'medium').length;
+          const healthScore = Math.max(0, Math.min(100, 100 - high * 12 - medium * 5));
+          const computedAt = rows.map((r) => r.computed_at).sort().slice(-1)[0] ?? null;
+          res.json({ products: cards, health_score: healthScore, issues_total: high + medium, high, medium, computed_at: computedAt, source: 'snapshot' });
+        } catch (err) {
+          res.json({ products: [], health_score: 0, issues_total: 0, high: 0, medium: 0, error: humanizeSqlError(err) });
+        }
+      });
+
+      // Force a snapshot recompute (the Home "Refresh" button / a scheduled job).
+      app.post('/api/control-tower-refresh', async (_req, res) => {
+        try {
+          const n = await refreshControlTowerSnapshot();
+          res.json({ ok: true, refreshed: n });
+        } catch (err) {
+          res.json({ ok: false, error: humanizeSqlError(err) });
+        }
+      });
 
       // Unified Action Inbox: one prioritized worklist across ALL supply-chain
-      // products (each product's aggregate → one actionable item, ranked by severity
-      // then size). Items needing no action (severity ok) are omitted. Reuses the
-      // curated playbook for the recommended action so it renders without the LLM.
+      // products — READS the pre-aggregated snapshot (no live scan), turns each
+      // needs-attention product into an actionable item ranked by severity then size,
+      // and layers the curated playbook so it renders without the LLM.
       app.get('/api/action-inbox', async (_req, res) => {
-        const items = await Promise.all(
-          scProducts().map(async ({ p, domainName, domainLabel }) => {
-            const sql = demoAggregateSql(p.product_name);
-            try {
-              const rows = sql ? await runSql(sql) : [];
-              const stats = (rows[0] ?? {}) as Record<string, unknown>;
-              const entries = Object.entries(stats);
-              const [metric, raw] = entries[0] ?? ['count', 0];
-              const headline = Number(raw) || 0;
-              const criticalKey = CRITICAL_KEYS.find((k) => Number(stats[k] ?? 0) > 0);
-              const severity = criticalKey ? 'high' : headline > 0 ? 'medium' : 'ok';
-              const pb = p.playbook ?? [];
+        try {
+          const rows = await readSnapshot();
+          const items = rows
+            .map((r) => {
+              const meta = DEMO_PRODUCTS[r.product_name];
+              if (!meta || r.severity === 'ok') return null;
+              const pb = meta.playbook ?? [];
+              const headline = Number(r.headline_value) || 0;
               return {
-                id: `inbox-${p.product_name}`,
-                product_name: p.product_name,
-                product_display: p.display_name,
-                domain: domainName,
-                domain_label: domainLabel,
-                severity,
-                priority: severity === 'high' ? 'HIGH' : severity === 'medium' ? 'MEDIUM' : 'LOW',
-                headline_metric: metric,
+                id: `inbox-${r.product_name}`,
+                product_name: r.product_name,
+                product_display: meta.display_name,
+                domain: r.domain,
+                domain_label: meta.domainLabel,
+                severity: r.severity,
+                priority: r.severity === 'high' ? 'HIGH' : r.severity === 'medium' ? 'MEDIUM' : 'LOW',
+                headline_metric: r.headline_metric,
                 headline_value: headline,
-                critical_metric: criticalKey ?? null,
-                critical_value: criticalKey ? Number(stats[criticalKey] ?? 0) : 0,
-                issue: `${headline.toLocaleString()} ${humanizeKey(metric)} — ${p.issue}`,
+                critical_metric: r.critical_metric,
+                critical_value: Number(r.critical_value) || 0,
+                issue: `${headline.toLocaleString()} ${humanizeKey(r.headline_metric)} — ${meta.issue}`,
                 root_cause: pb[0]?.root_cause ?? '',
-                recommended_action: pb[0]?.recommended_action ?? p.action_hint,
-                kpis: stats,
+                recommended_action: pb[0]?.recommended_action ?? meta.action_hint,
+                kpis: parseKpis(r.metrics_json),
               };
-            } catch (err) {
-              return {
-                id: `inbox-${p.product_name}`,
-                product_name: p.product_name,
-                product_display: p.display_name,
-                domain: domainName,
-                domain_label: domainLabel,
-                severity: 'ok',
-                priority: 'LOW',
-                headline_metric: '',
-                headline_value: 0,
-                issue: `Couldn't load — ${humanizeSqlError(err)}`,
-                root_cause: '',
-                recommended_action: '',
-                kpis: {},
-              };
-            }
-          })
-        );
-        const rank = { HIGH: 0, MEDIUM: 1, LOW: 2 } as Record<string, number>;
-        const actionable = items
-          .filter((i) => i.severity !== 'ok')
-          .sort((a, b) => (rank[a.priority] - rank[b.priority]) || b.headline_value - a.headline_value);
-        res.json({ items: actionable });
+            })
+            .filter((i): i is NonNullable<typeof i> => i !== null);
+          const rank = { HIGH: 0, MEDIUM: 1, LOW: 2 } as Record<string, number>;
+          items.sort((a, b) => (rank[a.priority] - rank[b.priority]) || b.headline_value - a.headline_value);
+          res.json({ items });
+        } catch (err) {
+          res.json({ items: [], error: humanizeSqlError(err) });
+        }
       });
 
       // Ask the Control Tower: a fast, grounded, CACHED answer over the LIVE
@@ -1908,18 +1928,15 @@ createApp({
           res.json({ answer: null, llm: false, reason: 'no serving endpoint configured' });
           return;
         }
-        // live grounding: one headline signal per product
+        // grounding from the pre-aggregated snapshot (no live scan)
         const signals: string[] = [];
-        for (const { p } of scProducts()) {
-          const sql = demoAggregateSql(p.product_name);
-          if (!sql) continue;
-          try {
-            const stats = ((await runSql(sql))[0] ?? {}) as Record<string, unknown>;
-            const [metric, raw] = Object.entries(stats)[0] ?? ['count', 0];
-            signals.push(`- ${p.display_name}: ${Number(raw) || 0} ${humanizeKey(metric)}`);
-          } catch {
-            /* skip a product that fails */
+        try {
+          for (const r of await readSnapshot()) {
+            const meta = DEMO_PRODUCTS[r.product_name];
+            signals.push(`- ${meta?.display_name ?? r.product_name}: ${Number(r.headline_value) || 0} ${humanizeKey(r.headline_metric)}`);
           }
+        } catch {
+          /* snapshot unavailable — answer with no signals */
         }
         const rolePrefix = role ? `You are advising the ${role} of a restaurant chain. ` : '';
         const prompt =

@@ -54,18 +54,22 @@ import { SchemaLoader } from './components/SchemaLoader';
 import { Copilot } from './components/Copilot';
 
 // always-on nav (ontology-focused)
-const NAV_BASE = [
+// Business mode: the decision surfaces a supply-chain domain expert uses daily.
+const NAV_BUSINESS = [
   { to: '/', label: 'Home' },
   { to: '/action-inbox', label: 'Action Inbox' },
   { to: '/scenario-impact', label: 'Scenario & Impact' },
+  { to: '/action-center', label: 'Action Center' },
+];
+// Builder mode adds the technical curation / governance tabs.
+const NAV_BUILDER = [
   { to: '/data-products', label: 'Data Products' },
   { to: '/ontology-studio', label: 'Ontology Studio' },
   { to: '/semantic-explorer', label: 'Semantic Explorer' },
   { to: '/graph-explorer', label: 'Graph Explorer' },
   { to: '/data-contract', label: 'Data Contract' },
 ];
-// optional nav entries, gated by settings toggles (default OFF)
-const NAV_ACTION_CENTER = { to: '/action-center', label: 'Action Center' };
+// optional, gated by a settings toggle
 const NAV_BUSINESS_VIEW = { to: '/business-view', label: 'Business View' };
 
 // in-session action queue provider (shared by Action Center + Copilot).
@@ -106,10 +110,10 @@ function NavLinks({
   linkClass: NavLinkClassFn;
   onClick?: () => void;
 }) {
-  const { showActionCenter, showBusinessView } = useProduct();
+  const { mode, showBusinessView } = useProduct();
   const nav = [
-    ...NAV_BASE,
-    ...(showActionCenter ? [NAV_ACTION_CENTER] : []),
+    ...NAV_BUSINESS,
+    ...(mode === 'builder' ? NAV_BUILDER : []),
     ...(showBusinessView ? [NAV_BUSINESS_VIEW] : []),
   ];
   return (
@@ -405,10 +409,10 @@ function ControlPanel() {
   );
 }
 
-// Settings — nav visibility toggles (Action Center + Business View, default OFF).
+// Settings — extra nav visibility toggle (Business View). Action Center is part of
+// Business mode; the technical tabs are revealed via the Business/Builder toggle.
 function SettingsMenu() {
-  const { showActionCenter, setShowActionCenter, showBusinessView, setShowBusinessView } =
-    useProduct();
+  const { showBusinessView, setShowBusinessView } = useProduct();
   return (
     <Popover>
       <PopoverTrigger asChild>
@@ -419,18 +423,36 @@ function SettingsMenu() {
       <PopoverContent className="w-64 p-3 space-y-2.5" align="start">
         <div className="text-xs font-medium text-muted-foreground">Show sections</div>
         <label className="flex items-center gap-2 text-sm cursor-pointer">
-          <Switch checked={showActionCenter} onCheckedChange={setShowActionCenter} />
-          Action Center
-        </label>
-        <label className="flex items-center gap-2 text-sm cursor-pointer">
           <Switch checked={showBusinessView} onCheckedChange={setShowBusinessView} />
           Business View
         </label>
         <p className="text-[11px] text-muted-foreground pt-1">
-          Off by default. Turn on to add these to the top navigation.
+          Use the Business / Builder toggle (top bar) to show or hide the technical
+          ontology tabs.
         </p>
       </PopoverContent>
     </Popover>
+  );
+}
+
+// Business / Builder audience toggle. Business (default) shows only the decision
+// surfaces; Builder reveals the technical curation tabs. Persisted via context.
+function ModeToggle() {
+  const { mode, setMode } = useProduct();
+  return (
+    <div className="flex items-center rounded-md border p-0.5 text-xs">
+      {(['business', 'builder'] as const).map((m) => (
+        <button
+          key={m}
+          onClick={() => setMode(m)}
+          className={`px-2 py-0.5 rounded capitalize transition-colors ${
+            mode === m ? 'bg-primary text-primary-foreground' : 'text-muted-foreground hover:text-foreground'
+          }`}
+        >
+          {m}
+        </button>
+      ))}
+    </div>
   );
 }
 
@@ -509,7 +531,8 @@ function Layout() {
             <div className="overflow-x-auto">
               <NavLinks className="flex gap-1 min-w-max" linkClass={navLinkClass} />
             </div>
-            <div className="ml-auto shrink-0">
+            <div className="ml-auto shrink-0 flex items-center gap-3">
+              <ModeToggle />
               <ScopeSyncToggle />
             </div>
           </div>

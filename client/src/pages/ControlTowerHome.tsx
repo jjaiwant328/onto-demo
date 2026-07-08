@@ -14,7 +14,7 @@ import {
 } from '@databricks/appkit-ui/react';
 import { AlertTriangle, CheckCircle2, ArrowRight, Activity, RefreshCw, ShieldAlert } from 'lucide-react';
 import { useProduct } from '../lib/product';
-import { fetchControlTowerSummary, humanizeMetric, type ControlTowerCard, type ControlTowerSummary } from '../lib/controlTower';
+import { fetchControlTowerSummary, refreshControlTower, humanizeMetric, type ControlTowerCard, type ControlTowerSummary } from '../lib/controlTower';
 import { AskControlTower } from '../components/AskControlTower';
 
 const SEV = {
@@ -33,6 +33,7 @@ export function ControlTowerHome() {
   const { setSelectedProduct, showActionCenter, setShowActionCenter } = useProduct();
   const [data, setData] = useState<ControlTowerSummary | null>(null);
   const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
 
   const load = () => {
     setLoading(true);
@@ -42,6 +43,18 @@ export function ControlTowerHome() {
     });
   };
   useEffect(load, []);
+
+  // Refresh RECOMPUTES the pre-aggregated snapshot (the one place that scans the
+  // facts), then re-reads it — mirroring what the scheduled job does in production.
+  const refresh = () => {
+    setRefreshing(true);
+    void refreshControlTower().then(() => {
+      void fetchControlTowerSummary().then((d) => {
+        setData(d);
+        setRefreshing(false);
+      });
+    });
+  };
 
   const openProduct = (c: ControlTowerCard) => {
     setSelectedProduct(c.product_name);
@@ -64,11 +77,12 @@ export function ControlTowerHome() {
         <div>
           <h2 className="text-2xl font-bold text-foreground">Control Tower</h2>
           <p className="text-muted-foreground">
-            What needs attention today across the QSR supply chain — live from the operational data.
+            What needs attention today across the QSR supply chain.
+            {data?.computed_at && <span className="text-xs"> · updated {data.computed_at}</span>}
           </p>
         </div>
-        <Button variant="outline" size="sm" className="gap-1.5 shrink-0" onClick={load} disabled={loading}>
-          <RefreshCw className={`h-4 w-4 ${loading ? 'animate-spin' : ''}`} /> Refresh
+        <Button variant="outline" size="sm" className="gap-1.5 shrink-0" onClick={refresh} disabled={loading || refreshing}>
+          <RefreshCw className={`h-4 w-4 ${loading || refreshing ? 'animate-spin' : ''}`} /> {refreshing ? 'Refreshing…' : 'Refresh'}
         </Button>
       </div>
 
