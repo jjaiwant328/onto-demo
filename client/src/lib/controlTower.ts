@@ -45,3 +45,57 @@ export async function fetchControlTowerSummary(domain?: string): Promise<Control
 export function humanizeMetric(key: string): string {
   return (key || '').replace(/_/g, ' ').replace(/\bpct\b/, '%').trim();
 }
+
+export type InboxItem = {
+  id: string;
+  product_name: string;
+  product_display: string;
+  domain: string;
+  domain_label: string;
+  severity: 'high' | 'medium' | 'ok';
+  priority: 'HIGH' | 'MEDIUM' | 'LOW';
+  headline_metric: string;
+  headline_value: number;
+  critical_metric?: string | null;
+  critical_value?: number;
+  issue: string;
+  root_cause: string;
+  recommended_action: string;
+  kpis: Record<string, unknown>;
+};
+
+export async function fetchActionInbox(): Promise<InboxItem[]> {
+  try {
+    const r = await fetch('/api/action-inbox');
+    const d = await r.json();
+    return Array.isArray(d?.items) ? d.items : [];
+  } catch {
+    return [];
+  }
+}
+
+export async function askControlTower(
+  question: string,
+  role?: string
+): Promise<{ answer: string | null; llm: boolean; reason?: string }> {
+  try {
+    const r = await fetch('/api/control-tower-ask', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ question, role }),
+    });
+    return await r.json();
+  } catch (e) {
+    return { answer: null, llm: false, reason: e instanceof Error ? e.message : String(e) };
+  }
+}
+
+export async function fetchControlTowerConfig(): Promise<{ genie_url: string; llm: boolean }> {
+  try {
+    const r = await fetch('/api/control-tower-config');
+    const d = await r.json();
+    return { genie_url: String(d?.genie_url ?? ''), llm: Boolean(d?.llm) };
+  } catch {
+    return { genie_url: '', llm: false };
+  }
+}

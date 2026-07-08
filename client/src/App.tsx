@@ -39,6 +39,7 @@ import {
 import { ProductProvider, useProduct, ALL_SCOPE } from './lib/product';
 import { ActionsContext, type ActionItem } from './lib/actions';
 import { ControlTowerHome } from './pages/ControlTowerHome';
+import { ActionInbox } from './pages/ActionInbox';
 import { ScenarioImpact } from './pages/ScenarioImpact';
 import { DataProducts } from './pages/DataProducts';
 import { OntologyStudio } from './pages/OntologyStudio';
@@ -55,6 +56,7 @@ import { Copilot } from './components/Copilot';
 // always-on nav (ontology-focused)
 const NAV_BASE = [
   { to: '/', label: 'Home' },
+  { to: '/action-inbox', label: 'Action Inbox' },
   { to: '/scenario-impact', label: 'Scenario & Impact' },
   { to: '/data-products', label: 'Data Products' },
   { to: '/ontology-studio', label: 'Ontology Studio' },
@@ -530,6 +532,7 @@ const router = createBrowserRouter([
     element: <Layout />,
     children: [
       { index: true, element: <ControlTowerHome /> },
+      { path: '/action-inbox', element: <ActionInbox /> },
       { path: '/scenario-impact', element: <ScenarioImpact /> },
       { path: '/data-products', element: <DataProducts /> },
       { path: '/ontology-studio', element: <OntologyStudio /> },

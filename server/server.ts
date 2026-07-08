@@ -1826,6 +1826,128 @@ createApp({
         res.json({ products: cards, health_score: healthScore, issues_total: high + medium, high, medium });
       });
 
+      // supply-chain (data-backed) products with their domain, reused by the inbox/ask
+      const scProducts = () =>
+        ALL_DEMO_DOMAINS.flatMap((d) =>
+          d.products.filter((p) => p.backing_schema === QSR_SC_SCHEMA).map((p) => ({ p, domainName: d.name, domainLabel: d.label }))
+        );
+      const humanizeKey = (k: string) => (k || '').replace(/_/g, ' ');
+      const QSR_GENIE_SPACE_ID = process.env.QSR_GENIE_SPACE_ID || '01f17a4306e818a183ff3f10237d5a56';
+
+      // Unified Action Inbox: one prioritized worklist across ALL supply-chain
+      // products (each product's aggregate → one actionable item, ranked by severity
+      // then size). Items needing no action (severity ok) are omitted. Reuses the
+      // curated playbook for the recommended action so it renders without the LLM.
+      app.get('/api/action-inbox', async (_req, res) => {
+        const items = await Promise.all(
+          scProducts().map(async ({ p, domainName, domainLabel }) => {
+            const sql = demoAggregateSql(p.product_name);
+            try {
+              const rows = sql ? await runSql(sql) : [];
+              const stats = (rows[0] ?? {}) as Record<string, unknown>;
+              const entries = Object.entries(stats);
+              const [metric, raw] = entries[0] ?? ['count', 0];
+              const headline = Number(raw) || 0;
+              const criticalKey = CRITICAL_KEYS.find((k) => Number(stats[k] ?? 0) > 0);
+              const severity = criticalKey ? 'high' : headline > 0 ? 'medium' : 'ok';
+              const pb = p.playbook ?? [];
+              return {
+                id: `inbox-${p.product_name}`,
+                product_name: p.product_name,
+                product_display: p.display_name,
+                domain: domainName,
+                domain_label: domainLabel,
+                severity,
+                priority: severity === 'high' ? 'HIGH' : severity === 'medium' ? 'MEDIUM' : 'LOW',
+                headline_metric: metric,
+                headline_value: headline,
+                critical_metric: criticalKey ?? null,
+                critical_value: criticalKey ? Number(stats[criticalKey] ?? 0) : 0,
+                issue: `${headline.toLocaleString()} ${humanizeKey(metric)} — ${p.issue}`,
+                root_cause: pb[0]?.root_cause ?? '',
+                recommended_action: pb[0]?.recommended_action ?? p.action_hint,
+                kpis: stats,
+              };
+            } catch (err) {
+              return {
+                id: `inbox-${p.product_name}`,
+                product_name: p.product_name,
+                product_display: p.display_name,
+                domain: domainName,
+                domain_label: domainLabel,
+                severity: 'ok',
+                priority: 'LOW',
+                headline_metric: '',
+                headline_value: 0,
+                issue: `Couldn't load — ${humanizeSqlError(err)}`,
+                root_cause: '',
+                recommended_action: '',
+                kpis: {},
+              };
+            }
+          })
+        );
+        const rank = { HIGH: 0, MEDIUM: 1, LOW: 2 } as Record<string, number>;
+        const actionable = items
+          .filter((i) => i.severity !== 'ok')
+          .sort((a, b) => (rank[a.priority] - rank[b.priority]) || b.headline_value - a.headline_value);
+        res.json({ items: actionable });
+      });
+
+      // Ask the Control Tower: a fast, grounded, CACHED answer over the LIVE
+      // aggregate signals (role-framed). Genie is offered for deeper exploration.
+      app.post('/api/control-tower-ask', async (req, res) => {
+        const b = (req.body ?? {}) as { question?: string; role?: string };
+        const question = String(b.question ?? '').trim();
+        const role = String(b.role ?? '').trim();
+        if (!question) {
+          res.status(400).json({ answer: null, error: 'question required' });
+          return;
+        }
+        if (!hasLlm) {
+          res.json({ answer: null, llm: false, reason: 'no serving endpoint configured' });
+          return;
+        }
+        // live grounding: one headline signal per product
+        const signals: string[] = [];
+        for (const { p } of scProducts()) {
+          const sql = demoAggregateSql(p.product_name);
+          if (!sql) continue;
+          try {
+            const stats = ((await runSql(sql))[0] ?? {}) as Record<string, unknown>;
+            const [metric, raw] = Object.entries(stats)[0] ?? ['count', 0];
+            signals.push(`- ${p.display_name}: ${Number(raw) || 0} ${humanizeKey(metric)}`);
+          } catch {
+            /* skip a product that fails */
+          }
+        }
+        const rolePrefix = role ? `You are advising the ${role} of a restaurant chain. ` : '';
+        const prompt =
+          `${rolePrefix}You are the QSR Supply Chain Control Tower assistant. Answer the question using ONLY ` +
+          `the live aggregate signals below — do not invent data. Be concise (2-4 sentences), cite the ` +
+          `relevant numbers, and end with one recommended action.\n\nLIVE SIGNALS (today):\n${signals.join('\n')}\n\n` +
+          `QUESTION: ${question}`;
+        const answer = await llmComplete(prompt, 600, { label: 'control-tower-ask' });
+        res.json({ answer: answer ?? null, llm: Boolean(answer), signals_count: signals.length });
+      });
+
+      // Control Tower config for the client (Genie deep-link + LLM availability).
+      app.get('/api/control-tower-config', async (_req, res) => {
+        let host = '';
+        try {
+          const w = getWorkspaceClient({});
+          await w.config.ensureResolved?.();
+          host = w.config.host ?? process.env.DATABRICKS_HOST ?? '';
+        } catch {
+          host = process.env.DATABRICKS_HOST ?? '';
+        }
+        host = host.startsWith('http') ? host : host ? `https://${host}` : '';
+        res.json({
+          genie_url: host && QSR_GENIE_SPACE_ID ? `${host}/genie/rooms/${QSR_GENIE_SPACE_ID}` : '',
+          llm: hasLlm,
+        });
+      });
+
       // What-if scenarios: the injected scenario catalog (heat wave, supplier outage…).
       app.get('/api/scenarios', async (_req, res) => {
         try {

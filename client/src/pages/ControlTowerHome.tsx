@@ -15,6 +15,7 @@ import {
 import { AlertTriangle, CheckCircle2, ArrowRight, Activity, RefreshCw, ShieldAlert } from 'lucide-react';
 import { useProduct } from '../lib/product';
 import { fetchControlTowerSummary, humanizeMetric, type ControlTowerCard, type ControlTowerSummary } from '../lib/controlTower';
+import { AskControlTower } from '../components/AskControlTower';
 
 const SEV = {
   high: { label: 'Needs action', dot: 'bg-destructive', text: 'text-destructive', ring: 'border-destructive/40' },
@@ -115,6 +116,8 @@ export function ControlTowerHome() {
           </CardContent>
         </Card>
       </div>
+
+      <AskControlTower />
 
       {loading ? (
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
