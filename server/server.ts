@@ -1773,12 +1773,21 @@ createApp({
           d.products.filter((p) => p.backing_schema === QSR_SC_SCHEMA).map((p) => ({ p, domainName: d.name, domainLabel: d.label }))
         );
 
+      // The snapshot lives in a Delta table so a scheduled notebook job can maintain
+      // exactly what the app reads (Lakebase isn't writable from a job notebook).
+      const CT_SNAPSHOT = 'jai_ontos.demo_schema.jai_control_tower_snapshot';
+      const CT_SNAPSHOT_DDL =
+        `CREATE TABLE IF NOT EXISTS ${CT_SNAPSHOT} (product_name string, domain string, ` +
+        `headline_metric string, headline_value double, critical_metric string, ` +
+        `critical_value double, severity string, metrics_json string, computed_at timestamp) USING delta`;
+
       // Recompute the pre-aggregated snapshot: run each product's aggregate ONCE and
-      // upsert a single row per product. This is the ONLY path that scans the fact
-      // tables — the Home / Inbox / Ask all READ the snapshot, so those reads stay
-      // fast at any data volume. Invoked on demand (Refresh) or on a schedule.
+      // OVERWRITE the whole (tiny) snapshot table. This is the ONLY path that scans
+      // the fact tables — the Home / Inbox / Ask all READ the snapshot, so those
+      // reads stay fast at any data volume. Invoked on demand (Refresh) or by the
+      // scheduled Databricks Job (which runs the same logic in a notebook).
       const refreshControlTowerSnapshot = async (): Promise<number> => {
-        let n = 0;
+        const values: string[] = [];
         for (const { p, domainName } of scProducts()) {
           const sql = demoAggregateSql(p.product_name);
           if (!sql) continue;
@@ -1788,35 +1797,40 @@ createApp({
             const headline = Number(raw) || 0;
             const criticalKey = CRITICAL_KEYS.find((k) => Number(stats[k] ?? 0) > 0);
             const severity = criticalKey ? 'high' : headline > 0 ? 'medium' : 'ok';
-            await lbQuery(
-              `INSERT INTO jai_control_tower_snapshot (product_name, domain, headline_metric, headline_value, ` +
-                `critical_metric, critical_value, severity, metrics_json, computed_at) ` +
-                `VALUES ($1,$2,$3,$4,$5,$6,$7,$8, now()) ON CONFLICT (product_name) DO UPDATE SET ` +
-                `domain=EXCLUDED.domain, headline_metric=EXCLUDED.headline_metric, headline_value=EXCLUDED.headline_value, ` +
-                `critical_metric=EXCLUDED.critical_metric, critical_value=EXCLUDED.critical_value, ` +
-                `severity=EXCLUDED.severity, metrics_json=EXCLUDED.metrics_json, computed_at=now()`,
-              [p.product_name, domainName, metric, headline, criticalKey ?? null,
-                criticalKey ? Number(stats[criticalKey] ?? 0) : 0, severity, JSON.stringify(stats)]
+            const critVal = criticalKey ? Number(stats[criticalKey] ?? 0) : 0;
+            values.push(
+              `(${sqlStr(p.product_name)}, ${sqlStr(domainName)}, ${sqlStr(metric)}, ${headline}, ` +
+                `${criticalKey ? sqlStr(criticalKey) : 'NULL'}, ${critVal}, ${sqlStr(severity)}, ` +
+                `${sqlStr(JSON.stringify(stats))}, current_timestamp())`
             );
-            n++;
           } catch {
             /* skip a product that fails to aggregate */
           }
         }
-        return n;
+        if (!values.length) return 0;
+        await runSql(CT_SNAPSHOT_DDL);
+        await runSql(`INSERT OVERWRITE ${CT_SNAPSHOT} VALUES ${values.join(', ')}`);
+        return values.length;
       };
 
       type SnapRow = { product_name: string; domain: string; headline_metric: string; headline_value: number; critical_metric: string | null; critical_value: number; severity: string; metrics_json: string; computed_at: string };
-      // read the snapshot, building it lazily the first time it's empty
+      // read the snapshot, building it lazily if missing/empty
       const readSnapshot = async (): Promise<SnapRow[]> => {
         const q =
-          `SELECT product_name, domain, headline_metric, headline_value, critical_metric, critical_value, ` +
-          `severity, metrics_json, to_char(computed_at,'YYYY-MM-DD HH24:MI:SS') AS computed_at ` +
-          `FROM jai_control_tower_snapshot`;
-        let rows = (await lbQuery(q)) as unknown as SnapRow[];
+          `SELECT product_name, domain, headline_metric, cast(headline_value as double) AS headline_value, ` +
+          `critical_metric, cast(critical_value as double) AS critical_value, severity, metrics_json, ` +
+          `cast(computed_at as string) AS computed_at FROM ${CT_SNAPSHOT}`;
+        let rows: SnapRow[];
+        try {
+          rows = (await runSql(q)) as unknown as SnapRow[];
+        } catch {
+          // table not created yet → build it, then read
+          await refreshControlTowerSnapshot();
+          rows = (await runSql(q)) as unknown as SnapRow[];
+        }
         if (!rows.length) {
           await refreshControlTowerSnapshot();
-          rows = (await lbQuery(q)) as unknown as SnapRow[];
+          rows = (await runSql(q)) as unknown as SnapRow[];
         }
         return rows;
       };
@@ -1959,10 +1973,151 @@ createApp({
           host = process.env.DATABRICKS_HOST ?? '';
         }
         host = host.startsWith('http') ? host : host ? `https://${host}` : '';
+        let refreshJob: { databricks_job_id: string; job_url: string; schedule_cron: string; job_deployed_at: string } | null = null;
+        try {
+          const row = (await lbQuery(
+            `SELECT databricks_job_id, job_url, schedule_cron, to_char(job_deployed_at,'YYYY-MM-DD HH24:MI:SS') AS job_deployed_at ` +
+              `FROM jai_monitor_job WHERE domain = '__control_tower__' AND databricks_job_id IS NOT NULL`
+          ))[0] as unknown as typeof refreshJob;
+          if (row) refreshJob = row;
+        } catch {
+          /* ignore */
+        }
         res.json({
           genie_url: host && QSR_GENIE_SPACE_ID ? `${host}/genie/rooms/${QSR_GENIE_SPACE_ID}` : '',
           llm: hasLlm,
+          refresh_job: refreshJob,
         });
+      });
+
+      // Build the Control Tower snapshot-refresh notebook (Python): recompute every
+      // supply-chain product's aggregate and OVERWRITE the Delta snapshot table.
+      const buildControlTowerNotebook = (): string => {
+        const queries: Record<string, { sql: string; domain: string }> = {};
+        for (const { p, domainName } of scProducts()) {
+          const sql = demoAggregateSql(p.product_name);
+          if (sql) queries[p.product_name] = { sql, domain: domainName };
+        }
+        return [
+          '# Databricks notebook source',
+          '# Auto-generated by RT_onto — refreshes the Control Tower snapshot the app reads.',
+          'from datetime import datetime',
+          'import json',
+          `TABLE = ${JSON.stringify(CT_SNAPSHOT)}`,
+          `CRITICAL_KEYS = json.loads(r'''${JSON.stringify(CRITICAL_KEYS)}''')`,
+          `QUERIES = json.loads(r'''${JSON.stringify(queries)}''')`,
+          '',
+          'spark.sql(f"""CREATE TABLE IF NOT EXISTS {TABLE} (product_name string, domain string,',
+          '  headline_metric string, headline_value double, critical_metric string, critical_value double,',
+          '  severity string, metrics_json string, computed_at timestamp) USING delta""")',
+          'now = datetime.utcnow()',
+          'rows = []',
+          'for product, cfg in QUERIES.items():',
+          '    try:',
+          '        rec = spark.sql(cfg["sql"]).limit(1).collect()',
+          '        stats = rec[0].asDict() if rec else {}',
+          '    except Exception:',
+          '        stats = {}',
+          '    items = list(stats.items())',
+          '    metric, raw = (items[0] if items else ("count", 0))',
+          '    try:',
+          '        headline = float(raw) if raw is not None else 0.0',
+          '    except Exception:',
+          '        headline = 0.0',
+          '    def _num(v):',
+          '        try:\n            return float(v)\n        except Exception:\n            return 0.0',
+          '    crit = next((k for k in CRITICAL_KEYS if _num(stats.get(k)) > 0), None)',
+          '    sev = "high" if crit else ("medium" if headline > 0 else "ok")',
+          '    crit_val = _num(stats.get(crit)) if crit else 0.0',
+          '    rows.append((product, cfg["domain"], str(metric), headline, crit, crit_val, sev,',
+          '                 json.dumps({k: str(v) for k, v in stats.items()}), now))',
+          'cols = ["product_name","domain","headline_metric","headline_value","critical_metric","critical_value","severity","metrics_json","computed_at"]',
+          'spark.createDataFrame(rows, cols).write.mode("overwrite").saveAsTable(TABLE)',
+          'print(f"control tower snapshot refreshed: {len(rows)} products")',
+          '',
+        ].join('\n');
+      };
+
+      // Deploy the scheduled Control Tower refresh as a real serverless Databricks Job
+      // (imports the notebook, creates/updates the Job on a cron). Registered in
+      // jai_monitor_job under a synthetic domain so it shows in Jobs & schedules.
+      app.post('/api/control-tower-deploy-job', async (req, res) => {
+        const cron = String((req.body as { cron?: string })?.cron || '0 0 6 * * ?');
+        const tz = 'America/New_York';
+        const jobName = 'jai_control_tower_refresh_daily';
+        try {
+          const who = (await whoami()) || 'unknown';
+          const nbDir = `/Users/${who}/jai_monitor`;
+          const nbPath = `${nbDir}/${jobName}`;
+          await authFetch('/api/2.0/workspace/mkdirs', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            rawBody: JSON.stringify({ path: nbDir }),
+          }).catch(() => {});
+          const nbContent = Buffer.from(buildControlTowerNotebook()).toString('base64');
+          const imp = await authFetch('/api/2.0/workspace/import', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            rawBody: JSON.stringify({ path: nbPath, format: 'SOURCE', language: 'PYTHON', content: nbContent, overwrite: true }),
+          });
+          if (!imp.ok) {
+            res.json({ ok: false, error: `notebook import failed (${imp.status}): ${(await imp.text()).slice(0, 300)}` });
+            return;
+          }
+          const settings = {
+            name: jobName,
+            tags: { app: 'rt_onto', kind: 'control_tower_refresh' },
+            schedule: { quartz_cron_expression: cron, timezone_id: tz, pause_status: 'UNPAUSED' },
+            tasks: [{ task_key: 'refresh_snapshot', notebook_task: { notebook_path: nbPath, source: 'WORKSPACE' } }],
+          };
+          const existing = (await lbQuery<{ databricks_job_id: string | null }>(
+            `SELECT databricks_job_id FROM jai_monitor_job WHERE domain = '__control_tower__'`
+          ))[0]?.databricks_job_id;
+          let dbId = existing ?? '';
+          if (existing) {
+            const rs = await authFetch('/api/2.1/jobs/reset', {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              rawBody: JSON.stringify({ job_id: Number(existing), new_settings: settings }),
+            });
+            if (!rs.ok) {
+              if (rs.status === 400 || rs.status === 404) dbId = '';
+              else {
+                res.json({ ok: false, error: `jobs/reset failed (${rs.status}): ${(await rs.text()).slice(0, 300)}` });
+                return;
+              }
+            }
+          }
+          if (!dbId) {
+            const cr = await authFetch('/api/2.1/jobs/create', {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              rawBody: JSON.stringify(settings),
+            });
+            const crText = await cr.text();
+            if (!cr.ok) {
+              res.json({ ok: false, error: `jobs/create failed (${cr.status}): ${crText.slice(0, 300)}` });
+              return;
+            }
+            dbId = String((JSON.parse(crText) as { job_id?: number }).job_id ?? '');
+          }
+          const host = (cachedHost ?? '').startsWith('http') ? cachedHost : `https://${cachedHost}`;
+          const jobUrl = `${host}/jobs/${dbId}`;
+          await lbQuery(
+            `INSERT INTO jai_monitor_job (job_id, domain, domain_label, job_name, schedule_cron, schedule_tz, ` +
+              `products_json, aggregates_json, enabled, version, created_by, created_at, updated_at, ` +
+              `databricks_job_id, job_url, job_notebook_path, job_deployed_at) ` +
+              `VALUES ('jai_control_tower', '__control_tower__', 'Control Tower refresh', $1, $2, $3, '[]', '[]', ` +
+              `true, 1, $4, now(), now(), $5, $6, $7, now()) ON CONFLICT (domain) DO UPDATE SET ` +
+              `schedule_cron = EXCLUDED.schedule_cron, databricks_job_id = EXCLUDED.databricks_job_id, ` +
+              `job_url = EXCLUDED.job_url, job_notebook_path = EXCLUDED.job_notebook_path, ` +
+              `job_deployed_at = now(), updated_at = now()`,
+            [jobName, cron, tz, who, dbId, jobUrl, nbPath]
+          );
+          res.json({ ok: true, databricks_job_id: dbId, job_url: jobUrl, schedule_cron: cron, notebook_path: nbPath });
+        } catch (err) {
+          res.json({ ok: false, error: humanizeSqlError(err) });
+        }
       });
 
       // What-if scenarios: the injected scenario catalog (heat wave, supplier outage…).

@@ -102,12 +102,41 @@ export async function askControlTower(
   }
 }
 
-export async function fetchControlTowerConfig(): Promise<{ genie_url: string; llm: boolean }> {
+export type CtRefreshJob = { databricks_job_id: string; job_url: string; schedule_cron: string; job_deployed_at?: string };
+export type ControlTowerConfig = { genie_url: string; llm: boolean; refresh_job: CtRefreshJob | null };
+
+export async function fetchControlTowerConfig(): Promise<ControlTowerConfig> {
   try {
     const r = await fetch('/api/control-tower-config');
     const d = await r.json();
-    return { genie_url: String(d?.genie_url ?? ''), llm: Boolean(d?.llm) };
+    return { genie_url: String(d?.genie_url ?? ''), llm: Boolean(d?.llm), refresh_job: d?.refresh_job ?? null };
   } catch {
-    return { genie_url: '', llm: false };
+    return { genie_url: '', llm: false, refresh_job: null };
   }
+}
+
+// Provision (or update) the scheduled Databricks Job that keeps the snapshot fresh.
+export async function deployControlTowerRefreshJob(
+  cron?: string
+): Promise<{ ok: boolean; databricks_job_id?: string; job_url?: string; schedule_cron?: string; error?: string }> {
+  try {
+    const r = await fetch('/api/control-tower-deploy-job', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(cron ? { cron } : {}),
+    });
+    return await r.json();
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : String(e) };
+  }
+}
+
+// map a quartz cron to a friendly label (best-effort)
+export function cronLabel(cron?: string): string {
+  const map: Record<string, string> = {
+    '0 0 6 * * ?': 'daily · 6:00 AM',
+    '0 0 7 * * ?': 'daily · 7:00 AM',
+    '0 0 */6 * * ?': 'every 6 hours',
+  };
+  return cron ? (map[cron] ?? cron) : '';
 }

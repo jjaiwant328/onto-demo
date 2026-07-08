@@ -12,9 +12,19 @@ import {
   Button,
   Skeleton,
 } from '@databricks/appkit-ui/react';
-import { AlertTriangle, CheckCircle2, ArrowRight, Activity, RefreshCw, ShieldAlert } from 'lucide-react';
+import { AlertTriangle, CheckCircle2, ArrowRight, Activity, RefreshCw, ShieldAlert, CalendarClock, ExternalLink } from 'lucide-react';
 import { useProduct } from '../lib/product';
-import { fetchControlTowerSummary, refreshControlTower, humanizeMetric, type ControlTowerCard, type ControlTowerSummary } from '../lib/controlTower';
+import {
+  fetchControlTowerSummary,
+  refreshControlTower,
+  fetchControlTowerConfig,
+  deployControlTowerRefreshJob,
+  cronLabel,
+  humanizeMetric,
+  type ControlTowerCard,
+  type ControlTowerSummary,
+  type CtRefreshJob,
+} from '../lib/controlTower';
 import { AskControlTower } from '../components/AskControlTower';
 
 const SEV = {
@@ -34,6 +44,23 @@ export function ControlTowerHome() {
   const [data, setData] = useState<ControlTowerSummary | null>(null);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
+  const [refreshJob, setRefreshJob] = useState<CtRefreshJob | null>(null);
+  const [deploying, setDeploying] = useState(false);
+
+  useEffect(() => {
+    void fetchControlTowerConfig().then((c) => setRefreshJob(c.refresh_job));
+  }, []);
+
+  // one-click: provision the scheduled Databricks Job that keeps the snapshot fresh
+  const enableAuto = () => {
+    setDeploying(true);
+    void deployControlTowerRefreshJob().then((r) => {
+      setDeploying(false);
+      if (r.ok && r.databricks_job_id && r.job_url) {
+        setRefreshJob({ databricks_job_id: r.databricks_job_id, job_url: r.job_url, schedule_cron: r.schedule_cron ?? '' });
+      }
+    });
+  };
 
   const load = () => {
     setLoading(true);
@@ -81,9 +108,21 @@ export function ControlTowerHome() {
             {data?.computed_at && <span className="text-xs"> · updated {data.computed_at}</span>}
           </p>
         </div>
-        <Button variant="outline" size="sm" className="gap-1.5 shrink-0" onClick={refresh} disabled={loading || refreshing}>
-          <RefreshCw className={`h-4 w-4 ${loading || refreshing ? 'animate-spin' : ''}`} /> {refreshing ? 'Refreshing…' : 'Refresh'}
-        </Button>
+        <div className="flex flex-col items-end gap-1.5 shrink-0">
+          <Button variant="outline" size="sm" className="gap-1.5" onClick={refresh} disabled={loading || refreshing}>
+            <RefreshCw className={`h-4 w-4 ${loading || refreshing ? 'animate-spin' : ''}`} /> {refreshing ? 'Refreshing…' : 'Refresh'}
+          </Button>
+          {refreshJob ? (
+            <a href={refreshJob.job_url} target="_blank" rel="noreferrer" className="flex items-center gap-1 text-[11px] text-muted-foreground hover:text-foreground">
+              <CalendarClock className="h-3 w-3 text-emerald-600" /> Auto-updates {cronLabel(refreshJob.schedule_cron)}
+              <ExternalLink className="h-3 w-3" />
+            </a>
+          ) : (
+            <button onClick={enableAuto} disabled={deploying} className="flex items-center gap-1 text-[11px] text-primary hover:underline disabled:opacity-50">
+              <CalendarClock className="h-3 w-3" /> {deploying ? 'Scheduling…' : 'Turn on daily auto-update'}
+            </button>
+          )}
+        </div>
       </div>
 
       {/* headline row: network health + issue count */}

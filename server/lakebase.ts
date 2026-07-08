@@ -162,21 +162,10 @@ export async function ensureLakebaseTables(): Promise<void> {
   await lbQuery(`ALTER TABLE jai_monitor_job ADD COLUMN IF NOT EXISTS job_url text`);
   await lbQuery(`ALTER TABLE jai_monitor_job ADD COLUMN IF NOT EXISTS job_deployed_at timestamptz`);
   await lbQuery(`ALTER TABLE jai_monitor_job ADD COLUMN IF NOT EXISTS job_notebook_path text`);
-  // Control Tower snapshot — one PRE-AGGREGATED row per supply-chain product,
-  // refreshed on a cadence / on demand. The Home, Action Inbox and Ask read THIS
-  // (a tiny per-product table) instead of scanning the fact tables live, so reads
-  // stay fast regardless of underlying data volume.
-  await lbQuery(`CREATE TABLE IF NOT EXISTS jai_control_tower_snapshot (
-    product_name text PRIMARY KEY,
-    domain text,
-    headline_metric text,
-    headline_value double precision,
-    critical_metric text,
-    critical_value double precision,
-    severity text,
-    metrics_json text,
-    computed_at timestamptz
-  )`);
+  // (The Control Tower snapshot lives in a Delta table
+  // jai_ontos.demo_schema.jai_control_tower_snapshot — written by BOTH the app's
+  // on-demand refresh and the scheduled Databricks Job, read by the app — so a
+  // notebook-based job can maintain exactly what the app serves.)
   // LLM response cache — keyed by a hash of the exact prompt (+ max tokens), so any
   // change to the inputs (which are embedded in the prompt) misses and re-runs,
   // while unchanged inputs reuse the stored answer (no tokens). Long-term (survives
