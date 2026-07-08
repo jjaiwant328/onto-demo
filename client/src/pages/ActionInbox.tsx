@@ -14,11 +14,13 @@ import {
   Textarea,
   Skeleton,
 } from '@databricks/appkit-ui/react';
-import { CheckCircle2, XCircle, Pencil, ArrowRight, AlertTriangle, RefreshCw, Inbox } from 'lucide-react';
+import { CheckCircle2, XCircle, Pencil, ArrowRight, AlertTriangle, RefreshCw, Inbox, Wrench } from 'lucide-react';
 import { useProduct } from '../lib/product';
 import { fetchActionInbox, type InboxItem } from '../lib/controlTower';
 import { logAction, type LogContext } from '../lib/actionLog';
 import type { ActionItem } from '../lib/actions';
+import { QSR_SC_MITIGATIONS } from '../../../shared/demoDomains';
+import { MitigationPanel } from '../components/MitigationPanel';
 
 function priorityVariant(p: string): 'default' | 'secondary' | 'outline' {
   return p === 'HIGH' ? 'default' : p === 'MEDIUM' ? 'secondary' : 'outline';
@@ -76,20 +78,22 @@ export function ActionInbox() {
         </Card>
       ) : (
         <div className="space-y-3">
-          {shown.map((it) => <InboxCard key={it.id} item={it} />)}
+          {shown.map((it) => <InboxCard key={it.id} item={it} onChanged={load} />)}
         </div>
       )}
     </div>
   );
 }
 
-function InboxCard({ item }: { item: InboxItem }) {
+function InboxCard({ item, onChanged }: { item: InboxItem; onChanged?: () => void }) {
   const navigate = useNavigate();
   const { setSelectedProduct, showActionCenter, setShowActionCenter } = useProduct();
   const [status, setStatus] = useState<'pending' | 'approved' | 'modified' | 'rejected'>('pending');
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(item.recommended_action);
   const [note, setNote] = useState<string | null>(null);
+  const [mitOpen, setMitOpen] = useState(false);
+  const hasMitigation = Boolean(QSR_SC_MITIGATIONS[item.product_name]);
 
   const ctx: LogContext = { schema_label: 'QSR Supply Chain', domain: item.domain_label, product: item.product_display };
   const asAction = (recommended?: string): ActionItem => ({
@@ -160,7 +164,10 @@ function InboxCard({ item }: { item: InboxItem }) {
 
         {!editing && status === 'pending' && (
           <div className="flex flex-wrap gap-2 pt-1">
-            <Button size="sm" className="gap-1.5" onClick={() => void decide('approved')}><CheckCircle2 className="h-4 w-4" /> Approve</Button>
+            {hasMitigation && (
+              <Button size="sm" className="gap-1.5" onClick={() => setMitOpen(true)}><Wrench className="h-4 w-4" /> Mitigate</Button>
+            )}
+            <Button size="sm" variant={hasMitigation ? 'outline' : 'default'} className="gap-1.5" onClick={() => void decide('approved')}><CheckCircle2 className="h-4 w-4" /> Approve</Button>
             <Button size="sm" variant="outline" className="gap-1.5" onClick={() => setEditing(true)}><Pencil className="h-4 w-4" /> Modify</Button>
             <Button size="sm" variant="ghost" className="gap-1.5" onClick={() => void decide('rejected')}><XCircle className="h-4 w-4" /> Reject</Button>
             <Button size="sm" variant="ghost" className="gap-1.5 ml-auto text-primary" onClick={investigate}>Investigate <ArrowRight className="h-3.5 w-3.5" /></Button>
@@ -168,6 +175,9 @@ function InboxCard({ item }: { item: InboxItem }) {
         )}
         {note && <div className="text-xs text-muted-foreground">{note}</div>}
       </CardContent>
+      {hasMitigation && (
+        <MitigationPanel item={item} open={mitOpen} onOpenChange={setMitOpen} onResolved={() => onChanged?.()} />
+      )}
     </Card>
   );
 }

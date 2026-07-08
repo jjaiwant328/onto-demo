@@ -9,6 +9,7 @@ import {
   ALL_DEMO_DOMAINS,
   QSR_SC_REASONING_RULES,
   QSR_SC_SCHEMA,
+  QSR_SC_MITIGATIONS,
 } from '../shared/demoDomains';
 import {
   serializeTtl,
@@ -700,7 +701,8 @@ createApp({
         const b = (req.body ?? {}) as { product?: string };
         const product = (b.product ?? '').trim();
         const meta = DEMO_PRODUCTS[product];
-        const aggSql = demoAggregateSql(product);
+        // net out any resolved mitigations so the Action Center count matches the Home
+        const aggSql = netAggregateSql(product, (await activeMitigationPredicates())[product] ?? []);
         const rowSql = demoExceptionSql(product, 8); // a few representative examples
         if (!meta || !aggSql || !rowSql) {
           res.status(400).json({ actions: [], reason: 'not a data-backed product', rows: [], stats: null });
@@ -1802,12 +1804,42 @@ createApp({
         }
       };
 
+      // ---- Mitigation ledger: approved actions the app has "dispatched" to a system
+      // of record (simulated). A RESOLVED mitigation nets its slice out of the exception
+      // aggregates (anti-predicate), so the KPI drops everywhere; source facts untouched.
+      const INTERVENTION_LOG = 'jai_ontos.demo_schema.jai_intervention_log';
+      const INTERVENTION_DDL =
+        `CREATE TABLE IF NOT EXISTS ${INTERVENTION_LOG} (intervention_id string, product_name string, ` +
+        `domain string, action_key string, action_label string, target_system string, work_order_id string, ` +
+        `status string, mitigation_predicate string, effect_label string, expected_delta double, ` +
+        `created_by string, created_at timestamp, resolved_at timestamp) USING delta`;
+      // product_name → anti-predicates from RESOLVED mitigations (best-effort; [] if none)
+      const activeMitigationPredicates = async (): Promise<Record<string, string[]>> => {
+        try {
+          const rows = (await runSql(
+            `SELECT product_name, mitigation_predicate FROM ${INTERVENTION_LOG} WHERE status = 'resolved'`
+          )) as unknown as { product_name: string; mitigation_predicate: string }[];
+          const map: Record<string, string[]> = {};
+          for (const r of rows) (map[r.product_name] ??= []).push(r.mitigation_predicate);
+          return map;
+        } catch {
+          return {}; // ledger not created yet
+        }
+      };
+      // append ` AND NOT (pred)` for each active mitigation to a product's aggregate SQL
+      const netAggregateSql = (productName: string, preds: string[]): string | null => {
+        const base = demoAggregateSql(productName);
+        if (!base || !preds.length) return base;
+        return base + preds.map((p) => ` AND NOT (${p})`).join('');
+      };
+
       // Compute the cards LIVE (scans the fact tables). Used to build the snapshot and
       // as a fallback so the Home always has data even if the snapshot can't be written.
       const computeCardsLive = async (): Promise<CtCard[]> => {
         const out: CtCard[] = [];
+        const mitig = await activeMitigationPredicates();
         for (const { p, domainName, domainLabel } of scProducts()) {
-          const sql = demoAggregateSql(p.product_name);
+          const sql = netAggregateSql(p.product_name, mitig[p.product_name] ?? []);
           if (!sql) continue;
           try {
             const stats = ((await runSql(sql))[0] ?? {}) as Record<string, unknown>;
@@ -1926,6 +1958,106 @@ createApp({
         try {
           const n = await refreshControlTowerSnapshot();
           res.json({ ok: true, refreshed: n });
+        } catch (err) {
+          res.json({ ok: false, error: humanizeSqlError(err) });
+        }
+      });
+
+      // ---- Mitigation workflow (closed loop over a simulated system of record) ----
+      const MITIGATION_STEPS = ['submitted', 'acknowledged', 'in_progress', 'resolved'] as const;
+      // Create a mitigation: "dispatch" the approved play to its system of record.
+      app.post('/api/mitigations', async (req, res) => {
+        const product = String((req.body as { product_name?: string })?.product_name ?? '').trim();
+        const meta = DEMO_PRODUCTS[product];
+        const m = QSR_SC_MITIGATIONS[product];
+        if (!meta || !m) {
+          res.status(400).json({ ok: false, error: 'no mitigation defined for this product' });
+          return;
+        }
+        try {
+          // projected effect = the critical slice being cleared (from a live count)
+          let expectedDelta = 0;
+          try {
+            const r = (await runSql(
+              `SELECT count(*) AS n FROM ${meta.backing_schema ?? QSR_SC_SCHEMA}.${meta.table} ` +
+                `WHERE ${meta.exception_where} AND (${m.mitigation_predicate})`
+            ))[0] as { n?: unknown };
+            expectedDelta = Number(r?.n ?? 0) || 0;
+          } catch {
+            /* leave 0 */
+          }
+          const id = `mit_${Date.now().toString(36)}_${randomUUID().slice(0, 6)}`;
+          const wo = `WO-${Math.floor(1000 + Math.random() * 9000)}`;
+          const who = (await whoami()) || 'unknown';
+          const domain = ALL_DEMO_DOMAINS.find((d) => d.products.some((p) => p.product_name === product))?.name ?? '';
+          await runSql(INTERVENTION_DDL);
+          await runSql(
+            `INSERT INTO ${INTERVENTION_LOG} VALUES (${sqlStr(id)}, ${sqlStr(product)}, ${sqlStr(domain)}, ` +
+              `${sqlStr(m.action_key)}, ${sqlStr(m.action_label)}, ${sqlStr(m.target_system)}, ${sqlStr(wo)}, ` +
+              `'submitted', ${sqlStr(m.mitigation_predicate)}, ${sqlStr(m.effect_label)}, ${expectedDelta}, ` +
+              `${sqlStr(who)}, current_timestamp(), NULL)`
+          );
+          // record the decision in the action log too (dedup by product+issue)
+          await lbQuery(
+            `INSERT INTO action_log (action_id, created_at, updated_at, schema_label, domain, product, source, ` +
+              `priority, issue, root_cause, recommended_action, confidence, decision, track_status, decided_by, ` +
+              `decided_at, ref_entity, notes) VALUES ($1, now(), now(), 'QSR Supply Chain', $2, $3, 'exception', ` +
+              `'HIGH', $4, '', $5, 0.7, 'approved', 'in_progress', $6, now(), $7, '') ` +
+              `ON CONFLICT (action_id) DO UPDATE SET decision='approved', track_status='in_progress', ` +
+              `recommended_action=EXCLUDED.recommended_action, decided_at=now(), updated_at=now()`,
+            [
+              `act_${createHash('sha1').update(`${meta.display_name}|${m.action_label}`).digest('hex').slice(0, 16)}`,
+              domain, meta.display_name, `Mitigate: ${meta.issue}`, m.action_label, who, wo,
+            ]
+          ).catch(() => {});
+          res.json({ ok: true, intervention_id: id, work_order_id: wo, target_system: m.target_system, status: 'submitted', expected_delta: expectedDelta, action_label: m.action_label, action_key: m.action_key, mitigation_predicate: m.mitigation_predicate });
+        } catch (err) {
+          res.json({ ok: false, error: humanizeSqlError(err) });
+        }
+      });
+
+      // Advance a mitigation's status (submitted→acknowledged→in_progress→resolved).
+      // On resolve, refresh the snapshot so the KPI drop shows on the Home.
+      app.post('/api/mitigation-advance', async (req, res) => {
+        const id = String((req.body as { intervention_id?: string })?.intervention_id ?? '').trim();
+        if (!id) {
+          res.status(400).json({ ok: false, error: 'intervention_id required' });
+          return;
+        }
+        try {
+          const cur = (await runSql(`SELECT status FROM ${INTERVENTION_LOG} WHERE intervention_id = ${sqlStr(id)}`))[0] as { status?: string };
+          const idx = MITIGATION_STEPS.indexOf((cur?.status ?? 'submitted') as (typeof MITIGATION_STEPS)[number]);
+          const next = MITIGATION_STEPS[Math.min(idx + 1, MITIGATION_STEPS.length - 1)];
+          const resolvedAt = next === 'resolved' ? 'current_timestamp()' : 'resolved_at';
+          await runSql(`UPDATE ${INTERVENTION_LOG} SET status = ${sqlStr(next)}, resolved_at = ${resolvedAt} WHERE intervention_id = ${sqlStr(id)}`);
+          if (next === 'resolved') await refreshControlTowerSnapshot().catch(() => {});
+          res.json({ ok: true, status: next });
+        } catch (err) {
+          res.json({ ok: false, error: humanizeSqlError(err) });
+        }
+      });
+
+      // List mitigations (newest first) for the status/connector surfaces.
+      app.get('/api/mitigations', async (_req, res) => {
+        try {
+          const rows = await runSql(
+            `SELECT intervention_id, product_name, domain, action_key, action_label, target_system, work_order_id, ` +
+              `status, mitigation_predicate, effect_label, expected_delta, ` +
+              `cast(created_at as string) AS created_at, cast(resolved_at as string) AS resolved_at ` +
+              `FROM ${INTERVENTION_LOG} ORDER BY created_at DESC`
+          ).catch(() => [] as Record<string, unknown>[]);
+          res.json({ mitigations: rows });
+        } catch (err) {
+          res.json({ mitigations: [], error: humanizeSqlError(err) });
+        }
+      });
+
+      // Reset the demo: clear all mitigations and rebuild the snapshot.
+      app.post('/api/mitigations-reset', async (_req, res) => {
+        try {
+          await runSql(`DELETE FROM ${INTERVENTION_LOG}`).catch(() => {});
+          await refreshControlTowerSnapshot().catch(() => {});
+          res.json({ ok: true });
         } catch (err) {
           res.json({ ok: false, error: humanizeSqlError(err) });
         }

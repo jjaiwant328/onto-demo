@@ -536,6 +536,55 @@ export const QSR_SC_REASONING_RULES: ReasoningRule[] = [
   },
 ];
 
+// Curated MITIGATION layer: maps a supply-chain product to the approved play, the
+// external system of record that would execute it, and the exact exception slice the
+// play clears (mitigation_predicate). The demo dispatches a simulated work order to
+// `target_system`, then nets `mitigation_predicate` out of the exception aggregates so
+// the KPI drops. `effect_label` describes the outcome; `unit_value_usd` (optional) puts
+// a $ figure on the protected slice.
+export type Mitigation = {
+  action_key: string;
+  action_label: string;
+  target_system: string;
+  mitigation_predicate: string; // SQL over the product's fact table; cleared on resolve
+  effect_label: string;
+  unit_value_usd?: number; // $ protected per unit of the cleared slice
+};
+export const QSR_SC_MITIGATIONS: Record<string, Mitigation> = {
+  sc_inventory_stockout: {
+    action_key: 'activate_alternate_supplier',
+    action_label: 'Activate qualified alternate supplier for outage-impacted lines',
+    target_system: 'Procurement / ERP',
+    mitigation_predicate: 'impacted_by_supplier_outage',
+    effect_label: 'outage-driven stockout positions cleared by alternate supply',
+    unit_value_usd: 45,
+  },
+  sc_po_fulfillment: {
+    action_key: 'escalate_split_po',
+    action_label: 'Escalate the most-late POs and split volume to a secondary source',
+    target_system: 'Procurement / ERP',
+    mitigation_predicate: 'impacted_by_outage',
+    effect_label: 'outage-impacted late POs escalated / re-sourced',
+    unit_value_usd: 800,
+  },
+  sc_equipment_health: {
+    action_key: 'dispatch_maintenance',
+    action_label: 'Dispatch field maintenance to units in a failure state',
+    target_system: 'CMMS / Maintenance',
+    mitigation_predicate: "status = 'Failure'",
+    effect_label: 'failed equipment units dispatched for repair',
+    unit_value_usd: 300,
+  },
+  sc_labor_staffing: {
+    action_key: 'reallocate_labor',
+    action_label: 'Reallocate labor / trigger call-ins for shortage shifts',
+    target_system: 'Labor scheduling',
+    mitigation_predicate: 'labor_shortage = true',
+    effect_label: 'labor-shortage shifts covered by reallocation',
+    unit_value_usd: 120,
+  },
+};
+
 // Curated QSR subclass taxonomy: a class (by short name) → a superclass label
 // and the subclasses it specializes into. Emitted as rdfs:subClassOf axioms in
 // the ontology artifact (e.g. Ingredient → Chicken/Produce/Sauce/…). QSR layer;

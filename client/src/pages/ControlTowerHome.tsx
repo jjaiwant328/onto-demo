@@ -12,7 +12,7 @@ import {
   Button,
   Skeleton,
 } from '@databricks/appkit-ui/react';
-import { AlertTriangle, CheckCircle2, ArrowRight, Activity, RefreshCw, ShieldAlert, CalendarClock, ExternalLink } from 'lucide-react';
+import { AlertTriangle, CheckCircle2, ArrowRight, Activity, RefreshCw, ShieldAlert, CalendarClock, ExternalLink, Wrench, RotateCcw } from 'lucide-react';
 import { useProduct } from '../lib/product';
 import {
   fetchControlTowerSummary,
@@ -26,6 +26,7 @@ import {
   type CtRefreshJob,
 } from '../lib/controlTower';
 import { AskControlTower } from '../components/AskControlTower';
+import { fetchMitigations, resetMitigations, type Mitigation } from '../lib/mitigation';
 
 const SEV = {
   high: { label: 'Needs action', dot: 'bg-destructive', text: 'text-destructive', ring: 'border-destructive/40' },
@@ -46,10 +47,24 @@ export function ControlTowerHome() {
   const [refreshing, setRefreshing] = useState(false);
   const [refreshJob, setRefreshJob] = useState<CtRefreshJob | null>(null);
   const [deploying, setDeploying] = useState(false);
+  const [mits, setMits] = useState<Mitigation[]>([]);
+  const [resetting, setResetting] = useState(false);
 
   useEffect(() => {
     void fetchControlTowerConfig().then((c) => setRefreshJob(c.refresh_job));
+    void fetchMitigations().then(setMits);
   }, []);
+
+  const resetDemo = () => {
+    setResetting(true);
+    void resetMitigations().then(() => {
+      void fetchMitigations().then(setMits);
+      void fetchControlTowerSummary().then((d) => {
+        setData(d);
+        setResetting(false);
+      });
+    });
+  };
 
   // one-click: provision the scheduled Databricks Job that keeps the snapshot fresh
   const enableAuto = () => {
@@ -75,6 +90,7 @@ export function ControlTowerHome() {
   // facts), then re-reads it — mirroring what the scheduled job does in production.
   const refresh = () => {
     setRefreshing(true);
+    void fetchMitigations().then(setMits);
     void refreshControlTower().then(() => {
       void fetchControlTowerSummary().then((d) => {
         setData(d);
@@ -124,6 +140,21 @@ export function ControlTowerHome() {
           )}
         </div>
       </div>
+
+      {/* mitigations banner (closed-loop demo) */}
+      {mits.length > 0 && (
+        <div className="flex items-center gap-3 rounded-md border border-emerald-200 bg-emerald-50 p-3 text-sm">
+          <Wrench className="h-4 w-4 text-emerald-600 shrink-0" />
+          <span className="text-emerald-800">
+            <span className="font-medium">{mits.filter((m) => m.status === 'resolved').length}</span> mitigation(s) applied
+            {mits.some((m) => m.status !== 'resolved') && <> · <span className="font-medium">{mits.filter((m) => m.status !== 'resolved').length}</span> in progress</>} —
+            KPIs reflect the effect (source data unchanged).
+          </span>
+          <Button variant="outline" size="sm" className="ml-auto gap-1.5 shrink-0" onClick={resetDemo} disabled={resetting}>
+            <RotateCcw className={`h-3.5 w-3.5 ${resetting ? 'animate-spin' : ''}`} /> Reset demo
+          </Button>
+        </div>
+      )}
 
       {/* headline row: network health + issue count */}
       <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
