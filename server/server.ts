@@ -1781,58 +1781,18 @@ createApp({
         `headline_metric string, headline_value double, critical_metric string, ` +
         `critical_value double, severity string, metrics_json string, computed_at timestamp) USING delta`;
 
-      // Recompute the pre-aggregated snapshot: run each product's aggregate ONCE and
-      // OVERWRITE the whole (tiny) snapshot table. This is the ONLY path that scans
-      // the fact tables — the Home / Inbox / Ask all READ the snapshot, so those
-      // reads stay fast at any data volume. Invoked on demand (Refresh) or by the
-      // scheduled Databricks Job (which runs the same logic in a notebook).
-      const refreshControlTowerSnapshot = async (): Promise<number> => {
-        const values: string[] = [];
-        for (const { p, domainName } of scProducts()) {
-          const sql = demoAggregateSql(p.product_name);
-          if (!sql) continue;
-          try {
-            const stats = ((await runSql(sql))[0] ?? {}) as Record<string, unknown>;
-            const [metric, raw] = Object.entries(stats)[0] ?? ['count', 0];
-            const headline = Number(raw) || 0;
-            const criticalKey = CRITICAL_KEYS.find((k) => Number(stats[k] ?? 0) > 0);
-            const severity = criticalKey ? 'high' : headline > 0 ? 'medium' : 'ok';
-            const critVal = criticalKey ? Number(stats[criticalKey] ?? 0) : 0;
-            values.push(
-              `(${sqlStr(p.product_name)}, ${sqlStr(domainName)}, ${sqlStr(metric)}, ${headline}, ` +
-                `${criticalKey ? sqlStr(criticalKey) : 'NULL'}, ${critVal}, ${sqlStr(severity)}, ` +
-                `${sqlStr(JSON.stringify(stats))}, current_timestamp())`
-            );
-          } catch {
-            /* skip a product that fails to aggregate */
-          }
-        }
-        if (!values.length) return 0;
-        await runSql(CT_SNAPSHOT_DDL);
-        await runSql(`INSERT OVERWRITE ${CT_SNAPSHOT} VALUES ${values.join(', ')}`);
-        return values.length;
-      };
-
-      type SnapRow = { product_name: string; domain: string; headline_metric: string; headline_value: number; critical_metric: string | null; critical_value: number; severity: string; metrics_json: string; computed_at: string };
-      // read the snapshot, building it lazily if missing/empty
-      const readSnapshot = async (): Promise<SnapRow[]> => {
-        const q =
-          `SELECT product_name, domain, headline_metric, cast(headline_value as double) AS headline_value, ` +
-          `critical_metric, cast(critical_value as double) AS critical_value, severity, metrics_json, ` +
-          `cast(computed_at as string) AS computed_at FROM ${CT_SNAPSHOT}`;
-        let rows: SnapRow[];
-        try {
-          rows = (await runSql(q)) as unknown as SnapRow[];
-        } catch {
-          // table not created yet → build it, then read
-          await refreshControlTowerSnapshot();
-          rows = (await runSql(q)) as unknown as SnapRow[];
-        }
-        if (!rows.length) {
-          await refreshControlTowerSnapshot();
-          rows = (await runSql(q)) as unknown as SnapRow[];
-        }
-        return rows;
+      type CtCard = {
+        product_name: string;
+        display_name: string;
+        business_outcome: string;
+        domain: string;
+        domain_label: string;
+        headline_metric: string;
+        headline_value: number;
+        critical_metric: string | null;
+        critical_value: number;
+        kpis: Record<string, unknown>;
+        severity: string;
       };
       const parseKpis = (s: string): Record<string, unknown> => {
         try {
@@ -1842,17 +1802,71 @@ createApp({
         }
       };
 
-      // Cross-product "what needs attention today" — READS the pre-aggregated snapshot
-      // (fast; no live fact-table scan). Optional ?domain= narrows to one layer.
-      app.get('/api/control-tower-summary', async (req, res) => {
-        const domainFilter = String(req.query.domain ?? '').trim();
+      // Compute the cards LIVE (scans the fact tables). Used to build the snapshot and
+      // as a fallback so the Home always has data even if the snapshot can't be written.
+      const computeCardsLive = async (): Promise<CtCard[]> => {
+        const out: CtCard[] = [];
+        for (const { p, domainName, domainLabel } of scProducts()) {
+          const sql = demoAggregateSql(p.product_name);
+          if (!sql) continue;
+          try {
+            const stats = ((await runSql(sql))[0] ?? {}) as Record<string, unknown>;
+            const [metric, raw] = Object.entries(stats)[0] ?? ['count', 0];
+            const headline = Number(raw) || 0;
+            const criticalKey = CRITICAL_KEYS.find((k) => Number(stats[k] ?? 0) > 0);
+            out.push({
+              product_name: p.product_name,
+              display_name: p.display_name,
+              business_outcome: p.business_outcome,
+              domain: domainName,
+              domain_label: domainLabel,
+              headline_metric: String(metric),
+              headline_value: headline,
+              critical_metric: criticalKey ?? null,
+              critical_value: criticalKey ? Number(stats[criticalKey] ?? 0) : 0,
+              kpis: stats,
+              severity: criticalKey ? 'high' : headline > 0 ? 'medium' : 'ok',
+            });
+          } catch {
+            /* skip a product that fails to aggregate */
+          }
+        }
+        return out;
+      };
+
+      // Recompute + OVERWRITE the Delta snapshot (the fast-read table). Throws if the
+      // write fails (e.g. missing MODIFY grant) so the Refresh button can report it.
+      const refreshControlTowerSnapshot = async (): Promise<number> => {
+        const cards = await computeCardsLive();
+        if (!cards.length) return 0;
+        const values = cards.map(
+          (c) =>
+            `(${sqlStr(c.product_name)}, ${sqlStr(c.domain)}, ${sqlStr(c.headline_metric)}, ${c.headline_value}, ` +
+            `${c.critical_metric ? sqlStr(c.critical_metric) : 'NULL'}, ${c.critical_value}, ${sqlStr(c.severity)}, ` +
+            `${sqlStr(JSON.stringify(c.kpis))}, current_timestamp())`
+        );
+        await runSql(CT_SNAPSHOT_DDL);
+        await runSql(`INSERT OVERWRITE ${CT_SNAPSHOT} VALUES ${values.join(', ')}`);
+        return cards.length;
+      };
+
+      // Read the snapshot (fast path). Returns null if the table is missing/empty or
+      // unreadable, signalling the caller to fall back to a live compute.
+      const readSnapshotCards = async (): Promise<{ cards: CtCard[]; computedAt: string | null } | null> => {
+        const q =
+          `SELECT product_name, domain, headline_metric, cast(headline_value as double) AS headline_value, ` +
+          `critical_metric, cast(critical_value as double) AS critical_value, severity, metrics_json, ` +
+          `cast(computed_at as string) AS computed_at FROM ${CT_SNAPSHOT}`;
         try {
-          const rows = await readSnapshot();
+          const rows = (await runSql(q)) as unknown as {
+            product_name: string; domain: string; headline_metric: string; headline_value: number;
+            critical_metric: string | null; critical_value: number; severity: string; metrics_json: string; computed_at: string;
+          }[];
+          if (!rows.length) return null;
           const cards = rows
-            .map((r) => {
+            .map((r): CtCard | null => {
               const meta = DEMO_PRODUCTS[r.product_name];
               if (!meta) return null;
-              if (domainFilter && r.domain !== domainFilter) return null;
               return {
                 product_name: r.product_name,
                 display_name: meta.display_name,
@@ -1867,12 +1881,41 @@ createApp({
                 severity: r.severity,
               };
             })
-            .filter((c): c is NonNullable<typeof c> => c !== null);
+            .filter((c): c is CtCard => c !== null);
+          const computedAt = rows.map((r) => r.computed_at).sort().slice(-1)[0] ?? null;
+          return { cards, computedAt };
+        } catch {
+          return null;
+        }
+      };
+
+      // Cards for the Home/Inbox/Ask: prefer the snapshot; if absent, try to build it
+      // (best-effort); if that also fails (e.g. no write grant), compute live so the UI
+      // is never blank.
+      const getControlTowerCards = async (): Promise<{ cards: CtCard[]; computedAt: string | null; source: 'snapshot' | 'live' }> => {
+        const snap = await readSnapshotCards();
+        if (snap) return { ...snap, source: 'snapshot' };
+        try {
+          await refreshControlTowerSnapshot();
+          const rebuilt = await readSnapshotCards();
+          if (rebuilt) return { ...rebuilt, source: 'snapshot' };
+        } catch {
+          /* write failed — fall through to live compute */
+        }
+        return { cards: await computeCardsLive(), computedAt: null, source: 'live' };
+      };
+
+      // Cross-product "what needs attention today" — READS the pre-aggregated snapshot
+      // (fast; no live fact-table scan). Optional ?domain= narrows to one layer.
+      app.get('/api/control-tower-summary', async (req, res) => {
+        const domainFilter = String(req.query.domain ?? '').trim();
+        try {
+          const { cards: all, computedAt, source } = await getControlTowerCards();
+          const cards = domainFilter ? all.filter((c) => c.domain === domainFilter) : all;
           const high = cards.filter((c) => c.severity === 'high').length;
           const medium = cards.filter((c) => c.severity === 'medium').length;
           const healthScore = Math.max(0, Math.min(100, 100 - high * 12 - medium * 5));
-          const computedAt = rows.map((r) => r.computed_at).sort().slice(-1)[0] ?? null;
-          res.json({ products: cards, health_score: healthScore, issues_total: high + medium, high, medium, computed_at: computedAt, source: 'snapshot' });
+          res.json({ products: cards, health_score: healthScore, issues_total: high + medium, high, medium, computed_at: computedAt, source });
         } catch (err) {
           res.json({ products: [], health_score: 0, issues_total: 0, high: 0, medium: 0, error: humanizeSqlError(err) });
         }
@@ -1894,32 +1937,30 @@ createApp({
       // and layers the curated playbook so it renders without the LLM.
       app.get('/api/action-inbox', async (_req, res) => {
         try {
-          const rows = await readSnapshot();
-          const items = rows
-            .map((r) => {
-              const meta = DEMO_PRODUCTS[r.product_name];
-              if (!meta || r.severity === 'ok') return null;
-              const pb = meta.playbook ?? [];
-              const headline = Number(r.headline_value) || 0;
+          const { cards } = await getControlTowerCards();
+          const items = cards
+            .filter((c) => c.severity !== 'ok')
+            .map((c) => {
+              const meta = DEMO_PRODUCTS[c.product_name];
+              const pb = meta?.playbook ?? [];
               return {
-                id: `inbox-${r.product_name}`,
-                product_name: r.product_name,
-                product_display: meta.display_name,
-                domain: r.domain,
-                domain_label: meta.domainLabel,
-                severity: r.severity,
-                priority: r.severity === 'high' ? 'HIGH' : r.severity === 'medium' ? 'MEDIUM' : 'LOW',
-                headline_metric: r.headline_metric,
-                headline_value: headline,
-                critical_metric: r.critical_metric,
-                critical_value: Number(r.critical_value) || 0,
-                issue: `${headline.toLocaleString()} ${humanizeKey(r.headline_metric)} — ${meta.issue}`,
+                id: `inbox-${c.product_name}`,
+                product_name: c.product_name,
+                product_display: c.display_name,
+                domain: c.domain,
+                domain_label: c.domain_label,
+                severity: c.severity,
+                priority: c.severity === 'high' ? 'HIGH' : c.severity === 'medium' ? 'MEDIUM' : 'LOW',
+                headline_metric: c.headline_metric,
+                headline_value: c.headline_value,
+                critical_metric: c.critical_metric,
+                critical_value: c.critical_value,
+                issue: `${c.headline_value.toLocaleString()} ${humanizeKey(c.headline_metric)} — ${meta?.issue ?? ''}`,
                 root_cause: pb[0]?.root_cause ?? '',
-                recommended_action: pb[0]?.recommended_action ?? meta.action_hint,
-                kpis: parseKpis(r.metrics_json),
+                recommended_action: pb[0]?.recommended_action ?? meta?.action_hint ?? '',
+                kpis: c.kpis,
               };
-            })
-            .filter((i): i is NonNullable<typeof i> => i !== null);
+            });
           const rank = { HIGH: 0, MEDIUM: 1, LOW: 2 } as Record<string, number>;
           items.sort((a, b) => (rank[a.priority] - rank[b.priority]) || b.headline_value - a.headline_value);
           res.json({ items });
@@ -1942,15 +1983,15 @@ createApp({
           res.json({ answer: null, llm: false, reason: 'no serving endpoint configured' });
           return;
         }
-        // grounding from the pre-aggregated snapshot (no live scan)
+        // grounding from the snapshot (falls back to live compute if unavailable)
         const signals: string[] = [];
         try {
-          for (const r of await readSnapshot()) {
-            const meta = DEMO_PRODUCTS[r.product_name];
-            signals.push(`- ${meta?.display_name ?? r.product_name}: ${Number(r.headline_value) || 0} ${humanizeKey(r.headline_metric)}`);
+          const { cards } = await getControlTowerCards();
+          for (const c of cards) {
+            signals.push(`- ${c.display_name}: ${c.headline_value} ${humanizeKey(c.headline_metric)}`);
           }
         } catch {
-          /* snapshot unavailable — answer with no signals */
+          /* signals unavailable — answer with none */
         }
         const rolePrefix = role ? `You are advising the ${role} of a restaurant chain. ` : '';
         const prompt =

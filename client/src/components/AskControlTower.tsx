@@ -7,14 +7,15 @@ import { Card, CardContent, CardHeader, CardTitle, CardDescription, Button, Inpu
 import { Sparkles, Send, Loader2, MessageSquare, ExternalLink } from 'lucide-react';
 import { askControlTower, fetchControlTowerConfig } from '../lib/controlTower';
 
-const ROLES: { role: string; label: string; prompts: string[] }[] = [
-  { role: 'CEO', label: 'CEO', prompts: ['Summarize today’s biggest supply-chain risks.', 'Where are the largest opportunities to cut waste and protect service?'] },
-  { role: 'COO', label: 'COO', prompts: ['Which restaurants need intervention today?', 'What are the top operational risks right now?'] },
-  { role: 'CSCO', label: 'Chief Supply Chain Officer', prompts: ['Which supplier disruptions have the largest downstream impact?', 'Which distribution centers are capacity constrained?'] },
+// One combined leadership lens (merged CEO / COO / Chief Supply Chain Officer).
+const PROMPTS = [
+  'Summarize today’s biggest supply-chain risks.',
+  'Which restaurants need intervention today?',
+  'Which supplier disruptions have the largest downstream impact?',
+  'Where are the biggest opportunities to cut waste and protect service?',
 ];
 
 export function AskControlTower() {
-  const [role, setRole] = useState<string>('CSCO');
   const [q, setQ] = useState('');
   const [answer, setAnswer] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -35,13 +36,11 @@ export function AskControlTower() {
     setBusy(true);
     setAnswer(null);
     setNote(null);
-    const r = await askControlTower(text, ROLES.find((x) => x.role === role)?.label);
+    const r = await askControlTower(text, 'supply-chain leadership');
     setBusy(false);
     if (r.answer) setAnswer(r.answer);
     else setNote(r.reason === 'no serving endpoint configured' ? 'The assistant needs the Foundation Model endpoint (not configured here). Use "Explore in Genie" for a live answer.' : 'No answer returned.');
   };
-
-  const rolePrompts = ROLES.find((x) => x.role === role)?.prompts ?? [];
 
   return (
     <Card className="shadow-sm border-primary/30">
@@ -50,19 +49,12 @@ export function AskControlTower() {
           <Sparkles className="h-4 w-4 text-primary" /> Ask the Control Tower
         </CardTitle>
         <CardDescription>
-          A grounded answer over today&rsquo;s live signals. Pick a lens, ask in plain English, or explore deeper in Genie.
+          A grounded answer over today&rsquo;s live signals — ask in plain English, or explore deeper in Genie.
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-3">
-        <div className="flex flex-wrap items-center gap-1.5">
-          {ROLES.map((r) => (
-            <Button key={r.role} size="sm" variant={role === r.role ? 'default' : 'outline'} className="h-7 text-xs" onClick={() => setRole(r.role)}>
-              {r.label}
-            </Button>
-          ))}
-        </div>
         <div className="flex flex-wrap gap-1.5">
-          {rolePrompts.map((p) => (
+          {PROMPTS.map((p) => (
             <Button key={p} size="sm" variant="ghost" className="h-auto py-1 text-xs text-primary" disabled={busy || !llm} onClick={() => { setQ(p); void ask(p); }}>
               {p}
             </Button>
