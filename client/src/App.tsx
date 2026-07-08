@@ -38,6 +38,8 @@ import {
 } from 'lucide-react';
 import { ProductProvider, useProduct, ALL_SCOPE } from './lib/product';
 import { ActionsContext, type ActionItem } from './lib/actions';
+import { ControlTowerHome } from './pages/ControlTowerHome';
+import { ScenarioImpact } from './pages/ScenarioImpact';
 import { DataProducts } from './pages/DataProducts';
 import { OntologyStudio } from './pages/OntologyStudio';
 import { SemanticExplorer } from './pages/SemanticExplorer';
@@ -52,6 +54,8 @@ import { Copilot } from './components/Copilot';
 
 // always-on nav (ontology-focused)
 const NAV_BASE = [
+  { to: '/', label: 'Home' },
+  { to: '/scenario-impact', label: 'Scenario & Impact' },
   { to: '/data-products', label: 'Data Products' },
   { to: '/ontology-studio', label: 'Ontology Studio' },
   { to: '/semantic-explorer', label: 'Semantic Explorer' },
@@ -109,7 +113,7 @@ function NavLinks({
   return (
     <nav className={className}>
       {nav.map((n) => (
-        <NavLink key={n.to} to={n.to} className={linkClass} onClick={onClick}>
+        <NavLink key={n.to} to={n.to} end={n.to === '/'} className={linkClass} onClick={onClick}>
           {n.label}
         </NavLink>
       ))}
@@ -525,7 +529,8 @@ const router = createBrowserRouter([
   {
     element: <Layout />,
     children: [
-      { index: true, element: <Navigate to="/data-products" replace /> },
+      { index: true, element: <ControlTowerHome /> },
+      { path: '/scenario-impact', element: <ScenarioImpact /> },
       { path: '/data-products', element: <DataProducts /> },
       { path: '/ontology-studio', element: <OntologyStudio /> },
       { path: '/semantic-explorer', element: <SemanticExplorer /> },
@@ -533,7 +538,7 @@ const router = createBrowserRouter([
       { path: '/data-contract', element: <DataContract /> },
       { path: '/action-center', element: <ActionCenter /> },
       { path: '/business-view', element: <BusinessView /> },
-      { path: '*', element: <Navigate to="/data-products" replace /> },
+      { path: '*', element: <Navigate to="/" replace /> },
     ],
   },
   // standalone print routes (no app chrome) for clean PDF export

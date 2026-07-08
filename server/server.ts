@@ -8,6 +8,7 @@ import {
   DEMO_PRODUCTS,
   ALL_DEMO_DOMAINS,
   QSR_SC_REASONING_RULES,
+  QSR_SC_SCHEMA,
 } from '../shared/demoDomains';
 import {
   serializeTtl,
@@ -1757,6 +1758,237 @@ createApp({
           res.json({ jobs: rows });
         } catch (err) {
           res.json({ jobs: [], error: humanizeSqlError(err) });
+        }
+      });
+
+      // ============ Control Tower (business decision surfaces) ================
+      const sqlStr = (v: unknown) => `'${String(v ?? '').replace(/'/g, "''")}'`;
+      // stat keys that signal a CRITICAL sub-count within a product's aggregate
+      const CRITICAL_KEYS = ['critical_items', 'failures', 'outage_driven', 'severely_late', 'single_source_suppliers'];
+
+      // Cross-product "what needs attention today" over the QSR supply-chain spine.
+      // Runs each data-backed product's aggregate (the same SQL the Action Center and
+      // monitoring use) and returns a headline number + severity per product, plus a
+      // composite network-health score. Optional ?domain= narrows to one layer.
+      app.get('/api/control-tower-summary', async (req, res) => {
+        const domainFilter = String(req.query.domain ?? '').trim();
+        const products: { p: (typeof DEMO_PRODUCTS)[string]; domainName: string; domainLabel: string }[] = [];
+        for (const d of ALL_DEMO_DOMAINS) {
+          if (domainFilter && d.name !== domainFilter) continue;
+          for (const p of d.products) {
+            if (p.backing_schema !== QSR_SC_SCHEMA) continue; // supply-chain, data-backed
+            products.push({ p: { ...p, domainLabel: d.label }, domainName: d.name, domainLabel: d.label });
+          }
+        }
+        const cards = await Promise.all(
+          products.map(async ({ p, domainName, domainLabel }) => {
+            const sql = demoAggregateSql(p.product_name);
+            try {
+              const rows = sql ? await runSql(sql) : [];
+              const stats = (rows[0] ?? {}) as Record<string, unknown>;
+              const entries = Object.entries(stats);
+              const [headlineMetric, headlineRaw] = entries[0] ?? ['count', 0];
+              const headline = Number(headlineRaw) || 0;
+              const criticalKey = CRITICAL_KEYS.find((k) => Number(stats[k] ?? 0) > 0);
+              const severity = criticalKey ? 'high' : headline > 0 ? 'medium' : 'ok';
+              return {
+                product_name: p.product_name,
+                display_name: p.display_name,
+                business_outcome: p.business_outcome,
+                domain: domainName,
+                domain_label: domainLabel,
+                headline_metric: headlineMetric,
+                headline_value: headline,
+                critical_metric: criticalKey ?? null,
+                critical_value: criticalKey ? Number(stats[criticalKey] ?? 0) : 0,
+                kpis: stats,
+                severity,
+              };
+            } catch (err) {
+              return {
+                product_name: p.product_name,
+                display_name: p.display_name,
+                domain: domainName,
+                domain_label: domainLabel,
+                severity: 'unknown',
+                error: humanizeSqlError(err),
+                kpis: {},
+                headline_metric: '',
+                headline_value: 0,
+              };
+            }
+          })
+        );
+        const high = cards.filter((c) => c.severity === 'high').length;
+        const medium = cards.filter((c) => c.severity === 'medium').length;
+        // composite 0-100: start healthy, dock per product needing attention
+        const healthScore = Math.max(0, Math.min(100, 100 - high * 12 - medium * 5));
+        res.json({ products: cards, health_score: healthScore, issues_total: high + medium, high, medium });
+      });
+
+      // What-if scenarios: the injected scenario catalog (heat wave, supplier outage…).
+      app.get('/api/scenarios', async (_req, res) => {
+        try {
+          const rows = await runSql(
+            `SELECT scenario_id, scenario_type, scope_kind, scope_value, ` +
+              `cast(start_date as string) AS start_date, cast(end_date as string) AS end_date, ` +
+              `effect, magnitude, description FROM ${QSR_SC_SCHEMA}.jai_scenario ` +
+              `ORDER BY start_date DESC`
+          );
+          res.json({ scenarios: rows });
+        } catch (err) {
+          res.json({ scenarios: [], error: humanizeSqlError(err) });
+        }
+      });
+
+      // Deterministic projected impact for a scenario + the matching curated playbook
+      // and reasoning rule (honest data-vs-guidance split; optional cached narrative).
+      app.post('/api/scenario-impact', async (req, res) => {
+        const b = (req.body ?? {}) as { scenario_id?: string };
+        const id = String(b.scenario_id ?? '').trim();
+        if (!id) {
+          res.status(400).json({ error: 'scenario_id required' });
+          return;
+        }
+        try {
+          const sc = (await runSql(
+            `SELECT scenario_id, scenario_type, scope_kind, scope_value, effect, magnitude, description ` +
+              `FROM ${QSR_SC_SCHEMA}.jai_scenario WHERE scenario_id = ${sqlStr(id)} LIMIT 1`
+          ))[0] as Record<string, unknown> | undefined;
+          if (!sc) {
+            res.json({ error: 'scenario not found' });
+            return;
+          }
+          const type = String(sc.scenario_type ?? '');
+          const scopeKind = String(sc.scope_kind ?? '');
+          const scopeVal = String(sc.scope_value ?? '');
+          const regionClause = scopeKind === 'region' && scopeVal ? ` AND region = ${sqlStr(scopeVal)}` : '';
+          // map scenario type → { impact query, product for playbook, reasoning rule }
+          type ImpactDef = { label: string; sql: string; product?: string; ruleId?: string };
+          const T: Record<string, ImpactDef> = {
+            supplier_outage: {
+              label: 'ingredient positions at stockout risk from the outage',
+              sql: `SELECT count(*) AS impact_count, count(distinct restaurant_id) AS restaurants FROM ${QSR_SC_SCHEMA}.jai_inventory_event WHERE stockout_risk = true AND impacted_by_supplier_outage = true`,
+              product: 'sc_inventory_stockout',
+              ruleId: 'RR4',
+            },
+            heat_wave: {
+              label: 'demand-surge forecast days in scope',
+              sql: `SELECT count(*) AS impact_count, count(distinct restaurant_id) AS restaurants, round(avg(beverage_demand_index),2) AS avg_beverage_index FROM ${QSR_SC_SCHEMA}.jai_forecast WHERE heat_wave_active = true${regionClause}`,
+              product: 'sc_forecast_demand',
+              ruleId: 'RR1',
+            },
+            promotion: {
+              label: 'promotion-driven surge days in scope',
+              sql: `SELECT count(*) AS impact_count, count(distinct restaurant_id) AS restaurants FROM ${QSR_SC_SCHEMA}.jai_forecast WHERE promo_active = true${regionClause}`,
+              product: 'sc_forecast_demand',
+              ruleId: 'RR1',
+            },
+            holiday: {
+              label: 'promotion/holiday surge days in scope',
+              sql: `SELECT count(*) AS impact_count, count(distinct restaurant_id) AS restaurants FROM ${QSR_SC_SCHEMA}.jai_forecast WHERE promo_active = true${regionClause}`,
+              product: 'sc_forecast_demand',
+            },
+            snowstorm: {
+              label: 'high-dollar waste events in scope',
+              sql: `SELECT count(*) AS impact_count, round(sum(waste_usd),0) AS waste_usd, count(distinct restaurant_id) AS restaurants FROM ${QSR_SC_SCHEMA}.jai_waste_event WHERE waste_usd > 120${regionClause}`,
+              product: 'sc_waste',
+              ruleId: 'RR3',
+            },
+            equipment_failure: {
+              label: 'equipment readings in failure / low health',
+              sql: `SELECT count(*) AS impact_count, count(distinct restaurant_id) AS restaurants FROM ${QSR_SC_SCHEMA}.jai_equipment_health WHERE status = 'Failure' OR health_score < 40`,
+              product: 'sc_equipment_health',
+              ruleId: 'RR6',
+            },
+            labor_shortage: {
+              label: 'understaffed shifts in scope',
+              sql: `SELECT count(*) AS impact_count, count(distinct restaurant_id) AS restaurants FROM ${QSR_SC_SCHEMA}.jai_labor_shift WHERE staffing_ratio < 0.8${regionClause}`,
+              product: 'sc_labor_staffing',
+              ruleId: 'RR7',
+            },
+          };
+          const def = T[type];
+          let impact: Record<string, unknown> = {};
+          if (def) {
+            try {
+              impact = ((await runSql(def.sql))[0] ?? {}) as Record<string, unknown>;
+            } catch {
+              impact = {};
+            }
+          }
+          const meta = def?.product ? DEMO_PRODUCTS[def.product] : undefined;
+          const rule = def?.ruleId ? QSR_SC_REASONING_RULES.find((r) => r.id === def.ruleId) : undefined;
+          res.json({
+            scenario: sc,
+            impact_label: def?.label ?? 'related exceptions',
+            impact,
+            product: meta ? { product_name: meta.product_name, display_name: meta.display_name } : null,
+            playbook: meta?.playbook ?? [],
+            rule: rule
+              ? { id: rule.id, name: rule.name, if_conditions: rule.if_conditions, then_conclusion: rule.then_conclusion }
+              : null,
+          });
+        } catch (err) {
+          res.json({ error: humanizeSqlError(err) });
+        }
+      });
+
+      // Entity picker for the impact explorer (suppliers / DCs / ingredients).
+      app.get('/api/impact-entities', async (req, res) => {
+        const type = String(req.query.type ?? 'supplier');
+        const q =
+          type === 'dc'
+            ? `SELECT dc_id AS id, dc_name AS name FROM ${QSR_SC_SCHEMA}.jai_dim_distribution_center ORDER BY dc_name`
+            : type === 'ingredient'
+              ? `SELECT ingredient_id AS id, ingredient_name AS name FROM ${QSR_SC_SCHEMA}.jai_dim_ingredient ORDER BY ingredient_name LIMIT 200`
+              : `SELECT supplier_id AS id, supplier_name AS name FROM ${QSR_SC_SCHEMA}.jai_dim_supplier ORDER BY supplier_name`;
+        try {
+          res.json({ entities: await runSql(q) });
+        } catch (err) {
+          res.json({ entities: [], error: humanizeSqlError(err) });
+        }
+      });
+
+      // Blast-radius: downstream at-risk restaurants/items for a supplier/DC/ingredient.
+      app.post('/api/impact-trace', async (req, res) => {
+        const b = (req.body ?? {}) as { entity_type?: string; id?: string };
+        const type = String(b.entity_type ?? 'supplier');
+        const id = String(b.id ?? '').trim();
+        if (!id) {
+          res.status(400).json({ error: 'id required' });
+          return;
+        }
+        let q = '';
+        if (type === 'supplier') {
+          q =
+            `SELECT i.ingredient_name AS name, count(distinct e.restaurant_id) AS restaurants, ` +
+            `count(*) AS at_risk_positions FROM ${QSR_SC_SCHEMA}.jai_inventory_event e ` +
+            `JOIN ${QSR_SC_SCHEMA}.jai_dim_ingredient i ON e.ingredient_id = i.ingredient_id ` +
+            `WHERE i.primary_supplier_id = ${sqlStr(id)} AND e.stockout_risk = true ` +
+            `GROUP BY 1 ORDER BY restaurants DESC`;
+        } else if (type === 'dc') {
+          q =
+            `SELECT r.region AS name, count(distinct e.restaurant_id) AS restaurants, ` +
+            `count(*) AS at_risk_positions FROM ${QSR_SC_SCHEMA}.jai_inventory_event e ` +
+            `JOIN ${QSR_SC_SCHEMA}.jai_dim_restaurant r ON e.restaurant_id = r.restaurant_id ` +
+            `WHERE r.dc_id = ${sqlStr(id)} AND e.stockout_risk = true ` +
+            `GROUP BY 1 ORDER BY at_risk_positions DESC`;
+        } else {
+          q =
+            `SELECT r.region AS name, count(distinct e.restaurant_id) AS restaurants, ` +
+            `count(*) AS at_risk_positions FROM ${QSR_SC_SCHEMA}.jai_inventory_event e ` +
+            `JOIN ${QSR_SC_SCHEMA}.jai_dim_restaurant r ON e.restaurant_id = r.restaurant_id ` +
+            `WHERE e.ingredient_id = ${sqlStr(id)} AND e.stockout_risk = true ` +
+            `GROUP BY 1 ORDER BY at_risk_positions DESC`;
+        }
+        try {
+          const rows = await runSql(q);
+          const restaurants = rows.reduce((s, r) => s + (Number(r.restaurants) || 0), 0);
+          const positions = rows.reduce((s, r) => s + (Number(r.at_risk_positions) || 0), 0);
+          res.json({ rows, total_restaurants: restaurants, total_positions: positions });
+        } catch (err) {
+          res.json({ rows: [], error: humanizeSqlError(err) });
         }
       });
 
