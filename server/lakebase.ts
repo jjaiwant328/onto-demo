@@ -155,6 +155,25 @@ export async function ensureLakebaseTables(): Promise<void> {
     created_at timestamptz,
     updated_at timestamptz
   )`);
+  // Databricks Job provisioning details for a deployed monitoring definition
+  // (populated when the user clicks "Deploy scheduled job"). Nullable — a job may
+  // be defined/run on-demand without being deployed as a real scheduled Job.
+  await lbQuery(`ALTER TABLE jai_monitor_job ADD COLUMN IF NOT EXISTS databricks_job_id text`);
+  await lbQuery(`ALTER TABLE jai_monitor_job ADD COLUMN IF NOT EXISTS job_url text`);
+  await lbQuery(`ALTER TABLE jai_monitor_job ADD COLUMN IF NOT EXISTS job_deployed_at timestamptz`);
+  await lbQuery(`ALTER TABLE jai_monitor_job ADD COLUMN IF NOT EXISTS job_notebook_path text`);
+  // LLM response cache — keyed by a hash of the exact prompt (+ max tokens), so any
+  // change to the inputs (which are embedded in the prompt) misses and re-runs,
+  // while unchanged inputs reuse the stored answer (no tokens). Long-term (survives
+  // restarts) and shared across sessions/users.
+  await lbQuery(`CREATE TABLE IF NOT EXISTS jai_llm_cache (
+    cache_key text PRIMARY KEY,
+    label text,
+    response text,
+    created_at timestamptz,
+    last_hit_at timestamptz,
+    hits int DEFAULT 0
+  )`);
   // Monitoring-job RUN OUTPUT — daily AGGREGATE results, one row per
   // (domain, product, day). Never stores row-level detail or actions; this is
   // physically separate from action_log (no decision/recommendation columns).

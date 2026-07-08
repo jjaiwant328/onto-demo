@@ -26,8 +26,14 @@ import {
   TableHead,
   TableHeader,
   TableRow,
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogDescription,
+  DialogTrigger,
 } from '@databricks/appkit-ui/react';
-import { Send, Bot, Sparkles, Loader2, Save, Play, CalendarClock, ShieldCheck, MessageSquare, Zap } from 'lucide-react';
+import { Send, Bot, Sparkles, Loader2, Save, Play, CalendarClock, ShieldCheck, MessageSquare, Zap, Rocket, ExternalLink, ListChecks } from 'lucide-react';
 import {
   fetchMonitorJob,
   saveMonitorJob,
@@ -35,10 +41,13 @@ import {
   runMonitorJob,
   fetchMonitorRuns,
   fetchMonitorPreview,
+  deployMonitorJob,
+  fetchMonitorJobs,
   CRON_PRESETS,
   type AggregateSpec,
   type MonitorRun,
   type MonitorPreview,
+  type MonitorJobSummary,
 } from '../lib/monitorJob';
 import { fetchProductLinks, type ProductLink } from '../lib/productLinks';
 
@@ -60,6 +69,10 @@ export function MonitorJobBuilder({ domain, domainLabel }: { domain: string; dom
   const [running, setRunning] = useState(false);
   const [runNote, setRunNote] = useState<string | null>(null);
   const [saveNote, setSaveNote] = useState<string | null>(null);
+  const [deploying, setDeploying] = useState(false);
+  const [deployNote, setDeployNote] = useState<string | null>(null);
+  // provisioned Databricks Job (populated from the saved definition / after deploy)
+  const [deployed, setDeployed] = useState<{ id: string; url: string; notebook?: string; at?: string } | null>(null);
   // Genie / dashboard links attached in the ontology (Ontology Studio / Further
   // analysis) — used to make each monitored exception investigable.
   const [links, setLinks] = useState<ProductLink[]>([]);
@@ -78,6 +91,8 @@ export function MonitorJobBuilder({ domain, domainLabel }: { domain: string; dom
   useEffect(() => {
     setMessages([]);
     setSpec(null);
+    setDeployed(null);
+    setDeployNote(null);
     void (async () => {
       const [job, prev] = await Promise.all([fetchMonitorJob(domain), fetchMonitorPreview(domain)]);
       setPreview(prev);
@@ -85,6 +100,9 @@ export function MonitorJobBuilder({ domain, domainLabel }: { domain: string; dom
       if (job) {
         setCron(job.schedule_cron ?? '0 0 7 * * ?');
         setVersion(job.version ?? null);
+        if (job.databricks_job_id && job.job_url) {
+          setDeployed({ id: job.databricks_job_id, url: job.job_url, notebook: job.job_notebook_path ?? undefined, at: job.job_deployed_at ?? undefined });
+        }
         if (job.aggregates_json) {
           try {
             const parsed = JSON.parse(job.aggregates_json);
@@ -173,6 +191,21 @@ export function MonitorJobBuilder({ domain, domainLabel }: { domain: string; dom
   const scheduleLabel = CRON_PRESETS.find((c) => c.value === cron)?.label ?? cron;
   const lastRun = runs[0]?.run_ts ?? null;
 
+  const doDeploy = async () => {
+    setDeploying(true);
+    setDeployNote(null);
+    // ensure the latest schedule/spec is saved before provisioning
+    await saveMonitorJob({ domain, schedule_cron: cron, aggregates_json: spec ?? { aggregates: [] }, enabled: true });
+    const r = await deployMonitorJob(domain);
+    setDeploying(false);
+    if (r.ok && r.databricks_job_id && r.job_url) {
+      setDeployed({ id: r.databricks_job_id, url: r.job_url, notebook: r.notebook_path, at: new Date().toISOString() });
+      setDeployNote(`Scheduled Databricks Job #${r.databricks_job_id} provisioned (${scheduleLabel}).`);
+    } else {
+      setDeployNote(`Deploy failed: ${r.error ?? 'unknown'}`);
+    }
+  };
+
   const suggestions = [
     `Monitor the key aggregate metrics across all ${domainLabel} products`,
     'Alert when any product has more than 5 exceptions',
@@ -251,18 +284,23 @@ export function MonitorJobBuilder({ domain, domainLabel }: { domain: string; dom
         </CardContent>
       </Card>
 
-      {/* 2. Job card — spec preview, name, schedule, save + run now */}
+      {/* 2. Job card — spec preview, name, schedule, save + run now + deploy */}
       <Card className="shadow-sm">
         <CardHeader>
-          <CardTitle className="flex items-center gap-2">
-            <CalendarClock className="h-4 w-4 text-primary" /> Batch job & schedule
-          </CardTitle>
-          <CardDescription>
-            Job name <code>{jobName}</code>
-            {version != null && <span className="text-muted-foreground"> · saved v{version}</span>}. Runs the
-            aggregate query below for every product daily and stores results in Lakebase
-            (<code>jai_monitor_run</code>).
-          </CardDescription>
+          <div className="flex items-start justify-between gap-3">
+            <div>
+              <CardTitle className="flex items-center gap-2">
+                <CalendarClock className="h-4 w-4 text-primary" /> Batch job & schedule
+              </CardTitle>
+              <CardDescription>
+                Job name <code>{jobName}</code>
+                {version != null && <span className="text-muted-foreground"> · saved v{version}</span>}. "Run now"
+                executes immediately and logs to <code>jai_monitor_run</code>; "Deploy scheduled job" provisions a
+                real Databricks Job on the cron below.
+              </CardDescription>
+            </div>
+            <JobsSchedulesDialog />
+          </div>
         </CardHeader>
         <CardContent className="space-y-4">
           <div className="flex flex-wrap items-center gap-2">
@@ -285,12 +323,37 @@ export function MonitorJobBuilder({ domain, domainLabel }: { domain: string; dom
                 {saving ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Save className="h-3.5 w-3.5" />}
                 Save definition
               </Button>
-              <Button size="sm" className="gap-1.5" disabled={running} onClick={() => void doRun()}>
+              <Button size="sm" variant="outline" className="gap-1.5" disabled={running} onClick={() => void doRun()}>
                 {running ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Play className="h-3.5 w-3.5" />}
                 Run now
               </Button>
+              <Button size="sm" className="gap-1.5" disabled={deploying} onClick={() => void doDeploy()}>
+                {deploying ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Rocket className="h-3.5 w-3.5" />}
+                {deployed ? 'Redeploy job' : 'Deploy scheduled job'}
+              </Button>
             </div>
           </div>
+
+          {deployed && (
+            <div className="rounded-md border border-success/30 bg-success/5 p-3 text-xs space-y-1">
+              <div className="flex items-center gap-2 font-medium text-success">
+                <Rocket className="h-3.5 w-3.5" /> Scheduled Databricks Job provisioned
+              </div>
+              <div>
+                Job <code>#{deployed.id}</code> · runs {scheduleLabel} ·{' '}
+                <a href={deployed.url} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 text-primary underline">
+                  Open in Databricks Jobs <ExternalLink className="h-3 w-3" />
+                </a>
+              </div>
+              {deployed.notebook && <div className="text-muted-foreground">Notebook: <code>{deployed.notebook}</code></div>}
+              {deployed.at && <div className="text-muted-foreground">Deployed {new Date(deployed.at).toLocaleString()}</div>}
+            </div>
+          )}
+          {deployNote && (
+            <div className="flex items-start gap-1.5 rounded-md bg-muted/40 p-2 text-xs text-muted-foreground">
+              <Rocket className="h-3.5 w-3.5 mt-0.5 shrink-0 text-primary" /> {deployNote}
+            </div>
+          )}
 
           {/* schedule + last-run status — everything about this job on one page */}
           <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 rounded-md border p-3 text-xs">
@@ -359,9 +422,10 @@ export function MonitorJobBuilder({ domain, domainLabel }: { domain: string; dom
 
           <div className="flex items-start gap-1.5 rounded-md bg-muted/40 p-2 text-[11px] text-muted-foreground">
             <ShieldCheck className="h-3.5 w-3.5 mt-0.5 shrink-0 text-primary" />
-            Deferred: this defines the job <code>{jobName}</code> and stores it in Lakebase. Deploying it as a
-            scheduled Databricks Job (asset bundle, daily cron, service-principal auth) is a follow-up step —
-            "Run now" already computes and stores results today.
+            "Run now" executes this on-demand and logs to <code>jai_monitor_run</code> (see Run history).
+            "Deploy scheduled job" imports the above as a notebook and provisions a serverless Databricks Job on
+            the cron schedule (aggregate-only; writes to <code>jai_ontos.demo_schema.jai_monitor_run_scheduled</code>).
+            It runs with the app's identity, so that principal needs workspace + jobs-create permission.
           </div>
         </CardContent>
       </Card>
@@ -449,5 +513,92 @@ export function MonitorJobBuilder({ domain, domainLabel }: { domain: string; dom
         </CardContent>
       </Card>
     </div>
+  );
+}
+
+// Jobs & schedules — a pop-up panel auditing every monitoring job defined in the
+// app (schedule, deploy status, provisioned Databricks Job link, last run). This
+// is currently the only place the app submits/schedules Databricks Jobs; if more
+// are added they should register in jai_monitor_job and surface here.
+function JobsSchedulesDialog() {
+  const [open, setOpen] = useState(false);
+  const [jobs, setJobs] = useState<MonitorJobSummary[]>([]);
+  const [loading, setLoading] = useState(false);
+
+  useEffect(() => {
+    if (!open) return;
+    setLoading(true);
+    void fetchMonitorJobs().then((j) => {
+      setJobs(j);
+      setLoading(false);
+    });
+  }, [open]);
+
+  const human = (cron?: string) => CRON_PRESETS.find((c) => c.value === cron)?.label ?? cron ?? '—';
+
+  return (
+    <Dialog open={open} onOpenChange={setOpen}>
+      <DialogTrigger asChild>
+        <Button size="sm" variant="outline" className="gap-1.5 shrink-0">
+          <ListChecks className="h-3.5 w-3.5" /> Jobs & schedules
+        </Button>
+      </DialogTrigger>
+      <DialogContent className="max-w-3xl">
+        <DialogHeader>
+          <DialogTitle>Jobs &amp; schedules</DialogTitle>
+          <DialogDescription>
+            Every monitoring job defined in this app — its schedule, whether it's deployed as a real
+            Databricks Job, and its latest run. This is the app's single job-submission surface.
+          </DialogDescription>
+        </DialogHeader>
+        {loading ? (
+          <div className="flex items-center gap-2 py-6 text-sm text-muted-foreground">
+            <Loader2 className="h-4 w-4 animate-spin" /> Loading…
+          </div>
+        ) : jobs.length === 0 ? (
+          <div className="py-6 text-sm text-muted-foreground">
+            No monitoring jobs defined yet. Save a definition in a data-backed domain, then deploy it.
+          </div>
+        ) : (
+          <div className="max-h-[60vh] overflow-auto">
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead>Domain</TableHead>
+                  <TableHead>Job name</TableHead>
+                  <TableHead>Schedule</TableHead>
+                  <TableHead>Deployed</TableHead>
+                  <TableHead>Last run</TableHead>
+                  <TableHead className="text-right">Runs</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {jobs.map((j) => (
+                  <TableRow key={j.domain}>
+                    <TableCell className="text-xs font-medium">{j.domain_label || j.domain}</TableCell>
+                    <TableCell className="text-xs"><code>{j.job_name}</code></TableCell>
+                    <TableCell className="text-xs">
+                      {human(j.schedule_cron)}
+                      <div className="text-[10px] text-muted-foreground">{j.schedule_tz}</div>
+                    </TableCell>
+                    <TableCell className="text-xs">
+                      {j.databricks_job_id && j.job_url ? (
+                        <a href={j.job_url} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 text-primary underline">
+                          #{j.databricks_job_id} <ExternalLink className="h-3 w-3" />
+                        </a>
+                      ) : (
+                        <Badge variant="outline" className="text-[10px]">not deployed</Badge>
+                      )}
+                    </TableCell>
+                    <TableCell className="text-xs text-muted-foreground">{j.last_run ?? '—'}</TableCell>
+                    <TableCell className="text-right text-xs">{j.run_count ?? 0}</TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          </div>
+        )}
+      </DialogContent>
+    </Dialog>
   );
 }

@@ -27,6 +27,27 @@ export type MonitorJob = {
   version?: number;
   created_by?: string;
   updated_at?: string;
+  databricks_job_id?: string | null;
+  job_url?: string | null;
+  job_notebook_path?: string | null;
+  job_deployed_at?: string | null;
+};
+
+// one row in the Jobs & schedules panel
+export type MonitorJobSummary = {
+  domain: string;
+  domain_label?: string;
+  job_name: string;
+  schedule_cron?: string;
+  schedule_tz?: string;
+  enabled?: boolean;
+  version?: number;
+  databricks_job_id?: string | null;
+  job_url?: string | null;
+  job_notebook_path?: string | null;
+  job_deployed_at?: string | null;
+  last_run?: string | null;
+  run_count?: number;
 };
 
 export type MonitorRun = {
@@ -118,6 +139,33 @@ export async function fetchMonitorRuns(domain: string, limit = 60): Promise<Moni
     const r = await fetch(`/api/monitor-runs?domain=${encodeURIComponent(domain)}&limit=${limit}`);
     const d = await r.json();
     return Array.isArray(d?.runs) ? d.runs : [];
+  } catch {
+    return [];
+  }
+}
+
+// Deploy the saved definition as a real scheduled Databricks Job.
+export async function deployMonitorJob(
+  domain: string
+): Promise<{ ok: boolean; databricks_job_id?: string; job_url?: string; notebook_path?: string; schedule_cron?: string; error?: string }> {
+  try {
+    const r = await fetch('/api/monitor-deploy-job', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ domain }),
+    });
+    return await r.json();
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : String(e) };
+  }
+}
+
+// Every defined/provisioned monitoring job (for the Jobs & schedules panel).
+export async function fetchMonitorJobs(): Promise<MonitorJobSummary[]> {
+  try {
+    const r = await fetch('/api/monitor-jobs');
+    const d = await r.json();
+    return Array.isArray(d?.jobs) ? d.jobs : [];
   } catch {
     return [];
   }
