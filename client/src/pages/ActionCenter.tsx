@@ -61,10 +61,7 @@ export function ActionCenter() {
     productScope,
     schemaEntries,
     selectedSchemaIds,
-    mode,
   } = useProduct();
-  // Monitoring (SQL + schedules) is a builder concern; hide it in business mode.
-  const showMonitor = mode === 'builder' && Boolean(selectedProduct.dataAvailable);
   const { queue, setQueue, addAction } = useActions();
   const live = components.live;
   const dataAvailable = Boolean(selectedProduct.dataAvailable);
@@ -124,7 +121,7 @@ export function ActionCenter() {
         <TabsList>
           <TabsTrigger value="actions">Actions</TabsTrigger>
           <TabsTrigger value="log">Action Log</TabsTrigger>
-          {showMonitor && <TabsTrigger value="monitor">Monitoring Job</TabsTrigger>}
+          {dataAvailable && <TabsTrigger value="monitor">Monitoring Job</TabsTrigger>}
         </TabsList>
 
         <TabsContent value="actions" className="space-y-6 mt-4">
@@ -165,7 +162,7 @@ export function ActionCenter() {
           <ActionLogTracker product={selectedProduct.display_name} />
         </TabsContent>
 
-        {showMonitor && (
+        {dataAvailable && (
           <TabsContent value="monitor" className="mt-4">
             <MonitorJobBuilder
               key={`monitor-${selectedDomain?.name ?? ''}`}
