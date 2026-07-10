@@ -290,6 +290,14 @@ function DomainControl() {
             <div className="text-xs font-medium text-muted-foreground px-1 pb-1">
               Combine domains ({toMerge.length} selected)
             </div>
+            {/* single check mark to select every domain at once */}
+            <label className="flex items-center gap-2 rounded-md px-2 py-1.5 text-sm font-medium hover:bg-muted cursor-pointer border-b mb-0.5">
+              <Checkbox
+                checked={domains.length > 0 && domains.every((d) => toMerge.includes(d.name))}
+                onCheckedChange={(v) => setToMerge(v ? domains.map((d) => d.name) : [])}
+              />
+              <span>All domains</span>
+            </label>
             <div className="flex flex-col gap-0.5 max-h-56 overflow-auto">
               {domains.map((d) => (
                 <label
