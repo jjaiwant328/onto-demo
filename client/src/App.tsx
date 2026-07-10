@@ -35,6 +35,7 @@ import {
   RotateCcw,
   Loader2,
   Settings,
+  Save,
 } from 'lucide-react';
 import { ProductProvider, useProduct, ALL_SCOPE } from './lib/product';
 import { ActionsContext, type ActionItem } from './lib/actions';
@@ -158,7 +159,9 @@ function SchemaList() {
     combined,
     isBundledSchema,
     removeSchema,
+    storeSchema,
   } = useProduct();
+  const [storingId, setStoringId] = useState<string | null>(null);
   return (
     <div className="rounded-md border">
       <div className="flex items-center justify-between px-2 py-1.5 border-b">
@@ -177,6 +180,8 @@ function SchemaList() {
         {schemaEntries.map((s) => {
           const bundled = isBundledSchema(s.id);
           const isCurated = s.id === 'fc_entdata_gold';
+          // ephemeral = loaded this session but not yet in the durable store
+          const ephemeral = !bundled && !s.savedId;
           const title = isCurated
             ? 'Delete Retailer — removes the live flagship (restore via Reset)'
             : bundled
@@ -193,6 +198,23 @@ function SchemaList() {
                 aria-label={s.label}
               />
               <span className="truncate flex-1">{s.label}</span>
+              {s.savedId && <Save className="h-3 w-3 text-emerald-600 shrink-0" aria-label="stored" />}
+              {ephemeral && (
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="h-6 w-6 p-0 shrink-0"
+                  title="Store durably (survives reloads)"
+                  disabled={storingId === s.id}
+                  onClick={async () => {
+                    setStoringId(s.id);
+                    await storeSchema(s.id);
+                    setStoringId(null);
+                  }}
+                >
+                  {storingId === s.id ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Save className="h-3.5 w-3.5 text-primary" />}
+                </Button>
+              )}
               <Button
                 variant="ghost"
                 size="sm"

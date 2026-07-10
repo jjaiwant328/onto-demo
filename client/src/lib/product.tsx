@@ -123,6 +123,9 @@ export type ProductContextValue = {
   saveSchema: (
     args: { customer: string; schemaName: string; source: string; catalogRef?: string; schema: Schema }
   ) => Promise<{ ok: boolean; error?: string }>;
+  // persist an already-loaded (ephemeral) registry entry to the durable store,
+  // converting it in place (keeps its loaded content; no duplicate entry).
+  storeSchema: (entryId: string) => Promise<{ ok: boolean; error?: string }>;
   deleteSavedSchema: (schemaId: string) => Promise<void>;
   schema: Schema;
   catalog: Catalog;
@@ -901,6 +904,34 @@ export function ProductProvider({ children }: { children: ReactNode }) {
     [refreshSavedSchemas]
   );
 
+  // Persist an ephemeral (loaded-but-unsaved) entry to the durable store and convert
+  // it in place: give it the returned saved id so it becomes the durable entry
+  // (keeps its already-loaded content, and mergeSaved won't add a duplicate).
+  const storeSchema = useCallback(
+    async (entryId: string): Promise<{ ok: boolean; error?: string }> => {
+      const entry = schemasReg.find((s) => s.id === entryId);
+      if (!entry) return { ok: false, error: 'not found' };
+      if (entry.bundled || entry.savedId) return { ok: false, error: 'already persistent' };
+      try {
+        const resp = await fetch('/api/save-schema', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ customer: entry.label, schemaName: entry.label, source: 'stored', schema: entry.schema }),
+        });
+        const data = await resp.json();
+        if (!data?.ok || !data.schema_id) return { ok: false, error: data?.error ?? 'save failed' };
+        const newId = `saved:${data.schema_id}`;
+        setSchemasReg((prev) => prev.map((s) => (s.id === entryId ? { ...s, id: newId, savedId: data.schema_id } : s)));
+        setSelectedSchemaIds((prev) => prev.map((id) => (id === entryId ? newId : id)));
+        await refreshSavedSchemas();
+        return { ok: true };
+      } catch (err) {
+        return { ok: false, error: err instanceof Error ? err.message : String(err) };
+      }
+    },
+    [schemasReg, refreshSavedSchemas]
+  );
+
   const deleteSavedSchema = useCallback(async (schemaId: string) => {
     try {
       await fetch('/api/delete-saved-schema', {
@@ -1192,6 +1223,7 @@ export function ProductProvider({ children }: { children: ReactNode }) {
     savedSchemas,
     refreshSavedSchemas,
     saveSchema,
+    storeSchema,
     deleteSavedSchema,
     schema,
     catalog,

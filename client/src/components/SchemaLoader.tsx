@@ -46,7 +46,7 @@ export function SchemaLoader() {
   const [status, setStatus] = useState<string | null>(null);
   const [filterNote, setFilterNote] = useState<string | null>(null);
   const [includeSystem, setIncludeSystem] = useState(false); // filter ON by default
-  const [storeOnLoad, setStoreOnLoad] = useState(false); // persist to the durable store
+  const [storeOnLoad, setStoreOnLoad] = useState(true); // persist to the durable store (on by default)
   const [schemaLabel, setSchemaLabel] = useState('');
   // optional grouping label saved to the store's `customer` field
   const [groupLabel, setGroupLabel] = useState('');
