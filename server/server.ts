@@ -8,6 +8,8 @@ import {
   DEMO_PRODUCTS,
   ALL_DEMO_DOMAINS,
   QSR_SC_REASONING_RULES,
+  QSR_SC_SCHEMA,
+  QSR_SC_MITIGATIONS,
 } from '../shared/demoDomains';
 import {
   serializeTtl,
@@ -699,7 +701,8 @@ createApp({
         const b = (req.body ?? {}) as { product?: string };
         const product = (b.product ?? '').trim();
         const meta = DEMO_PRODUCTS[product];
-        const aggSql = demoAggregateSql(product);
+        // net out any resolved mitigations so the Action Center count matches the Home
+        const aggSql = netAggregateSql(product, (await activeMitigationPredicates())[product] ?? []);
         const rowSql = demoExceptionSql(product, 8); // a few representative examples
         if (!meta || !aggSql || !rowSql) {
           res.status(400).json({ actions: [], reason: 'not a data-backed product', rows: [], stats: null });
@@ -1757,6 +1760,702 @@ createApp({
           res.json({ jobs: rows });
         } catch (err) {
           res.json({ jobs: [], error: humanizeSqlError(err) });
+        }
+      });
+
+      // ============ Control Tower (business decision surfaces) ================
+      const sqlStr = (v: unknown) => `'${String(v ?? '').replace(/'/g, "''")}'`;
+      // stat keys that signal a CRITICAL sub-count within a product's aggregate
+      const CRITICAL_KEYS = ['critical_items', 'failures', 'outage_driven', 'severely_late', 'single_source_suppliers'];
+      const humanizeKey = (k: string) => (k || '').replace(/_/g, ' ');
+      const QSR_GENIE_SPACE_ID = process.env.QSR_GENIE_SPACE_ID || '01f17a4306e818a183ff3f10237d5a56';
+      // supply-chain (data-backed) products with their domain
+      const scProducts = () =>
+        ALL_DEMO_DOMAINS.flatMap((d) =>
+          d.products.filter((p) => p.backing_schema === QSR_SC_SCHEMA).map((p) => ({ p, domainName: d.name, domainLabel: d.label }))
+        );
+
+      // The snapshot lives in a Delta table so a scheduled notebook job can maintain
+      // exactly what the app reads (Lakebase isn't writable from a job notebook).
+      const CT_SNAPSHOT = 'jai_ontos.demo_schema.jai_control_tower_snapshot';
+      const CT_SNAPSHOT_DDL =
+        `CREATE TABLE IF NOT EXISTS ${CT_SNAPSHOT} (product_name string, domain string, ` +
+        `headline_metric string, headline_value double, critical_metric string, ` +
+        `critical_value double, severity string, metrics_json string, computed_at timestamp) USING delta`;
+
+      type CtCard = {
+        product_name: string;
+        display_name: string;
+        business_outcome: string;
+        domain: string;
+        domain_label: string;
+        headline_metric: string;
+        headline_value: number;
+        critical_metric: string | null;
+        critical_value: number;
+        kpis: Record<string, unknown>;
+        severity: string;
+      };
+      const parseKpis = (s: string): Record<string, unknown> => {
+        try {
+          return JSON.parse(s || '{}');
+        } catch {
+          return {};
+        }
+      };
+
+      // ---- Mitigation ledger: approved actions the app has "dispatched" to a system
+      // of record (simulated). A RESOLVED mitigation nets its slice out of the exception
+      // aggregates (anti-predicate), so the KPI drops everywhere; source facts untouched.
+      const INTERVENTION_LOG = 'jai_ontos.demo_schema.jai_intervention_log';
+      const INTERVENTION_DDL =
+        `CREATE TABLE IF NOT EXISTS ${INTERVENTION_LOG} (intervention_id string, product_name string, ` +
+        `domain string, action_key string, action_label string, target_system string, work_order_id string, ` +
+        `status string, mitigation_predicate string, effect_label string, expected_delta double, ` +
+        `created_by string, created_at timestamp, resolved_at timestamp) USING delta`;
+      // product_name → anti-predicates from RESOLVED mitigations (best-effort; [] if none)
+      const activeMitigationPredicates = async (): Promise<Record<string, string[]>> => {
+        try {
+          const rows = (await runSql(
+            `SELECT product_name, mitigation_predicate FROM ${INTERVENTION_LOG} WHERE status = 'resolved'`
+          )) as unknown as { product_name: string; mitigation_predicate: string }[];
+          const map: Record<string, string[]> = {};
+          for (const r of rows) (map[r.product_name] ??= []).push(r.mitigation_predicate);
+          return map;
+        } catch {
+          return {}; // ledger not created yet
+        }
+      };
+      // append ` AND NOT (pred)` for each active mitigation to a product's aggregate SQL
+      const netAggregateSql = (productName: string, preds: string[]): string | null => {
+        const base = demoAggregateSql(productName);
+        if (!base || !preds.length) return base;
+        return base + preds.map((p) => ` AND NOT (${p})`).join('');
+      };
+
+      // Compute the cards LIVE (scans the fact tables). Used to build the snapshot and
+      // as a fallback so the Home always has data even if the snapshot can't be written.
+      const computeCardsLive = async (): Promise<CtCard[]> => {
+        const out: CtCard[] = [];
+        const mitig = await activeMitigationPredicates();
+        for (const { p, domainName, domainLabel } of scProducts()) {
+          const sql = netAggregateSql(p.product_name, mitig[p.product_name] ?? []);
+          if (!sql) continue;
+          try {
+            const stats = ((await runSql(sql))[0] ?? {}) as Record<string, unknown>;
+            const [metric, raw] = Object.entries(stats)[0] ?? ['count', 0];
+            const headline = Number(raw) || 0;
+            const criticalKey = CRITICAL_KEYS.find((k) => Number(stats[k] ?? 0) > 0);
+            out.push({
+              product_name: p.product_name,
+              display_name: p.display_name,
+              business_outcome: p.business_outcome,
+              domain: domainName,
+              domain_label: domainLabel,
+              headline_metric: String(metric),
+              headline_value: headline,
+              critical_metric: criticalKey ?? null,
+              critical_value: criticalKey ? Number(stats[criticalKey] ?? 0) : 0,
+              kpis: stats,
+              severity: criticalKey ? 'high' : headline > 0 ? 'medium' : 'ok',
+            });
+          } catch {
+            /* skip a product that fails to aggregate */
+          }
+        }
+        return out;
+      };
+
+      // Recompute + OVERWRITE the Delta snapshot (the fast-read table). Throws if the
+      // write fails (e.g. missing MODIFY grant) so the Refresh button can report it.
+      const refreshControlTowerSnapshot = async (): Promise<number> => {
+        const cards = await computeCardsLive();
+        if (!cards.length) return 0;
+        const values = cards.map(
+          (c) =>
+            `(${sqlStr(c.product_name)}, ${sqlStr(c.domain)}, ${sqlStr(c.headline_metric)}, ${c.headline_value}, ` +
+            `${c.critical_metric ? sqlStr(c.critical_metric) : 'NULL'}, ${c.critical_value}, ${sqlStr(c.severity)}, ` +
+            `${sqlStr(JSON.stringify(c.kpis))}, current_timestamp())`
+        );
+        await runSql(CT_SNAPSHOT_DDL);
+        await runSql(`INSERT OVERWRITE ${CT_SNAPSHOT} VALUES ${values.join(', ')}`);
+        return cards.length;
+      };
+
+      // Read the snapshot (fast path). Returns null if the table is missing/empty or
+      // unreadable, signalling the caller to fall back to a live compute.
+      const readSnapshotCards = async (): Promise<{ cards: CtCard[]; computedAt: string | null } | null> => {
+        const q =
+          `SELECT product_name, domain, headline_metric, cast(headline_value as double) AS headline_value, ` +
+          `critical_metric, cast(critical_value as double) AS critical_value, severity, metrics_json, ` +
+          `cast(computed_at as string) AS computed_at FROM ${CT_SNAPSHOT}`;
+        try {
+          const rows = (await runSql(q)) as unknown as {
+            product_name: string; domain: string; headline_metric: string; headline_value: number;
+            critical_metric: string | null; critical_value: number; severity: string; metrics_json: string; computed_at: string;
+          }[];
+          if (!rows.length) return null;
+          const cards = rows
+            .map((r): CtCard | null => {
+              const meta = DEMO_PRODUCTS[r.product_name];
+              if (!meta) return null;
+              return {
+                product_name: r.product_name,
+                display_name: meta.display_name,
+                business_outcome: meta.business_outcome,
+                domain: r.domain,
+                domain_label: meta.domainLabel,
+                headline_metric: r.headline_metric,
+                headline_value: Number(r.headline_value) || 0,
+                critical_metric: r.critical_metric,
+                critical_value: Number(r.critical_value) || 0,
+                kpis: parseKpis(r.metrics_json),
+                severity: r.severity,
+              };
+            })
+            .filter((c): c is CtCard => c !== null);
+          const computedAt = rows.map((r) => r.computed_at).sort().slice(-1)[0] ?? null;
+          return { cards, computedAt };
+        } catch {
+          return null;
+        }
+      };
+
+      // Cards for the Home/Inbox/Ask: prefer the snapshot; if absent, try to build it
+      // (best-effort); if that also fails (e.g. no write grant), compute live so the UI
+      // is never blank.
+      const getControlTowerCards = async (): Promise<{ cards: CtCard[]; computedAt: string | null; source: 'snapshot' | 'live' }> => {
+        const snap = await readSnapshotCards();
+        if (snap) return { ...snap, source: 'snapshot' };
+        try {
+          await refreshControlTowerSnapshot();
+          const rebuilt = await readSnapshotCards();
+          if (rebuilt) return { ...rebuilt, source: 'snapshot' };
+        } catch {
+          /* write failed — fall through to live compute */
+        }
+        return { cards: await computeCardsLive(), computedAt: null, source: 'live' };
+      };
+
+      // Cross-product "what needs attention today" — READS the pre-aggregated snapshot
+      // (fast; no live fact-table scan). Optional ?domain= narrows to one layer.
+      app.get('/api/control-tower-summary', async (req, res) => {
+        const domainFilter = String(req.query.domain ?? '').trim();
+        try {
+          const { cards: all, computedAt, source } = await getControlTowerCards();
+          const cards = domainFilter ? all.filter((c) => c.domain === domainFilter) : all;
+          const high = cards.filter((c) => c.severity === 'high').length;
+          const medium = cards.filter((c) => c.severity === 'medium').length;
+          const healthScore = Math.max(0, Math.min(100, 100 - high * 12 - medium * 5));
+          res.json({ products: cards, health_score: healthScore, issues_total: high + medium, high, medium, computed_at: computedAt, source });
+        } catch (err) {
+          res.json({ products: [], health_score: 0, issues_total: 0, high: 0, medium: 0, error: humanizeSqlError(err) });
+        }
+      });
+
+      // Force a snapshot recompute (the Home "Refresh" button / a scheduled job).
+      app.post('/api/control-tower-refresh', async (_req, res) => {
+        try {
+          const n = await refreshControlTowerSnapshot();
+          res.json({ ok: true, refreshed: n });
+        } catch (err) {
+          res.json({ ok: false, error: humanizeSqlError(err) });
+        }
+      });
+
+      // ---- Mitigation workflow (closed loop over a simulated system of record) ----
+      const MITIGATION_STEPS = ['submitted', 'acknowledged', 'in_progress', 'resolved'] as const;
+      // Create a mitigation: "dispatch" the approved play to its system of record.
+      app.post('/api/mitigations', async (req, res) => {
+        const product = String((req.body as { product_name?: string })?.product_name ?? '').trim();
+        const meta = DEMO_PRODUCTS[product];
+        const m = QSR_SC_MITIGATIONS[product];
+        if (!meta || !m) {
+          res.status(400).json({ ok: false, error: 'no mitigation defined for this product' });
+          return;
+        }
+        try {
+          // projected effect = the critical slice being cleared (from a live count)
+          let expectedDelta = 0;
+          try {
+            const r = (await runSql(
+              `SELECT count(*) AS n FROM ${meta.backing_schema ?? QSR_SC_SCHEMA}.${meta.table} ` +
+                `WHERE ${meta.exception_where} AND (${m.mitigation_predicate})`
+            ))[0] as { n?: unknown };
+            expectedDelta = Number(r?.n ?? 0) || 0;
+          } catch {
+            /* leave 0 */
+          }
+          const id = `mit_${Date.now().toString(36)}_${randomUUID().slice(0, 6)}`;
+          const wo = `WO-${Math.floor(1000 + Math.random() * 9000)}`;
+          const who = (await whoami()) || 'unknown';
+          const domain = ALL_DEMO_DOMAINS.find((d) => d.products.some((p) => p.product_name === product))?.name ?? '';
+          await runSql(INTERVENTION_DDL);
+          await runSql(
+            `INSERT INTO ${INTERVENTION_LOG} VALUES (${sqlStr(id)}, ${sqlStr(product)}, ${sqlStr(domain)}, ` +
+              `${sqlStr(m.action_key)}, ${sqlStr(m.action_label)}, ${sqlStr(m.target_system)}, ${sqlStr(wo)}, ` +
+              `'submitted', ${sqlStr(m.mitigation_predicate)}, ${sqlStr(m.effect_label)}, ${expectedDelta}, ` +
+              `${sqlStr(who)}, current_timestamp(), NULL)`
+          );
+          // record the decision in the action log too (dedup by product+issue)
+          await lbQuery(
+            `INSERT INTO action_log (action_id, created_at, updated_at, schema_label, domain, product, source, ` +
+              `priority, issue, root_cause, recommended_action, confidence, decision, track_status, decided_by, ` +
+              `decided_at, ref_entity, notes) VALUES ($1, now(), now(), 'QSR Supply Chain', $2, $3, 'exception', ` +
+              `'HIGH', $4, '', $5, 0.7, 'approved', 'in_progress', $6, now(), $7, '') ` +
+              `ON CONFLICT (action_id) DO UPDATE SET decision='approved', track_status='in_progress', ` +
+              `recommended_action=EXCLUDED.recommended_action, decided_at=now(), updated_at=now()`,
+            [
+              `act_${createHash('sha1').update(`${meta.display_name}|${m.action_label}`).digest('hex').slice(0, 16)}`,
+              domain, meta.display_name, `Mitigate: ${meta.issue}`, m.action_label, who, wo,
+            ]
+          ).catch(() => {});
+          res.json({ ok: true, intervention_id: id, work_order_id: wo, target_system: m.target_system, status: 'submitted', expected_delta: expectedDelta, action_label: m.action_label, action_key: m.action_key, mitigation_predicate: m.mitigation_predicate });
+        } catch (err) {
+          res.json({ ok: false, error: humanizeSqlError(err) });
+        }
+      });
+
+      // Advance a mitigation's status (submitted→acknowledged→in_progress→resolved).
+      // On resolve, refresh the snapshot so the KPI drop shows on the Home.
+      app.post('/api/mitigation-advance', async (req, res) => {
+        const id = String((req.body as { intervention_id?: string })?.intervention_id ?? '').trim();
+        if (!id) {
+          res.status(400).json({ ok: false, error: 'intervention_id required' });
+          return;
+        }
+        try {
+          const cur = (await runSql(`SELECT status FROM ${INTERVENTION_LOG} WHERE intervention_id = ${sqlStr(id)}`))[0] as { status?: string };
+          const idx = MITIGATION_STEPS.indexOf((cur?.status ?? 'submitted') as (typeof MITIGATION_STEPS)[number]);
+          const next = MITIGATION_STEPS[Math.min(idx + 1, MITIGATION_STEPS.length - 1)];
+          const resolvedAt = next === 'resolved' ? 'current_timestamp()' : 'resolved_at';
+          await runSql(`UPDATE ${INTERVENTION_LOG} SET status = ${sqlStr(next)}, resolved_at = ${resolvedAt} WHERE intervention_id = ${sqlStr(id)}`);
+          if (next === 'resolved') await refreshControlTowerSnapshot().catch(() => {});
+          res.json({ ok: true, status: next });
+        } catch (err) {
+          res.json({ ok: false, error: humanizeSqlError(err) });
+        }
+      });
+
+      // List mitigations (newest first) for the status/connector surfaces.
+      app.get('/api/mitigations', async (_req, res) => {
+        try {
+          const rows = await runSql(
+            `SELECT intervention_id, product_name, domain, action_key, action_label, target_system, work_order_id, ` +
+              `status, mitigation_predicate, effect_label, expected_delta, ` +
+              `cast(created_at as string) AS created_at, cast(resolved_at as string) AS resolved_at ` +
+              `FROM ${INTERVENTION_LOG} ORDER BY created_at DESC`
+          ).catch(() => [] as Record<string, unknown>[]);
+          res.json({ mitigations: rows });
+        } catch (err) {
+          res.json({ mitigations: [], error: humanizeSqlError(err) });
+        }
+      });
+
+      // Reset the demo: clear all mitigations and rebuild the snapshot.
+      app.post('/api/mitigations-reset', async (_req, res) => {
+        try {
+          await runSql(`DELETE FROM ${INTERVENTION_LOG}`).catch(() => {});
+          await refreshControlTowerSnapshot().catch(() => {});
+          res.json({ ok: true });
+        } catch (err) {
+          res.json({ ok: false, error: humanizeSqlError(err) });
+        }
+      });
+
+      // Unified Action Inbox: one prioritized worklist across ALL supply-chain
+      // products — READS the pre-aggregated snapshot (no live scan), turns each
+      // needs-attention product into an actionable item ranked by severity then size,
+      // and layers the curated playbook so it renders without the LLM.
+      app.get('/api/action-inbox', async (_req, res) => {
+        try {
+          const { cards } = await getControlTowerCards();
+          const items = cards
+            .filter((c) => c.severity !== 'ok')
+            .map((c) => {
+              const meta = DEMO_PRODUCTS[c.product_name];
+              const pb = meta?.playbook ?? [];
+              return {
+                id: `inbox-${c.product_name}`,
+                product_name: c.product_name,
+                product_display: c.display_name,
+                domain: c.domain,
+                domain_label: c.domain_label,
+                severity: c.severity,
+                priority: c.severity === 'high' ? 'HIGH' : c.severity === 'medium' ? 'MEDIUM' : 'LOW',
+                headline_metric: c.headline_metric,
+                headline_value: c.headline_value,
+                critical_metric: c.critical_metric,
+                critical_value: c.critical_value,
+                issue: `${c.headline_value.toLocaleString()} ${humanizeKey(c.headline_metric)} — ${meta?.issue ?? ''}`,
+                root_cause: pb[0]?.root_cause ?? '',
+                recommended_action: pb[0]?.recommended_action ?? meta?.action_hint ?? '',
+                kpis: c.kpis,
+              };
+            });
+          const rank = { HIGH: 0, MEDIUM: 1, LOW: 2 } as Record<string, number>;
+          items.sort((a, b) => (rank[a.priority] - rank[b.priority]) || b.headline_value - a.headline_value);
+          res.json({ items });
+        } catch (err) {
+          res.json({ items: [], error: humanizeSqlError(err) });
+        }
+      });
+
+      // Ask the Control Tower: a fast, grounded, CACHED answer over the LIVE
+      // aggregate signals (role-framed). Genie is offered for deeper exploration.
+      app.post('/api/control-tower-ask', async (req, res) => {
+        const b = (req.body ?? {}) as { question?: string; role?: string };
+        const question = String(b.question ?? '').trim();
+        const role = String(b.role ?? '').trim();
+        if (!question) {
+          res.status(400).json({ answer: null, error: 'question required' });
+          return;
+        }
+        if (!hasLlm) {
+          res.json({ answer: null, llm: false, reason: 'no serving endpoint configured' });
+          return;
+        }
+        // grounding from the snapshot (falls back to live compute if unavailable)
+        const signals: string[] = [];
+        try {
+          const { cards } = await getControlTowerCards();
+          for (const c of cards) {
+            signals.push(`- ${c.display_name}: ${c.headline_value} ${humanizeKey(c.headline_metric)}`);
+          }
+        } catch {
+          /* signals unavailable — answer with none */
+        }
+        const rolePrefix = role ? `You are advising the ${role} of a restaurant chain. ` : '';
+        const prompt =
+          `${rolePrefix}You are the QSR Supply Chain Control Tower assistant. Answer the question using ONLY ` +
+          `the live aggregate signals below — do not invent data. Be concise (2-4 sentences), cite the ` +
+          `relevant numbers, and end with one recommended action.\n\nLIVE SIGNALS (today):\n${signals.join('\n')}\n\n` +
+          `QUESTION: ${question}`;
+        const answer = await llmComplete(prompt, 600, { label: 'control-tower-ask' });
+        res.json({ answer: answer ?? null, llm: Boolean(answer), signals_count: signals.length });
+      });
+
+      // Control Tower config for the client (Genie deep-link + LLM availability).
+      app.get('/api/control-tower-config', async (_req, res) => {
+        let host = '';
+        try {
+          const w = getWorkspaceClient({});
+          await w.config.ensureResolved?.();
+          host = w.config.host ?? process.env.DATABRICKS_HOST ?? '';
+        } catch {
+          host = process.env.DATABRICKS_HOST ?? '';
+        }
+        host = host.startsWith('http') ? host : host ? `https://${host}` : '';
+        let refreshJob: { databricks_job_id: string; job_url: string; schedule_cron: string; job_deployed_at: string } | null = null;
+        try {
+          const row = (await lbQuery(
+            `SELECT databricks_job_id, job_url, schedule_cron, to_char(job_deployed_at,'YYYY-MM-DD HH24:MI:SS') AS job_deployed_at ` +
+              `FROM jai_monitor_job WHERE domain = '__control_tower__' AND databricks_job_id IS NOT NULL`
+          ))[0] as unknown as typeof refreshJob;
+          if (row) refreshJob = row;
+        } catch {
+          /* ignore */
+        }
+        res.json({
+          genie_url: host && QSR_GENIE_SPACE_ID ? `${host}/genie/rooms/${QSR_GENIE_SPACE_ID}` : '',
+          llm: hasLlm,
+          refresh_job: refreshJob,
+        });
+      });
+
+      // Build the Control Tower snapshot-refresh notebook (Python): recompute every
+      // supply-chain product's aggregate and OVERWRITE the Delta snapshot table.
+      const buildControlTowerNotebook = (): string => {
+        const queries: Record<string, { sql: string; domain: string }> = {};
+        for (const { p, domainName } of scProducts()) {
+          const sql = demoAggregateSql(p.product_name);
+          if (sql) queries[p.product_name] = { sql, domain: domainName };
+        }
+        return [
+          '# Databricks notebook source',
+          '# Auto-generated by RT_onto — refreshes the Control Tower snapshot the app reads.',
+          'from datetime import datetime',
+          'import json',
+          `TABLE = ${JSON.stringify(CT_SNAPSHOT)}`,
+          `CRITICAL_KEYS = json.loads(r'''${JSON.stringify(CRITICAL_KEYS)}''')`,
+          `QUERIES = json.loads(r'''${JSON.stringify(queries)}''')`,
+          '',
+          'spark.sql(f"""CREATE TABLE IF NOT EXISTS {TABLE} (product_name string, domain string,',
+          '  headline_metric string, headline_value double, critical_metric string, critical_value double,',
+          '  severity string, metrics_json string, computed_at timestamp) USING delta""")',
+          'now = datetime.utcnow()',
+          'rows = []',
+          'for product, cfg in QUERIES.items():',
+          '    try:',
+          '        rec = spark.sql(cfg["sql"]).limit(1).collect()',
+          '        stats = rec[0].asDict() if rec else {}',
+          '    except Exception:',
+          '        stats = {}',
+          '    items = list(stats.items())',
+          '    metric, raw = (items[0] if items else ("count", 0))',
+          '    try:',
+          '        headline = float(raw) if raw is not None else 0.0',
+          '    except Exception:',
+          '        headline = 0.0',
+          '    def _num(v):',
+          '        try:\n            return float(v)\n        except Exception:\n            return 0.0',
+          '    crit = next((k for k in CRITICAL_KEYS if _num(stats.get(k)) > 0), None)',
+          '    sev = "high" if crit else ("medium" if headline > 0 else "ok")',
+          '    crit_val = _num(stats.get(crit)) if crit else 0.0',
+          '    rows.append((product, cfg["domain"], str(metric), headline, crit, crit_val, sev,',
+          '                 json.dumps({k: str(v) for k, v in stats.items()}), now))',
+          'cols = ["product_name","domain","headline_metric","headline_value","critical_metric","critical_value","severity","metrics_json","computed_at"]',
+          'spark.createDataFrame(rows, cols).write.mode("overwrite").saveAsTable(TABLE)',
+          'print(f"control tower snapshot refreshed: {len(rows)} products")',
+          '',
+        ].join('\n');
+      };
+
+      // Deploy the scheduled Control Tower refresh as a real serverless Databricks Job
+      // (imports the notebook, creates/updates the Job on a cron). Registered in
+      // jai_monitor_job under a synthetic domain so it shows in Jobs & schedules.
+      app.post('/api/control-tower-deploy-job', async (req, res) => {
+        const cron = String((req.body as { cron?: string })?.cron || '0 0 6 * * ?');
+        const tz = 'America/New_York';
+        const jobName = 'jai_control_tower_refresh_daily';
+        try {
+          const who = (await whoami()) || 'unknown';
+          const nbDir = `/Users/${who}/jai_monitor`;
+          const nbPath = `${nbDir}/${jobName}`;
+          await authFetch('/api/2.0/workspace/mkdirs', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            rawBody: JSON.stringify({ path: nbDir }),
+          }).catch(() => {});
+          const nbContent = Buffer.from(buildControlTowerNotebook()).toString('base64');
+          const imp = await authFetch('/api/2.0/workspace/import', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            rawBody: JSON.stringify({ path: nbPath, format: 'SOURCE', language: 'PYTHON', content: nbContent, overwrite: true }),
+          });
+          if (!imp.ok) {
+            res.json({ ok: false, error: `notebook import failed (${imp.status}): ${(await imp.text()).slice(0, 300)}` });
+            return;
+          }
+          const settings = {
+            name: jobName,
+            tags: { app: 'rt_onto', kind: 'control_tower_refresh' },
+            schedule: { quartz_cron_expression: cron, timezone_id: tz, pause_status: 'UNPAUSED' },
+            tasks: [{ task_key: 'refresh_snapshot', notebook_task: { notebook_path: nbPath, source: 'WORKSPACE' } }],
+          };
+          const existing = (await lbQuery<{ databricks_job_id: string | null }>(
+            `SELECT databricks_job_id FROM jai_monitor_job WHERE domain = '__control_tower__'`
+          ))[0]?.databricks_job_id;
+          let dbId = existing ?? '';
+          if (existing) {
+            const rs = await authFetch('/api/2.1/jobs/reset', {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              rawBody: JSON.stringify({ job_id: Number(existing), new_settings: settings }),
+            });
+            if (!rs.ok) {
+              if (rs.status === 400 || rs.status === 404) dbId = '';
+              else {
+                res.json({ ok: false, error: `jobs/reset failed (${rs.status}): ${(await rs.text()).slice(0, 300)}` });
+                return;
+              }
+            }
+          }
+          if (!dbId) {
+            const cr = await authFetch('/api/2.1/jobs/create', {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              rawBody: JSON.stringify(settings),
+            });
+            const crText = await cr.text();
+            if (!cr.ok) {
+              res.json({ ok: false, error: `jobs/create failed (${cr.status}): ${crText.slice(0, 300)}` });
+              return;
+            }
+            dbId = String((JSON.parse(crText) as { job_id?: number }).job_id ?? '');
+          }
+          const host = (cachedHost ?? '').startsWith('http') ? cachedHost : `https://${cachedHost}`;
+          const jobUrl = `${host}/jobs/${dbId}`;
+          await lbQuery(
+            `INSERT INTO jai_monitor_job (job_id, domain, domain_label, job_name, schedule_cron, schedule_tz, ` +
+              `products_json, aggregates_json, enabled, version, created_by, created_at, updated_at, ` +
+              `databricks_job_id, job_url, job_notebook_path, job_deployed_at) ` +
+              `VALUES ('jai_control_tower', '__control_tower__', 'Control Tower refresh', $1, $2, $3, '[]', '[]', ` +
+              `true, 1, $4, now(), now(), $5, $6, $7, now()) ON CONFLICT (domain) DO UPDATE SET ` +
+              `schedule_cron = EXCLUDED.schedule_cron, databricks_job_id = EXCLUDED.databricks_job_id, ` +
+              `job_url = EXCLUDED.job_url, job_notebook_path = EXCLUDED.job_notebook_path, ` +
+              `job_deployed_at = now(), updated_at = now()`,
+            [jobName, cron, tz, who, dbId, jobUrl, nbPath]
+          );
+          res.json({ ok: true, databricks_job_id: dbId, job_url: jobUrl, schedule_cron: cron, notebook_path: nbPath });
+        } catch (err) {
+          res.json({ ok: false, error: humanizeSqlError(err) });
+        }
+      });
+
+      // What-if scenarios: the injected scenario catalog (heat wave, supplier outage…).
+      app.get('/api/scenarios', async (_req, res) => {
+        try {
+          const rows = await runSql(
+            `SELECT scenario_id, scenario_type, scope_kind, scope_value, ` +
+              `cast(start_date as string) AS start_date, cast(end_date as string) AS end_date, ` +
+              `effect, magnitude, description FROM ${QSR_SC_SCHEMA}.jai_scenario ` +
+              `ORDER BY start_date DESC`
+          );
+          res.json({ scenarios: rows });
+        } catch (err) {
+          res.json({ scenarios: [], error: humanizeSqlError(err) });
+        }
+      });
+
+      // Deterministic projected impact for a scenario + the matching curated playbook
+      // and reasoning rule (honest data-vs-guidance split; optional cached narrative).
+      app.post('/api/scenario-impact', async (req, res) => {
+        const b = (req.body ?? {}) as { scenario_id?: string };
+        const id = String(b.scenario_id ?? '').trim();
+        if (!id) {
+          res.status(400).json({ error: 'scenario_id required' });
+          return;
+        }
+        try {
+          const sc = (await runSql(
+            `SELECT scenario_id, scenario_type, scope_kind, scope_value, effect, magnitude, description ` +
+              `FROM ${QSR_SC_SCHEMA}.jai_scenario WHERE scenario_id = ${sqlStr(id)} LIMIT 1`
+          ))[0] as Record<string, unknown> | undefined;
+          if (!sc) {
+            res.json({ error: 'scenario not found' });
+            return;
+          }
+          const type = String(sc.scenario_type ?? '');
+          const scopeKind = String(sc.scope_kind ?? '');
+          const scopeVal = String(sc.scope_value ?? '');
+          const regionClause = scopeKind === 'region' && scopeVal ? ` AND region = ${sqlStr(scopeVal)}` : '';
+          // map scenario type → { impact query, product for playbook, reasoning rule }
+          type ImpactDef = { label: string; sql: string; product?: string; ruleId?: string };
+          const T: Record<string, ImpactDef> = {
+            supplier_outage: {
+              label: 'ingredient positions at stockout risk from the outage',
+              sql: `SELECT count(*) AS impact_count, count(distinct restaurant_id) AS restaurants FROM ${QSR_SC_SCHEMA}.jai_inventory_event WHERE stockout_risk = true AND impacted_by_supplier_outage = true`,
+              product: 'sc_inventory_stockout',
+              ruleId: 'RR4',
+            },
+            heat_wave: {
+              label: 'demand-surge forecast days in scope',
+              sql: `SELECT count(*) AS impact_count, count(distinct restaurant_id) AS restaurants, round(avg(beverage_demand_index),2) AS avg_beverage_index FROM ${QSR_SC_SCHEMA}.jai_forecast WHERE heat_wave_active = true${regionClause}`,
+              product: 'sc_forecast_demand',
+              ruleId: 'RR1',
+            },
+            promotion: {
+              label: 'promotion-driven surge days in scope',
+              sql: `SELECT count(*) AS impact_count, count(distinct restaurant_id) AS restaurants FROM ${QSR_SC_SCHEMA}.jai_forecast WHERE promo_active = true${regionClause}`,
+              product: 'sc_forecast_demand',
+              ruleId: 'RR1',
+            },
+            holiday: {
+              label: 'promotion/holiday surge days in scope',
+              sql: `SELECT count(*) AS impact_count, count(distinct restaurant_id) AS restaurants FROM ${QSR_SC_SCHEMA}.jai_forecast WHERE promo_active = true${regionClause}`,
+              product: 'sc_forecast_demand',
+            },
+            snowstorm: {
+              label: 'high-dollar waste events in scope',
+              sql: `SELECT count(*) AS impact_count, round(sum(waste_usd),0) AS waste_usd, count(distinct restaurant_id) AS restaurants FROM ${QSR_SC_SCHEMA}.jai_waste_event WHERE waste_usd > 120${regionClause}`,
+              product: 'sc_waste',
+              ruleId: 'RR3',
+            },
+            equipment_failure: {
+              label: 'equipment readings in failure / low health',
+              sql: `SELECT count(*) AS impact_count, count(distinct restaurant_id) AS restaurants FROM ${QSR_SC_SCHEMA}.jai_equipment_health WHERE status = 'Failure' OR health_score < 40`,
+              product: 'sc_equipment_health',
+              ruleId: 'RR6',
+            },
+            labor_shortage: {
+              label: 'understaffed shifts in scope',
+              sql: `SELECT count(*) AS impact_count, count(distinct restaurant_id) AS restaurants FROM ${QSR_SC_SCHEMA}.jai_labor_shift WHERE staffing_ratio < 0.8${regionClause}`,
+              product: 'sc_labor_staffing',
+              ruleId: 'RR7',
+            },
+          };
+          const def = T[type];
+          let impact: Record<string, unknown> = {};
+          if (def) {
+            try {
+              impact = ((await runSql(def.sql))[0] ?? {}) as Record<string, unknown>;
+            } catch {
+              impact = {};
+            }
+          }
+          const meta = def?.product ? DEMO_PRODUCTS[def.product] : undefined;
+          const rule = def?.ruleId ? QSR_SC_REASONING_RULES.find((r) => r.id === def.ruleId) : undefined;
+          res.json({
+            scenario: sc,
+            impact_label: def?.label ?? 'related exceptions',
+            impact,
+            product: meta ? { product_name: meta.product_name, display_name: meta.display_name } : null,
+            playbook: meta?.playbook ?? [],
+            rule: rule
+              ? { id: rule.id, name: rule.name, if_conditions: rule.if_conditions, then_conclusion: rule.then_conclusion }
+              : null,
+          });
+        } catch (err) {
+          res.json({ error: humanizeSqlError(err) });
+        }
+      });
+
+      // Entity picker for the impact explorer (suppliers / DCs / ingredients).
+      app.get('/api/impact-entities', async (req, res) => {
+        const type = String(req.query.type ?? 'supplier');
+        const q =
+          type === 'dc'
+            ? `SELECT dc_id AS id, dc_name AS name FROM ${QSR_SC_SCHEMA}.jai_dim_distribution_center ORDER BY dc_name`
+            : type === 'ingredient'
+              ? `SELECT ingredient_id AS id, ingredient_name AS name FROM ${QSR_SC_SCHEMA}.jai_dim_ingredient ORDER BY ingredient_name LIMIT 200`
+              : `SELECT supplier_id AS id, supplier_name AS name FROM ${QSR_SC_SCHEMA}.jai_dim_supplier ORDER BY supplier_name`;
+        try {
+          res.json({ entities: await runSql(q) });
+        } catch (err) {
+          res.json({ entities: [], error: humanizeSqlError(err) });
+        }
+      });
+
+      // Blast-radius: downstream at-risk restaurants/items for a supplier/DC/ingredient.
+      app.post('/api/impact-trace', async (req, res) => {
+        const b = (req.body ?? {}) as { entity_type?: string; id?: string };
+        const type = String(b.entity_type ?? 'supplier');
+        const id = String(b.id ?? '').trim();
+        if (!id) {
+          res.status(400).json({ error: 'id required' });
+          return;
+        }
+        let q = '';
+        if (type === 'supplier') {
+          q =
+            `SELECT i.ingredient_name AS name, count(distinct e.restaurant_id) AS restaurants, ` +
+            `count(*) AS at_risk_positions FROM ${QSR_SC_SCHEMA}.jai_inventory_event e ` +
+            `JOIN ${QSR_SC_SCHEMA}.jai_dim_ingredient i ON e.ingredient_id = i.ingredient_id ` +
+            `WHERE i.primary_supplier_id = ${sqlStr(id)} AND e.stockout_risk = true ` +
+            `GROUP BY 1 ORDER BY restaurants DESC`;
+        } else if (type === 'dc') {
+          q =
+            `SELECT r.region AS name, count(distinct e.restaurant_id) AS restaurants, ` +
+            `count(*) AS at_risk_positions FROM ${QSR_SC_SCHEMA}.jai_inventory_event e ` +
+            `JOIN ${QSR_SC_SCHEMA}.jai_dim_restaurant r ON e.restaurant_id = r.restaurant_id ` +
+            `WHERE r.dc_id = ${sqlStr(id)} AND e.stockout_risk = true ` +
+            `GROUP BY 1 ORDER BY at_risk_positions DESC`;
+        } else {
+          q =
+            `SELECT r.region AS name, count(distinct e.restaurant_id) AS restaurants, ` +
+            `count(*) AS at_risk_positions FROM ${QSR_SC_SCHEMA}.jai_inventory_event e ` +
+            `JOIN ${QSR_SC_SCHEMA}.jai_dim_restaurant r ON e.restaurant_id = r.restaurant_id ` +
+            `WHERE e.ingredient_id = ${sqlStr(id)} AND e.stockout_risk = true ` +
+            `GROUP BY 1 ORDER BY at_risk_positions DESC`;
+        }
+        try {
+          const rows = await runSql(q);
+          const restaurants = rows.reduce((s, r) => s + (Number(r.restaurants) || 0), 0);
+          const positions = rows.reduce((s, r) => s + (Number(r.at_risk_positions) || 0), 0);
+          res.json({ rows, total_restaurants: restaurants, total_positions: positions });
+        } catch (err) {
+          res.json({ rows: [], error: humanizeSqlError(err) });
         }
       });
 
