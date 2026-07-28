@@ -23,6 +23,15 @@ jobs:
     environment: staging
     steps:
       - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - run: npm ci
+      - run: npm run build
+
       - uses: databricks/setup-cli@main
       - run: databricks bundle deploy --target staging
       - name: Wait for app healthy

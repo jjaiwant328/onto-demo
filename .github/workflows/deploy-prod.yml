@@ -22,6 +22,15 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.release.tag_name }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - run: npm ci
+      - run: npm run build
+
       - uses: databricks/setup-cli@main
       - run: databricks bundle deploy --target prod
       - name: Wait for app healthy
