@@ -23,3 +23,10 @@ legacy_streamlit_app/app/seed/*.parquet
 .env
 *.local
 .DS_Store
+
+# ---- Bundled demo schemas & scratch inputs (kept locally, never committed) ----
+client/src/data/schema.qsr.json
+client/src/data/schema.qsr_sc.json
+inputs/qsr_full_with_noise.csv
+inputs/retailer_dims_bi.csv
+inputs/retailer_dims_pos.csv
