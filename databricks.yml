@@ -4,18 +4,20 @@ bundle:
 variables:
   sql_warehouse_id:
     description: SQL Warehouse ID
+    default: bf7ffcda00a8c351
+  app_name:
+    description: Deployed app name (varies by target)
+    default: rt-onto-demo
 
 resources:
   apps:
     app:
-      name: "rt-onto-demo"
+      name: ${var.app_name}
       description: "A Databricks App powered by AppKit"
       source_code_path: ./
-      # Uncomment to enable on behalf of user API scopes. Available scopes: sql, dashboards.genie, files.files, serving.serving-endpoints
       # user_api_scopes:
       #   - sql
 
-      # The resources which this app has access to.
       resources:
         - name: sql-warehouse
           sql_warehouse:
@@ -26,11 +28,43 @@ resources:
             name: databricks-claude-sonnet-4-5
             permission: CAN_QUERY
 
+# =============================================================================
+# TARGETS: Multi-environment lifecycle (dev -> staging -> prod)
+# =============================================================================
 targets:
-  default:
+  dev:
     default: true
+    mode: development
     workspace:
       host: https://fe-vm-jai-classic-ws.cloud.databricks.com
-
     variables:
-      sql_warehouse_id: bf7ffcda00a8c351
+      app_name: rt-onto-demo-dev-${workspace.current_user.short_name}
+
+  staging:
+    workspace:
+      host: https://fe-vm-jai-classic-ws.cloud.databricks.com
+      root_path: /Shared/.bundle/${bundle.name}/${bundle.target}
+    variables:
+      app_name: rt-onto-demo-staging
+    run_as:
+      service_principal_name: 'bd3dd6e7-e022-432e-975c-e8965d56ee2f'
+    permissions:
+      - service_principal_name: 'bd3dd6e7-e022-432e-975c-e8965d56ee2f'
+        level: CAN_MANAGE
+      - user_name: jaiwant.jonathan@databricks.com
+        level: CAN_MANAGE
+
+  prod:
+    mode: production
+    workspace:
+      host: https://fe-vm-jai-classic-ws.cloud.databricks.com
+      root_path: /Shared/.bundle/${bundle.name}/${bundle.target}
+    variables:
+      app_name: rt-onto-demo
+    run_as:
+      service_principal_name: '675ab5ff-bb2c-4917-9d0e-e6bc807f336e'
+    permissions:
+      - service_principal_name: '675ab5ff-bb2c-4917-9d0e-e6bc807f336e'
+        level: CAN_MANAGE
+      - user_name: jaiwant.jonathan@databricks.com
+        level: CAN_MANAGE

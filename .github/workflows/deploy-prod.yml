@@ -1,0 +1,35 @@
+name: Deploy - Production
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  DATABRICKS_AUTH_TYPE: github-oidc
+  DATABRICKS_HOST: ${{ vars.DATABRICKS_HOST }}
+  DATABRICKS_CLIENT_ID: ${{ vars.DATABRICKS_SP_CLIENT_ID_PROD }}
+
+jobs:
+  deploy-prod:
+    name: Deploy App to Production
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name }}
+      - uses: databricks/setup-cli@main
+      - run: databricks bundle deploy --target prod
+      - name: Wait for app healthy
+        run: |
+          for i in $(seq 1 30); do
+            STATUS=$(databricks apps get rt-onto-demo --output JSON | python3 -c "import sys,json; print(json.load(sys.stdin).get('status',{}).get('state',''))")
+            [ "$STATUS" = "RUNNING" ] && echo "App is RUNNING (${{ github.event.release.tag_name }})" && exit 0
+            echo "  Attempt $i: status=$STATUS"
+            sleep 10
+          done
+          exit 1

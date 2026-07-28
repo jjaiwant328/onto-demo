@@ -1,0 +1,36 @@
+name: Deploy - Staging
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - 'docs/**'
+      - '*.md'
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  DATABRICKS_AUTH_TYPE: github-oidc
+  DATABRICKS_HOST: ${{ vars.DATABRICKS_HOST }}
+  DATABRICKS_CLIENT_ID: ${{ vars.DATABRICKS_SP_CLIENT_ID }}
+
+jobs:
+  deploy-staging:
+    name: Deploy App to Staging
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - uses: actions/checkout@v4
+      - uses: databricks/setup-cli@main
+      - run: databricks bundle deploy --target staging
+      - name: Wait for app healthy
+        run: |
+          for i in $(seq 1 30); do
+            STATUS=$(databricks apps get rt-onto-demo-staging --output JSON | python3 -c "import sys,json; print(json.load(sys.stdin).get('status',{}).get('state',''))")
+            [ "$STATUS" = "RUNNING" ] && echo "App is RUNNING" && exit 0
+            echo "  Attempt $i: status=$STATUS"
+            sleep 10
+          done
+          exit 1
