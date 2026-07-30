@@ -207,9 +207,13 @@ export function OntologyStudio() {
   const [acceptingRef, setAcceptingRef] = useState<string | null>(null);
   const [acceptResult, setAcceptResult] = useState<{ ok: boolean; msg: string } | null>(null);
   const [highlightRelRef, setHighlightRelRef] = useState<string | null>(null);
+  // ref to the just-added Relationships row, so we can scroll it into view
+  const highlightRowRef = useRef<HTMLTableRowElement | null>(null);
   // clear the "just added" row highlight a few seconds after it appears
   useEffect(() => {
     if (!highlightRelRef) return;
+    // scroll the newly-added row into view so the user sees where it landed
+    highlightRowRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' });
     const t = setTimeout(() => setHighlightRelRef(null), 6000);
     return () => clearTimeout(t);
   }, [highlightRelRef]);
@@ -650,7 +654,11 @@ export function OntologyStudio() {
                 </TableRow>
               </TableHeader>
               <TableBody>
-                {relationships.map((r, i) => {
+                {[...relationships]
+                  // surface user-added / confirmed edges at the top so an accepted
+                  // suggestion is immediately visible (they render newest-relevant first).
+                  .sort((a, b) => (b.origin === 'user' ? 1 : 0) - (a.origin === 'user' ? 1 : 0))
+                  .map((r, i) => {
                   const ref = `${r.from.join(',')}>${r.to}:${r.predicate}`;
                   const confirmOv = overrideFor('edge_status', ref, 'confirm');
                   const rejectOv = overrideFor('edge_status', ref, 'reject');
@@ -658,6 +666,7 @@ export function OntologyStudio() {
                   return (
                     <TableRow
                       key={`${ref}-${i}`}
+                      ref={justAdded ? highlightRowRef : undefined}
                       className={
                         justAdded ? 'bg-emerald-50 ring-1 ring-emerald-300 transition-colors' : undefined
                       }
