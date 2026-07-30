@@ -1054,8 +1054,14 @@ createApp({
         }
         const createdBy = await whoami();
         const value = b.value == null ? '' : typeof b.value === 'string' ? b.value : JSON.stringify(b.value);
-        // deterministic id so the same target+action upserts in place
-        const id = `ov_${Buffer.from(`${b.schema_label}|${b.product ?? ''}|${b.kind}|${b.ref}|${b.action}`).toString('base64url').slice(0, 48)}`;
+        // deterministic id so the same target+action upserts in place. Hash the
+        // FULL key (not a truncated base64 of it): long schema labels used to push
+        // kind/ref/action past a 48-char cut-off, collapsing every override for a
+        // schema+product to one id so they clobbered each other via ON CONFLICT.
+        const id = `ov_${createHash('sha256')
+          .update(`${b.schema_label}|${b.product ?? ''}|${b.kind}|${b.ref}|${b.action}`)
+          .digest('hex')
+          .slice(0, 48)}`;
         try {
           await lbQuery(
             `INSERT INTO ontology_overrides (id, schema_label, product, kind, ref, action, value, created_by, created_at) ` +
