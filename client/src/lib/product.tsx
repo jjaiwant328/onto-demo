@@ -190,10 +190,6 @@ export type ProductContextValue = {
   // tooling. Persisted to localStorage.
   showControlTower: boolean;
   setShowControlTower: (v: boolean) => void;
-  // audience mode: 'business' (decision surfaces only) hides the technical
-  // curation tabs; 'builder' reveals them. Persisted to localStorage.
-  mode: 'business' | 'builder';
-  setMode: (m: 'business' | 'builder') => void;
   // leading catalog/namespace segment of the active schema's tables (for
   // schema-accurate data contracts); null when it can't be determined.
   activeSourceCatalog: string | null;
@@ -320,7 +316,6 @@ const SYNC_KEY = 'rt_onto_sync_scope';
 const SHOW_AC_KEY = 'rt_onto_show_action_center'; // nav toggle (default OFF)
 const SHOW_BV_KEY = 'rt_onto_show_business_view'; // nav toggle (default OFF)
 const SHOW_CT_KEY = 'rt_onto_show_control_tower'; // Control Tower demo nav group (default ON)
-const MODE_KEY = 'rt_onto_mode'; // 'business' (default) | 'builder'
 // ids of built-in schemas the user has deleted (hidden). Built-ins aren't in
 // Lakebase, so we hide them via localStorage rather than DB-delete.
 const HIDDEN_KEY = 'rt_onto_hidden_builtins';
@@ -415,21 +410,6 @@ export function ProductProvider({ children }: { children: ReactNode }) {
     setShowControlTowerState(v);
     try {
       localStorage.setItem(SHOW_CT_KEY, v ? '1' : '0');
-    } catch {
-      /* ignore */
-    }
-  }, []);
-  const [mode, setModeState] = useState<'business' | 'builder'>(() => {
-    try {
-      return localStorage.getItem(MODE_KEY) === 'builder' ? 'builder' : 'business';
-    } catch {
-      return 'business';
-    }
-  });
-  const setMode = useCallback((m: 'business' | 'builder') => {
-    setModeState(m);
-    try {
-      localStorage.setItem(MODE_KEY, m);
     } catch {
       /* ignore */
     }
@@ -1314,8 +1294,6 @@ export function ProductProvider({ children }: { children: ReactNode }) {
     setShowBusinessView,
     showControlTower,
     setShowControlTower,
-    mode,
-    setMode,
     activeSourceCatalog,
     activeSchemaLabel,
     ontologyOverrides,

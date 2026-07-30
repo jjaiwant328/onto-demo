@@ -1,8 +1,8 @@
 // Mitigation panel — the closed-loop workflow for one flagged area. Shows the issue,
 // the recommended play + its (simulated) system of record, and the projected KPI
 // improvement; on dispatch it opens a work order and advances a status timeline; on
-// Resolved the exception aggregates net it out so the Home number drops. In Builder
-// mode it also reveals the outbound connector payload (the real-integration seam).
+// Resolved the exception aggregates net it out so the Home number drops. It also
+// reveals the outbound connector payload (the real-integration seam).
 import { useState } from 'react';
 import {
   Dialog,
@@ -13,7 +13,6 @@ import {
   Button,
 } from '@databricks/appkit-ui/react';
 import { Loader2, ArrowRight, CheckCircle2, Send, Wrench, Plug, ChevronDown } from 'lucide-react';
-import { useProduct } from '../lib/product';
 import {
   createMitigation,
   advanceMitigation,
@@ -38,7 +37,6 @@ export function MitigationPanel({
   onOpenChange: (v: boolean) => void;
   onResolved?: () => void;
 }) {
-  const { mode } = useProduct();
   const [wo, setWo] = useState<CreateMitigationResult | null>(null);
   const [status, setStatus] = useState<string>('');
   const [busy, setBusy] = useState(false);
@@ -145,34 +143,32 @@ export function MitigationPanel({
             </div>
           )}
 
-          {/* Builder-only: the real integration seam */}
-          {mode === 'builder' && (
-            <div className="rounded-md border border-dashed p-2">
-              <button className="flex items-center gap-1.5 text-xs font-medium text-muted-foreground" onClick={() => setShowConnector((v) => !v)}>
-                <Plug className="h-3.5 w-3.5" /> Connector (builder) <ChevronDown className={`h-3 w-3 transition-transform ${showConnector ? 'rotate-180' : ''}`} />
-              </button>
-              {showConnector && (
-                <div className="mt-2 space-y-1.5">
-                  <pre className="text-[11px] bg-muted rounded p-2 overflow-x-auto whitespace-pre-wrap">{JSON.stringify(
-                    {
-                      system_of_record: wo?.target_system ?? 'ERP',
-                      action: wo?.action_key ?? item.product_name,
-                      work_order_id: wo?.work_order_id ?? 'WO-####',
-                      product: item.product_name,
-                      cleared_slice: wo?.mitigation_predicate ?? '(mitigation predicate)',
-                    },
-                    null,
-                    2
-                  )}</pre>
-                  <p className="text-[11px] text-muted-foreground">
-                    Demo stub. In production this POSTs to your ERP / CMMS API or emits a reverse-ETL / Workflows
-                    event; the effect is modelled in the lakehouse via <code>jai_intervention_log</code>, which the
-                    exception aggregates net out (<code>AND NOT (predicate)</code>).
-                  </p>
-                </div>
-              )}
-            </div>
-          )}
+          {/* The real integration seam */}
+          <div className="rounded-md border border-dashed p-2">
+            <button className="flex items-center gap-1.5 text-xs font-medium text-muted-foreground" onClick={() => setShowConnector((v) => !v)}>
+              <Plug className="h-3.5 w-3.5" /> Connector <ChevronDown className={`h-3 w-3 transition-transform ${showConnector ? 'rotate-180' : ''}`} />
+            </button>
+            {showConnector && (
+              <div className="mt-2 space-y-1.5">
+                <pre className="text-[11px] bg-muted rounded p-2 overflow-x-auto whitespace-pre-wrap">{JSON.stringify(
+                  {
+                    system_of_record: wo?.target_system ?? 'ERP',
+                    action: wo?.action_key ?? item.product_name,
+                    work_order_id: wo?.work_order_id ?? 'WO-####',
+                    product: item.product_name,
+                    cleared_slice: wo?.mitigation_predicate ?? '(mitigation predicate)',
+                  },
+                  null,
+                  2
+                )}</pre>
+                <p className="text-[11px] text-muted-foreground">
+                  Demo stub. In production this POSTs to your ERP / CMMS API or emits a reverse-ETL / Workflows
+                  event; the effect is modelled in the lakehouse via <code>jai_intervention_log</code>, which the
+                  exception aggregates net out (<code>AND NOT (predicate)</code>).
+                </p>
+              </div>
+            )}
+          </div>
         </div>
       </DialogContent>
     </Dialog>

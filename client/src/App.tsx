@@ -54,15 +54,15 @@ import { PrintActions } from './pages/PrintActions';
 import { SchemaLoader } from './components/SchemaLoader';
 import { Copilot } from './components/Copilot';
 
-// always-on nav (ontology-focused)
-// Business mode: the decision surfaces a supply-chain domain expert uses daily.
+// The Control Tower demo group: the supply-chain decision surfaces (gated by the
+// "Control Tower demo" Settings toggle).
 const NAV_BUSINESS = [
   { to: '/', label: 'Home' },
   { to: '/action-inbox', label: 'Action Inbox' },
   { to: '/scenario-impact', label: 'Scenario & Impact' },
   { to: '/action-center', label: 'Action Center' },
 ];
-// Builder mode adds the technical curation / governance tabs.
+// The technical curation / governance tabs (always shown).
 const NAV_BUILDER = [
   { to: '/data-products', label: 'Data Products' },
   { to: '/ontology-studio', label: 'Ontology Studio' },
@@ -119,13 +119,12 @@ function NavLinks({
   linkClass: NavLinkClassFn;
   onClick?: () => void;
 }) {
-  const { mode, showBusinessView, showControlTower } = useProduct();
-  // With the Control Tower demo group hidden, always surface the generic ontology
-  // tabs so the nav bar is never empty and the app stays navigable.
-  const showBuilderTabs = mode === 'builder' || !showControlTower;
+  const { showBusinessView, showControlTower } = useProduct();
+  // The generic ontology/builder tabs are always shown; the Control Tower demo
+  // group is gated by its Settings toggle.
   const nav = [
     ...(showControlTower ? NAV_BUSINESS : []),
-    ...(showBuilderTabs ? NAV_BUILDER : []),
+    ...NAV_BUILDER,
     ...(showBusinessView ? [NAV_BUSINESS_VIEW] : []),
   ];
   return (
@@ -450,8 +449,8 @@ function ControlPanel() {
   );
 }
 
-// Settings — extra nav visibility toggle (Business View). Action Center is part of
-// Business mode; the technical tabs are revealed via the Business/Builder toggle.
+// Settings — nav visibility toggles: the Control Tower demo group and the
+// optional Business View section.
 function SettingsMenu() {
   const { showBusinessView, setShowBusinessView, showControlTower, setShowControlTower } =
     useProduct();
@@ -476,33 +475,8 @@ function SettingsMenu() {
           <Switch checked={showBusinessView} onCheckedChange={setShowBusinessView} />
           Business View
         </label>
-        <p className="text-[11px] text-muted-foreground pt-1">
-          Use the Business / Builder toggle (top bar) to show or hide the technical
-          ontology tabs.
-        </p>
       </PopoverContent>
     </Popover>
-  );
-}
-
-// Business / Builder audience toggle. Business (default) shows only the decision
-// surfaces; Builder reveals the technical curation tabs. Persisted via context.
-function ModeToggle() {
-  const { mode, setMode } = useProduct();
-  return (
-    <div className="flex items-center rounded-md border p-0.5 text-xs">
-      {(['business', 'builder'] as const).map((m) => (
-        <button
-          key={m}
-          onClick={() => setMode(m)}
-          className={`px-2 py-0.5 rounded capitalize transition-colors ${
-            mode === m ? 'bg-primary text-primary-foreground' : 'text-muted-foreground hover:text-foreground'
-          }`}
-        >
-          {m}
-        </button>
-      ))}
-    </div>
   );
 }
 
@@ -582,7 +556,6 @@ function Layout() {
               <NavLinks className="flex gap-1 min-w-max" linkClass={navLinkClass} />
             </div>
             <div className="ml-auto shrink-0 flex items-center gap-3">
-              <ModeToggle />
               <ScopeSyncToggle />
             </div>
           </div>

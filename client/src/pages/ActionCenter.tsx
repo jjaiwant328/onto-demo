@@ -61,10 +61,9 @@ export function ActionCenter() {
     productScope,
     schemaEntries,
     selectedSchemaIds,
-    mode,
   } = useProduct();
-  // Monitoring (SQL + schedules) is a builder concern; hide it in business mode.
-  const showMonitor = mode === 'builder' && Boolean(selectedProduct.dataAvailable);
+  // Monitoring (SQL + schedules) shows whenever the product has backing data.
+  const showMonitor = Boolean(selectedProduct.dataAvailable);
   const { queue, setQueue, addAction } = useActions();
   const live = components.live;
   const dataAvailable = Boolean(selectedProduct.dataAvailable);
