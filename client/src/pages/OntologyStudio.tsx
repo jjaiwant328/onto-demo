@@ -202,6 +202,17 @@ export function OntologyStudio() {
   const [suggestions, setSuggestions] = useState<SuggestedRelationship[]>([]);
   const [suggesting, setSuggesting] = useState(false);
   const [suggestNote, setSuggestNote] = useState<string | null>(null);
+  // in-flight accept + feedback: which suggestion is saving, an inline result
+  // message, and the relRef of the just-added edge to highlight in the table.
+  const [acceptingRef, setAcceptingRef] = useState<string | null>(null);
+  const [acceptResult, setAcceptResult] = useState<{ ok: boolean; msg: string } | null>(null);
+  const [highlightRelRef, setHighlightRelRef] = useState<string | null>(null);
+  // clear the "just added" row highlight a few seconds after it appears
+  useEffect(() => {
+    if (!highlightRelRef) return;
+    const t = setTimeout(() => setHighlightRelRef(null), 6000);
+    return () => clearTimeout(t);
+  }, [highlightRelRef]);
   // C) validate-against-data result (cached per scope)
   const [validation, setValidation] = useState<ValidationResult | null>(
     () => getScopeCache<ValidationResult>('validation') ?? null
@@ -643,9 +654,18 @@ export function OntologyStudio() {
                   const ref = `${r.from.join(',')}>${r.to}:${r.predicate}`;
                   const confirmOv = overrideFor('edge_status', ref, 'confirm');
                   const rejectOv = overrideFor('edge_status', ref, 'reject');
+                  const justAdded = ref === highlightRelRef;
                   return (
-                    <TableRow key={`${ref}-${i}`}>
+                    <TableRow
+                      key={`${ref}-${i}`}
+                      className={
+                        justAdded ? 'bg-emerald-50 ring-1 ring-emerald-300 transition-colors' : undefined
+                      }
+                    >
                       <TableCell className="font-medium">
+                        {justAdded && (
+                          <Badge className="mr-1.5 bg-emerald-600 text-[10px]">just added</Badge>
+                        )}
                         {r.from.join(', ')} <span className="text-muted-foreground">·{r.predicate}·</span> {r.to}
                       </TableCell>
                       <TableCell>
@@ -769,6 +789,22 @@ export function OntologyStudio() {
         </CardHeader>
         <CardContent className="space-y-2">
           {suggestNote && <p className="text-sm text-muted-foreground">{suggestNote}</p>}
+          {acceptResult && (
+            <div
+              className={`flex items-start gap-2 rounded-md border px-3 py-2 text-sm ${
+                acceptResult.ok
+                  ? 'border-emerald-300 bg-emerald-50 text-emerald-800'
+                  : 'border-destructive/40 bg-destructive/10 text-destructive'
+              }`}
+            >
+              {acceptResult.ok ? (
+                <CheckCircle2 className="h-4 w-4 mt-0.5 shrink-0" />
+              ) : (
+                <AlertTriangle className="h-4 w-4 mt-0.5 shrink-0" />
+              )}
+              <span>{acceptResult.msg}</span>
+            </div>
+          )}
           {suggestions.length === 0 && !suggestNote && (
             <p className="text-sm text-muted-foreground">
               Click "Suggest relationships" to ask the model for candidate joins.
@@ -793,25 +829,53 @@ export function OntologyStudio() {
                     size="sm"
                     variant="ghost"
                     className="h-7 px-2 text-emerald-600"
-                    title="Confirm — add to ontology"
+                    title="Confirm — add to the Relationships table below"
+                    disabled={acceptingRef === ref}
                     onClick={() => {
-                      void saveOntologyOverride({
-                        product: selectedProduct.product_name,
-                        kind: 'relationship',
-                        ref,
-                        action: 'add',
-                        value: {
-                          from: s.from,
-                          to: s.to,
-                          predicate: s.predicate,
-                          column: s.column,
-                          toColumn: s.toColumn,
-                        },
-                      });
-                      setSuggestions((prev) => prev.filter((x) => `${x.from}|${x.predicate}|${x.to}` !== ref));
+                      void (async () => {
+                        setAcceptingRef(ref);
+                        setAcceptResult(null);
+                        const r = await saveOntologyOverride({
+                          product: selectedProduct.product_name,
+                          kind: 'relationship',
+                          ref,
+                          action: 'add',
+                          value: {
+                            from: s.from,
+                            to: s.to,
+                            predicate: s.predicate,
+                            column: s.column,
+                            toColumn: s.toColumn,
+                          },
+                        });
+                        setAcceptingRef(null);
+                        if (r.ok) {
+                          // only remove on success; surface WHERE it landed and
+                          // highlight the new row in the Relationships table.
+                          setSuggestions((prev) =>
+                            prev.filter((x) => `${x.from}|${x.predicate}|${x.to}` !== ref)
+                          );
+                          const relRefAdded = `${s.from}>${s.to}:${s.predicate}`;
+                          setHighlightRelRef(relRefAdded);
+                          setAcceptResult({
+                            ok: true,
+                            msg: `Added "${s.from} ·${s.predicate}· ${s.to}" to the Relationships table below (origin: user, confirmed).`,
+                          });
+                        } else {
+                          // keep the suggestion so the user can retry
+                          setAcceptResult({
+                            ok: false,
+                            msg: `Couldn't add relationship: ${r.error ?? 'save failed'}. It was not added — try again.`,
+                          });
+                        }
+                      })();
                     }}
                   >
-                    <Check className="h-3.5 w-3.5" />
+                    {acceptingRef === ref ? (
+                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                    ) : (
+                      <Check className="h-3.5 w-3.5" />
+                    )}
                   </Button>
                   <Button
                     size="sm"

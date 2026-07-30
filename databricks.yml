@@ -1,6 +1,14 @@
 bundle:
   name: rt-onto-demo
 
+# The bundled demo-schema JSONs are gitignored (they carry demo data kept out of
+# the git remote), but the client build imports them, so force them into the
+# deploy sync despite .gitignore.
+sync:
+  include:
+    - client/src/data/schema.qsr.json
+    - client/src/data/schema.qsr_sc.json
+
 variables:
   sql_warehouse_id:
     description: SQL Warehouse ID

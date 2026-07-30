@@ -125,7 +125,10 @@ export type ProductContextValue = {
   ) => Promise<{ ok: boolean; error?: string }>;
   // persist an already-loaded (ephemeral) registry entry to the durable store,
   // converting it in place (keeps its loaded content; no duplicate entry).
-  storeSchema: (entryId: string) => Promise<{ ok: boolean; error?: string }>;
+  storeSchema: (
+    entryId: string,
+    opts?: { customer?: string }
+  ) => Promise<{ ok: boolean; error?: string }>;
   deleteSavedSchema: (schemaId: string) => Promise<void>;
   schema: Schema;
   catalog: Catalog;
@@ -181,6 +184,12 @@ export type ProductContextValue = {
   setShowActionCenter: (v: boolean) => void;
   showBusinessView: boolean;
   setShowBusinessView: (v: boolean) => void;
+  // Control Tower demo nav group (Home / Action Inbox / Scenario & Impact /
+  // Action Center) — the supply-chain control-tower decision surfaces built for
+  // the flagship demo. Default ON; toggle OFF to show only the generic ontology
+  // tooling. Persisted to localStorage.
+  showControlTower: boolean;
+  setShowControlTower: (v: boolean) => void;
   // audience mode: 'business' (decision surfaces only) hides the technical
   // curation tabs; 'builder' reveals them. Persisted to localStorage.
   mode: 'business' | 'builder';
@@ -310,6 +319,7 @@ function sanitizeCatalog(catalog: Catalog, schema: Schema): Catalog {
 const SYNC_KEY = 'rt_onto_sync_scope';
 const SHOW_AC_KEY = 'rt_onto_show_action_center'; // nav toggle (default OFF)
 const SHOW_BV_KEY = 'rt_onto_show_business_view'; // nav toggle (default OFF)
+const SHOW_CT_KEY = 'rt_onto_show_control_tower'; // Control Tower demo nav group (default ON)
 const MODE_KEY = 'rt_onto_mode'; // 'business' (default) | 'builder'
 // ids of built-in schemas the user has deleted (hidden). Built-ins aren't in
 // Lakebase, so we hide them via localStorage rather than DB-delete.
@@ -393,6 +403,22 @@ export function ProductProvider({ children }: { children: ReactNode }) {
       /* ignore */
     }
   }, []);
+  // Control Tower demo group defaults ON (unset or '1' → shown; explicit '0' hides).
+  const [showControlTower, setShowControlTowerState] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem(SHOW_CT_KEY) !== '0';
+    } catch {
+      return true;
+    }
+  });
+  const setShowControlTower = useCallback((v: boolean) => {
+    setShowControlTowerState(v);
+    try {
+      localStorage.setItem(SHOW_CT_KEY, v ? '1' : '0');
+    } catch {
+      /* ignore */
+    }
+  }, []);
   const [mode, setModeState] = useState<'business' | 'builder'>(() => {
     try {
       return localStorage.getItem(MODE_KEY) === 'builder' ? 'builder' : 'business';
@@ -424,6 +450,9 @@ export function ProductProvider({ children }: { children: ReactNode }) {
   // the restore effect has run (both fire on mount; the [sig] persist effect
   // would otherwise clobber the saved selection with the initial default).
   const restoredRef = useRef(false);
+  // saved:* ids persisted in the last selection but not yet in the registry
+  // (their content lazy-loads via refreshSavedSchemas); re-selected once merged.
+  const pendingSavedSelRef = useRef<string[]>([]);
 
   const schemaEntries = schemasReg;
   const selected = useMemo(
@@ -908,7 +937,10 @@ export function ProductProvider({ children }: { children: ReactNode }) {
   // it in place: give it the returned saved id so it becomes the durable entry
   // (keeps its already-loaded content, and mergeSaved won't add a duplicate).
   const storeSchema = useCallback(
-    async (entryId: string): Promise<{ ok: boolean; error?: string }> => {
+    async (
+      entryId: string,
+      opts?: { customer?: string }
+    ): Promise<{ ok: boolean; error?: string }> => {
       const entry = schemasReg.find((s) => s.id === entryId);
       if (!entry) return { ok: false, error: 'not found' };
       if (entry.bundled || entry.savedId) return { ok: false, error: 'already persistent' };
@@ -916,7 +948,12 @@ export function ProductProvider({ children }: { children: ReactNode }) {
         const resp = await fetch('/api/save-schema', {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ customer: entry.label, schemaName: entry.label, source: 'stored', schema: entry.schema }),
+          body: JSON.stringify({
+            customer: opts?.customer?.trim() || entry.label,
+            schemaName: entry.label,
+            source: 'stored',
+            schema: entry.schema,
+          }),
         });
         const data = await resp.json();
         if (!data?.ok || !data.schema_id) return { ok: false, error: data?.error ?? 'save failed' };
@@ -992,17 +1029,21 @@ export function ProductProvider({ children }: { children: ReactNode }) {
   }, []);
 
   // restore persisted selection on first load (default = curated schema).
-  // Only restores built-in schema ids (saved/uploaded ids are session/store-driven
-  // and re-appear via the saved-schemas fetch); guards against stale ids.
+  // Restores VISIBLE built-in ids immediately; saved:* ids are stashed as pending
+  // and re-selected once refreshSavedSchemas merges their (lazy) registry entries,
+  // so a stored schema stays ACTIVE across reloads instead of reverting to default.
   useEffect(() => {
     try {
       const raw = localStorage.getItem(LS_KEY);
       if (raw) {
         const p = JSON.parse(raw) as { selectedSchemaIds?: string[] };
-        // only restore VISIBLE built-in ids (skip ones the user has hidden/deleted)
+        const persisted = p.selectedSchemaIds ?? [];
         const visibleIds = new Set(visibleBuiltinSchemas().map((s) => s.id));
-        const valid = (p.selectedSchemaIds ?? []).filter((id) => visibleIds.has(id));
-        if (valid.length) setSelectedSchemaIds(valid);
+        const builtinSel = persisted.filter((id) => visibleIds.has(id));
+        const savedSel = persisted.filter((id) => id.startsWith('saved:'));
+        if (builtinSel.length) setSelectedSchemaIds(builtinSel);
+        // defer saved-schema re-selection until their entries exist in the registry
+        pendingSavedSelRef.current = savedSel;
       }
     } catch {
       /* ignore */
@@ -1012,6 +1053,18 @@ export function ProductProvider({ children }: { children: ReactNode }) {
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // once saved schemas are merged into the registry, re-select any that the
+  // persisted selection referenced (fixes "saved schema loses selection on reload").
+  useEffect(() => {
+    const pending = pendingSavedSelRef.current;
+    if (!pending.length) return;
+    const ready = pending.filter((id) => schemasReg.some((s) => s.id === id));
+    if (ready.length) {
+      setSelectedSchemaIds(ready);
+      pendingSavedSelRef.current = [];
+    }
+  }, [schemasReg]);
 
   // leading catalog/namespace of the active schema's tables (for contracts)
   const activeSourceCatalog = useMemo(() => {
@@ -1259,6 +1312,8 @@ export function ProductProvider({ children }: { children: ReactNode }) {
     setShowActionCenter,
     showBusinessView,
     setShowBusinessView,
+    showControlTower,
+    setShowControlTower,
     mode,
     setMode,
     activeSourceCatalog,

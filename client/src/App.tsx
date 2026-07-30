@@ -93,6 +93,14 @@ function ActionsProvider({ children }: { children: React.ReactNode }) {
   );
 }
 
+// Index route: the Control Tower home is part of the demo nav group. When that
+// group is toggled off, land on the generic Data Products page instead so the
+// app still has a usable entry point.
+function HomeRoute() {
+  const { showControlTower } = useProduct();
+  return showControlTower ? <ControlTowerHome /> : <Navigate to="/data-products" replace />;
+}
+
 const navLinkClass = ({ isActive }: { isActive: boolean }) =>
   `px-3 py-1.5 rounded-md text-sm font-medium transition-colors ${
     isActive
@@ -111,10 +119,13 @@ function NavLinks({
   linkClass: NavLinkClassFn;
   onClick?: () => void;
 }) {
-  const { mode, showBusinessView } = useProduct();
+  const { mode, showBusinessView, showControlTower } = useProduct();
+  // With the Control Tower demo group hidden, always surface the generic ontology
+  // tabs so the nav bar is never empty and the app stays navigable.
+  const showBuilderTabs = mode === 'builder' || !showControlTower;
   const nav = [
-    ...NAV_BUSINESS,
-    ...(mode === 'builder' ? NAV_BUILDER : []),
+    ...(showControlTower ? NAV_BUSINESS : []),
+    ...(showBuilderTabs ? NAV_BUILDER : []),
     ...(showBusinessView ? [NAV_BUSINESS_VIEW] : []),
   ];
   return (
@@ -442,7 +453,8 @@ function ControlPanel() {
 // Settings — extra nav visibility toggle (Business View). Action Center is part of
 // Business mode; the technical tabs are revealed via the Business/Builder toggle.
 function SettingsMenu() {
-  const { showBusinessView, setShowBusinessView } = useProduct();
+  const { showBusinessView, setShowBusinessView, showControlTower, setShowControlTower } =
+    useProduct();
   return (
     <Popover>
       <PopoverTrigger asChild>
@@ -453,6 +465,14 @@ function SettingsMenu() {
       <PopoverContent className="w-64 p-3 space-y-2.5" align="start">
         <div className="text-xs font-medium text-muted-foreground">Show sections</div>
         <label className="flex items-center gap-2 text-sm cursor-pointer">
+          <Switch checked={showControlTower} onCheckedChange={setShowControlTower} />
+          Control Tower demo
+        </label>
+        <p className="text-[11px] text-muted-foreground">
+          Show the supply-chain control-tower panels (Home, Action Inbox, Scenario &amp;
+          Impact, Action Center). Turn off to keep only the generic ontology tools.
+        </p>
+        <label className="flex items-center gap-2 text-sm cursor-pointer pt-1">
           <Switch checked={showBusinessView} onCheckedChange={setShowBusinessView} />
           Business View
         </label>
@@ -584,7 +604,7 @@ const router = createBrowserRouter([
   {
     element: <Layout />,
     children: [
-      { index: true, element: <ControlTowerHome /> },
+      { index: true, element: <HomeRoute /> },
       { path: '/action-inbox', element: <ActionInbox /> },
       { path: '/scenario-impact', element: <ScenarioImpact /> },
       { path: '/data-products', element: <DataProducts /> },
