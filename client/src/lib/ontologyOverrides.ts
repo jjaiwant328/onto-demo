@@ -316,12 +316,17 @@ export function applyOntologyOverrides(
     .filter(({ ref }) => !relDeleted.has(ref))
     .map(({ remapped }) => remapped);
 
-  // append accepted LLM-suggested relationships (de-dupe against existing)
+  // append accepted LLM-suggested relationships (de-dupe against existing, and
+  // honour a delete override so a user-added edge can be removed like any other)
   const existingRefs = new Set(relationships.map(relRef));
   for (const add of relAdded) {
-    if (!existingRefs.has(relRef(add))) {
-      relationships.push(add);
-      existingRefs.add(relRef(add));
+    const addRef = relRef(add);
+    if (relDeleted.has(addRef)) continue;
+    if (!existingRefs.has(addRef)) {
+      // a reject override applies to added edges too
+      const status = relStatus.get(addRef);
+      relationships.push(status ? { ...add, status } : add);
+      existingRefs.add(addRef);
     }
   }
 

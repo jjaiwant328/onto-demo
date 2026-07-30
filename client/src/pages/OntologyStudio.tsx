@@ -663,30 +663,43 @@ export function OntologyStudio() {
                   const confirmOv = overrideFor('edge_status', ref, 'confirm');
                   const rejectOv = overrideFor('edge_status', ref, 'reject');
                   const justAdded = ref === highlightRelRef;
+                  const isRejected = r.status === 'rejected';
                   return (
                     <TableRow
                       key={`${ref}-${i}`}
                       ref={justAdded ? highlightRowRef : undefined}
                       className={
-                        justAdded ? 'bg-emerald-50 ring-1 ring-emerald-300 transition-colors' : undefined
+                        justAdded
+                          ? 'bg-emerald-50 ring-1 ring-emerald-300 transition-colors'
+                          : isRejected
+                            ? 'opacity-50'
+                            : undefined
                       }
                     >
-                      <TableCell className="font-medium">
+                      <TableCell className={`font-medium ${isRejected ? 'line-through' : ''}`}>
                         {justAdded && (
                           <Badge className="mr-1.5 bg-emerald-600 text-[10px]">just added</Badge>
                         )}
                         {r.from.join(', ')} <span className="text-muted-foreground">·{r.predicate}·</span> {r.to}
                       </TableCell>
                       <TableCell>
-                        <Badge variant={r.origin === 'user' ? 'default' : 'outline'} className="text-[10px]">
-                          {r.origin ?? 'heuristic'}
-                        </Badge>
+                        {isRejected ? (
+                          <Badge variant="destructive" className="text-[10px]">
+                            rejected
+                          </Badge>
+                        ) : (
+                          <Badge variant={r.origin === 'user' ? 'default' : 'outline'} className="text-[10px]">
+                            {r.origin ?? 'heuristic'}
+                          </Badge>
+                        )}
                       </TableCell>
                       <TableCell>
                         <span className="text-xs text-muted-foreground">
-                          {r.status === 'confirmed'
-                            ? '100% (confirmed)'
-                            : `${Math.round((r.confidence ?? 0.6) * 100)}%`}
+                          {isRejected
+                            ? '—'
+                            : r.status === 'confirmed'
+                              ? '100% (confirmed)'
+                              : `${Math.round((r.confidence ?? 0.6) * 100)}%`}
                         </span>
                       </TableCell>
                       <TableCell className="text-right">
@@ -695,7 +708,11 @@ export function OntologyStudio() {
                             size="sm"
                             variant={r.status === 'confirmed' ? 'default' : 'ghost'}
                             className="h-7 px-2"
-                            title="Confirm (trusted)"
+                            title={
+                              confirmOv
+                                ? 'Confirmed — click to undo (reset to original confidence)'
+                                : 'Confirm (mark trusted, 100%)'
+                            }
                             onClick={() =>
                               confirmOv
                                 ? void deleteOntologyOverride(confirmOv.id)
@@ -714,7 +731,11 @@ export function OntologyStudio() {
                             size="sm"
                             variant={r.status === 'rejected' ? 'default' : 'ghost'}
                             className="h-7 px-2"
-                            title="Reject (hide)"
+                            title={
+                              rejectOv
+                                ? 'Rejected — click to undo (restore this edge)'
+                                : 'Reject (mark spurious, hidden downstream)'
+                            }
                             onClick={() =>
                               rejectOv
                                 ? void deleteOntologyOverride(rejectOv.id)
@@ -733,7 +754,7 @@ export function OntologyStudio() {
                             size="sm"
                             variant="ghost"
                             className="h-7 px-2 text-destructive"
-                            title="Delete this FK/relationship"
+                            title="Delete this relationship (removes it from the ontology)"
                             onClick={() =>
                               void saveOntologyOverride({
                                 product: selectedProduct.product_name,
