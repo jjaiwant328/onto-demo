@@ -53,6 +53,7 @@ import { DataContract } from './pages/DataContract';
 import { ActionCenter } from './pages/ActionCenter';
 import { PrintProduct } from './pages/PrintProduct';
 import { PrintActions } from './pages/PrintActions';
+import { PrintDraft } from './pages/PrintDraft';
 import { SchemaLoader } from './components/SchemaLoader';
 import { Copilot } from './components/Copilot';
 
@@ -598,6 +599,7 @@ const router = createBrowserRouter([
   },
   // standalone print routes (no app chrome) for clean PDF export
   { path: '/print/actions', element: <PrintActions /> },
+  { path: '/print/draft/:draftId', element: <PrintDraft /> },
   { path: '/print/:productName', element: <PrintProduct /> },
 ]);
 

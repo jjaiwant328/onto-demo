@@ -5,6 +5,7 @@
 // deliberately separate so in-progress drafts never pollute the real catalog.
 import { useState } from 'react';
 import type React from 'react';
+import { useNavigate } from 'react-router';
 import {
   Card,
   CardContent,
@@ -14,12 +15,13 @@ import {
   Badge,
   Button,
 } from '@databricks/appkit-ui/react';
-import { Package, Check, Undo2, Trash2, Sparkles, Database, MessageSquare, Gauge } from 'lucide-react';
+import { Package, Check, Undo2, Trash2, Sparkles, Database, MessageSquare, Gauge, FileDown } from 'lucide-react';
 import { useProduct } from '../lib/product';
 import { parseSpec } from '../lib/useCaseProduct';
 
 export function DataProductDrafts() {
   const { useCaseDrafts, setUseCaseDraftStatus, removeUseCaseDraft, domainAnalysisLabel } = useProduct();
+  const navigate = useNavigate();
   const [busyId, setBusyId] = useState<string | null>(null);
 
   const toggle = async (draftId: string, completed: boolean) => {
@@ -82,6 +84,15 @@ export function DataProductDrafts() {
                 {spec?.summary && <CardDescription>{spec.summary}</CardDescription>}
               </div>
               <div className="flex items-center gap-1 shrink-0">
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="h-7 gap-1 px-2 text-xs"
+                  title="Export this data product as a PDF"
+                  onClick={() => void navigate(`/print/draft/${d.draft_id}`)}
+                >
+                  <FileDown className="h-3.5 w-3.5" /> Export PDF
+                </Button>
                 <Button
                   size="sm"
                   variant={completed ? 'outline' : 'default'}

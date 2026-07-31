@@ -35,6 +35,15 @@ const SEV_BADGE: Record<GapSeverity, 'destructive' | 'default' | 'outline'> = {
   'Nice-to-have': 'outline',
 };
 
+// Resolve a display score. Analyses generated before opportunity_score existed
+// (or an LLM that omitted it) persist 0/undefined; derive a sensible value from
+// the ROI tier so the column is never a flat 0.
+function displayScore(u: UseCase): number {
+  const s = Number(u.opportunity_score);
+  if (Number.isFinite(s) && s > 0) return Math.round(s);
+  return u.roi_tier === 'High' ? 75 : u.roi_tier === 'Low' ? 30 : 50;
+}
+
 export function DomainAnalysis() {
   const {
     domainAnalysis,
@@ -156,7 +165,9 @@ export function DomainAnalysis() {
                       </TableRow>
                     </TableHeader>
                     <TableBody>
-                      {domainAnalysis.use_cases.map((u, i) => (
+                      {[...domainAnalysis.use_cases]
+                        .sort((a, b) => displayScore(b) - displayScore(a))
+                        .map((u, i) => (
                         <TableRow key={`${u.title}-${i}`} className="align-top">
                           <TableCell className="font-medium align-top whitespace-normal break-words py-3">
                             {u.title}
@@ -174,12 +185,12 @@ export function DomainAnalysis() {
                           <TableCell className="align-top py-3">
                             <div className="flex items-center gap-2">
                               <span className="text-sm font-semibold tabular-nums">
-                                {Math.round(u.opportunity_score ?? 0)}
+                                {displayScore(u)}
                               </span>
                               <div className="h-1.5 flex-1 rounded-full bg-muted overflow-hidden">
                                 <div
                                   className="h-full bg-primary"
-                                  style={{ width: `${Math.max(0, Math.min(100, u.opportunity_score ?? 0))}%` }}
+                                  style={{ width: `${Math.max(0, Math.min(100, displayScore(u)))}%` }}
                                 />
                               </div>
                             </div>
