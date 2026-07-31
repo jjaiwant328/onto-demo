@@ -2573,6 +2573,224 @@ createApp({
         }
       });
 
+      // ================= Domain Analysis (ROI use cases + data gaps) =========
+      // Generated per schema+domain: an LLM (grounded in the domain's products +
+      // DDL/KPIs) ranks use cases by ROI tier, maps products, names data gaps, and
+      // picks a flagship. Falls back to a deterministic skeleton when no LLM is
+      // configured. Persisted in jai_domain_analysis and loaded back from there.
+      type DomainAnalysisProduct = {
+        product_name: string;
+        display_name?: string;
+        business_outcome?: string;
+        kpis?: string[];
+        fact_tables?: string[];
+        dim_tables?: string[];
+        issue?: string;
+        action_hint?: string;
+      };
+      const analysisId = (schema: string, domain: string) => `${schema}:${domain}`;
+
+      // Deterministic fallback: rank by data readiness (more tables/KPIs → higher),
+      // map each use case to its product, and flag the usual missing-dimension gaps.
+      const heuristicAnalysis = (
+        domainName: string,
+        domainLabel: string,
+        products: DomainAnalysisProduct[]
+      ) => {
+        const scored = products.map((p) => {
+          const tables = [...(p.fact_tables ?? []), ...(p.dim_tables ?? [])];
+          const readiness = tables.length + (p.kpis?.length ?? 0);
+          return { p, tables, readiness };
+        });
+        scored.sort((a, b) => b.readiness - a.readiness);
+        const tier = (i: number, n: number): 'High' | 'Medium' | 'Low' =>
+          i < Math.ceil(n / 3) ? 'High' : i < Math.ceil((2 * n) / 3) ? 'Medium' : 'Low';
+        const use_cases = scored.map((s, i) => ({
+          title: s.p.display_name ?? s.p.product_name,
+          roi_tier: tier(i, scored.length),
+          value_driver: s.p.business_outcome ?? 'Operational efficiency and decision support.',
+          data_readiness:
+            s.tables.length >= 3 ? 'Strong — multiple backing tables' : s.tables.length > 0 ? 'Partial — limited backing tables' : 'Weak — no backing tables identified',
+          effort: s.tables.length >= 3 ? 'Medium' : 'Low',
+          time_to_value: s.readiness >= 5 ? '2-4 weeks' : '4-8 weeks',
+          products: [s.p.product_name],
+          tables: s.tables,
+          description: s.p.issue ?? s.p.business_outcome ?? '',
+        }));
+        const data_gaps = [
+          {
+            gap: 'External/contextual signals (e.g. weather, mobility, macro)',
+            why_it_matters:
+              'Demand and traffic are heavily driven by external factors; without them models misattribute variance to internal levers.',
+            severity: 'Important' as const,
+            unblocks: use_cases.slice(0, 2).map((u) => u.title),
+          },
+          {
+            gap: 'Customer / loyalty identity dimension',
+            why_it_matters:
+              'Personalization, CLV, and churn use cases need a durable customer profile beyond transaction-level flags.',
+            severity: 'Important' as const,
+            unblocks: [],
+          },
+        ];
+        return {
+          domain: domainName,
+          domain_label: domainLabel,
+          llm_used: false,
+          flagship: use_cases[0]
+            ? { use_case: use_cases[0].title, rationale: 'Highest data readiness in this domain — fastest path to value.' }
+            : { use_case: '', rationale: '' },
+          use_cases,
+          data_gaps,
+        };
+      };
+
+      // Permissive JSON extraction (fenced or bare object) for the analysis shape.
+      const parseAnalysisJson = (text: string): Record<string, unknown> | null => {
+        if (!text) return null;
+        const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/);
+        const body = fenced ? fenced[1] : text;
+        const start = body.indexOf('{');
+        const end = body.lastIndexOf('}');
+        if (start < 0 || end <= start) return null;
+        try {
+          const obj = JSON.parse(body.slice(start, end + 1)) as unknown;
+          return obj && typeof obj === 'object' && !Array.isArray(obj) ? (obj as Record<string, unknown>) : null;
+        } catch {
+          return null;
+        }
+      };
+
+      app.post('/api/domain-analysis', async (req, res) => {
+        const b = (req.body ?? {}) as {
+          schema_label?: string;
+          domain_name?: string;
+          domain_label?: string;
+          signature?: string;
+          products?: DomainAnalysisProduct[];
+          components_summary?: string;
+        };
+        const schema = String(b.schema_label ?? '').trim();
+        const domain = String(b.domain_name ?? '').trim();
+        const domainLabel = String(b.domain_label ?? domain).trim();
+        const products = Array.isArray(b.products) ? b.products : [];
+        if (!schema || !domain || products.length === 0) {
+          res.status(400).json({ ok: false, error: 'schema_label, domain_name and products required' });
+          return;
+        }
+
+        // Build the grounded prompt from the domain's product metadata.
+        const productLines = products
+          .map((p) => {
+            const tables = [...(p.fact_tables ?? []), ...(p.dim_tables ?? [])].join(', ');
+            return (
+              `- ${p.display_name ?? p.product_name} (${p.product_name}): ` +
+              `${p.business_outcome ?? ''} | KPIs: ${(p.kpis ?? []).join(', ') || 'n/a'} | ` +
+              `tables: ${tables || 'n/a'}${p.issue ? ` | issue: ${p.issue}` : ''}`
+            );
+          })
+          .join('\n');
+        const prompt =
+          `You are a data & analytics strategist with deep industry domain expertise. Analyze the ` +
+          `business domain "${domainLabel}" using ONLY the products, KPIs, and tables listed below — ` +
+          `do not invent tables or columns. Apply domain expertise from outside the data to identify ` +
+          `high-value use cases and real data gaps.\n\n` +
+          `DOMAIN PRODUCTS:\n${productLines}\n\n` +
+          (b.components_summary ? `SCHEMA DETAIL:\n${b.components_summary.slice(0, 6000)}\n\n` : '') +
+          `Return ONLY a JSON object (no prose) with this exact shape:\n` +
+          `{"flagship":{"use_case":"","rationale":""},` +
+          `"use_cases":[{"title":"","roi_tier":"High|Medium|Low","value_driver":"",` +
+          `"data_readiness":"","effort":"Low|Medium|High","time_to_value":"","products":[""],` +
+          `"tables":[""],"description":""}],` +
+          `"data_gaps":[{"gap":"","why_it_matters":"","severity":"Critical|Important|Nice-to-have","unblocks":[""]}]}\n` +
+          `Rank use_cases by ROI tier (High first). Map each to the products/tables above. ` +
+          `Name data gaps a domain expert would flag as missing for these use cases.`;
+
+        let analysis: Record<string, unknown> | null = null;
+        let llmUsed = false;
+        const raw = await llmComplete(prompt, 4000, { label: 'domain-analysis' });
+        if (raw) {
+          const parsed = parseAnalysisJson(raw);
+          if (parsed && Array.isArray(parsed.use_cases)) {
+            analysis = {
+              domain,
+              domain_label: domainLabel,
+              llm_used: true,
+              flagship: parsed.flagship ?? { use_case: '', rationale: '' },
+              use_cases: parsed.use_cases,
+              data_gaps: Array.isArray(parsed.data_gaps) ? parsed.data_gaps : [],
+            };
+            llmUsed = true;
+          }
+        }
+        if (!analysis) {
+          analysis = heuristicAnalysis(domain, domainLabel, products);
+        }
+
+        try {
+          const who = await whoami();
+          await lbQuery(
+            `INSERT INTO jai_domain_analysis (analysis_id, schema_label, domain_name, domain_label, ` +
+              `signature, analysis_json, llm_used, generated_by, generated_at) ` +
+              `VALUES ($1,$2,$3,$4,$5,$6,$7,$8, now()) ` +
+              `ON CONFLICT (analysis_id) DO UPDATE SET domain_label=EXCLUDED.domain_label, ` +
+              `signature=EXCLUDED.signature, analysis_json=EXCLUDED.analysis_json, ` +
+              `llm_used=EXCLUDED.llm_used, generated_by=EXCLUDED.generated_by, generated_at=now()`,
+            [
+              analysisId(schema, domain),
+              schema,
+              domain,
+              domainLabel,
+              String(b.signature ?? ''),
+              JSON.stringify(analysis),
+              llmUsed,
+              who,
+            ]
+          );
+          res.json({ ok: true, analysis_id: analysisId(schema, domain), llm_used: llmUsed, analysis });
+        } catch (err) {
+          // persistence failed (e.g. no Lakebase locally) — still return the analysis
+          res.json({ ok: true, analysis_id: analysisId(schema, domain), llm_used: llmUsed, analysis, persist_warning: humanizeSqlError(err) });
+        }
+      });
+
+      app.get('/api/domain-analysis', async (req, res) => {
+        const schema = String(req.query.schema ?? '').trim();
+        const domain = String(req.query.domain ?? '').trim();
+        if (!schema || !domain) {
+          res.json({ analysis: null });
+          return;
+        }
+        try {
+          const rows = await lbQuery<{ analysis_json: string; signature: string; llm_used: boolean; generated_by: string; generated_at: string }>(
+            `SELECT analysis_json, signature, llm_used, generated_by, ` +
+              `to_char(generated_at, 'YYYY-MM-DD HH24:MI:SS') AS generated_at ` +
+              `FROM jai_domain_analysis WHERE analysis_id = $1 LIMIT 1`,
+            [analysisId(schema, domain)]
+          );
+          if (rows.length === 0) {
+            res.json({ analysis: null });
+            return;
+          }
+          const r = rows[0];
+          let parsed: unknown = null;
+          try {
+            parsed = JSON.parse(r.analysis_json);
+          } catch {
+            /* corrupt row */
+          }
+          res.json({
+            analysis: parsed,
+            signature: r.signature,
+            llm_used: r.llm_used,
+            generated_by: r.generated_by,
+            generated_at: r.generated_at,
+          });
+        } catch (err) {
+          res.json({ analysis: null, error: humanizeSqlError(err) });
+        }
+      });
+
       // ================= Governed serving-view live check =================
       app.get('/api/serving-view-check', async (req, res) => {
         const object = String(req.query.object ?? '').trim();

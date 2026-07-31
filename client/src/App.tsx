@@ -44,6 +44,7 @@ import { ActionInbox } from './pages/ActionInbox';
 import { ScenarioImpact } from './pages/ScenarioImpact';
 import { DataProducts } from './pages/DataProducts';
 import { OntologyStudio } from './pages/OntologyStudio';
+import { DomainAnalysis } from './pages/DomainAnalysis';
 import { SemanticExplorer } from './pages/SemanticExplorer';
 import { BusinessView } from './pages/BusinessView';
 import { GraphExplorer } from './pages/GraphExplorer';
@@ -65,6 +66,7 @@ const NAV_BUSINESS = [
 // The technical curation / governance tabs (always shown).
 const NAV_BUILDER = [
   { to: '/data-products', label: 'Data Products' },
+  { to: '/domain-analysis', label: 'Domain Analysis' },
   { to: '/ontology-studio', label: 'Ontology Studio' },
   { to: '/semantic-explorer', label: 'Semantic Explorer' },
   { to: '/graph-explorer', label: 'Graph Explorer' },
@@ -581,6 +583,7 @@ const router = createBrowserRouter([
       { path: '/action-inbox', element: <ActionInbox /> },
       { path: '/scenario-impact', element: <ScenarioImpact /> },
       { path: '/data-products', element: <DataProducts /> },
+      { path: '/domain-analysis', element: <DomainAnalysis /> },
       { path: '/ontology-studio', element: <OntologyStudio /> },
       { path: '/semantic-explorer', element: <SemanticExplorer /> },
       { path: '/graph-explorer', element: <GraphExplorer /> },

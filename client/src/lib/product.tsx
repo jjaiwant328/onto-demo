@@ -43,6 +43,14 @@ import {
   type ArtifactRuleInput,
 } from './ontologyArtifact';
 import { combineSchemas, type SchemaEntry, type ConformanceInfo } from './combineSchemas';
+import {
+  analysisSignature,
+  generateDomainAnalysis,
+  fetchDomainAnalysis,
+  toAnalysisProduct,
+  type DomainAnalysis,
+  type DomainAnalysisResult,
+} from './domainAnalysis';
 
 const DEFAULT_CATALOG = catalogJson as unknown as Catalog;
 const DEFAULT_SCHEMA = schemaJson as unknown as Schema;
@@ -169,6 +177,12 @@ export type ProductContextValue = {
   artifact: StoredArtifact | null;
   artifactStale: boolean;
   regenerateArtifact: (opts?: { rules?: ArtifactRuleInput[]; servingViewPresent?: boolean }) => Promise<void>;
+  // domain analysis (ROI-ranked use cases + data gaps) for the selected domain
+  domainAnalysis: DomainAnalysis | null;
+  domainAnalysisStale: boolean;
+  domainAnalyzing: boolean;
+  domainAnalysisLabel: string;
+  regenerateDomainAnalysis: () => Promise<DomainAnalysisResult>;
   // token that changes whenever the active schema selection changes; session-
   // scoped panels (Action queue, Copilot conversation) reset on it so no
   // schema's state leaks into another.
@@ -1207,6 +1221,59 @@ export function ProductProvider({ children }: { children: ReactNode }) {
     const t = setTimeout(() => void regenerateArtifact(), 1000);
     return () => clearTimeout(t);
   }, [artifact, artifactStale, regenerateArtifact]);
+
+  // ---- domain analysis (ROI-ranked use cases + data-gap analysis) per domain ----
+  // Scoped to the selected domain (all its products). Persisted in Lakebase and
+  // loaded back; regenerable, with a signature-based staleness indicator.
+  const [domainAnalysis, setDomainAnalysisState] = useState<DomainAnalysis | null>(null);
+  const [domainAnalysisSig, setDomainAnalysisSig] = useState<string | null>(null);
+  const [domainAnalyzing, setDomainAnalyzing] = useState(false);
+  // the domain key + label the analysis is scoped to (ALL_SCOPE → all domains)
+  const analysisDomainName = domainScopeAll ? ALL_SCOPE : selectedDomain?.name ?? ALL_SCOPE;
+  const analysisDomainLabel = domainScopeAll ? 'All domains' : selectedDomain?.label ?? 'All domains';
+  const analysisProducts = useMemo(
+    () => productsInDomain.map(toAnalysisProduct),
+    [productsInDomain]
+  );
+  const currentAnalysisSig = useMemo(
+    () => analysisSignature(analysisProducts),
+    [analysisProducts]
+  );
+  const domainAnalysisStale = useMemo(() => {
+    if (!domainAnalysis) return true;
+    return domainAnalysisSig !== currentAnalysisSig;
+  }, [domainAnalysis, domainAnalysisSig, currentAnalysisSig]);
+  useEffect(() => {
+    let cancelled = false;
+    void fetchDomainAnalysis(activeSchemaLabel, analysisDomainName).then((r) => {
+      if (cancelled) return;
+      setDomainAnalysisState(r.analysis);
+      setDomainAnalysisSig(r.signature ?? null);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [activeSchemaLabel, analysisDomainName]);
+  const regenerateDomainAnalysis = useCallback(async () => {
+    setDomainAnalyzing(true);
+    try {
+      const r = await generateDomainAnalysis({
+        schema_label: activeSchemaLabel,
+        domain_name: analysisDomainName,
+        domain_label: analysisDomainLabel,
+        signature: currentAnalysisSig,
+        products: analysisProducts,
+      });
+      if (r.ok && r.analysis) {
+        setDomainAnalysisState(r.analysis);
+        setDomainAnalysisSig(currentAnalysisSig);
+      }
+      return r;
+    } finally {
+      setDomainAnalyzing(false);
+    }
+  }, [activeSchemaLabel, analysisDomainName, analysisDomainLabel, currentAnalysisSig, analysisProducts]);
+
   const enterpriseGraph = useMemo(
     () => buildEnterpriseGraph(catalog, schema, conformance?.conformedTables, graphLinks),
     [catalog, schema, conformance, graphLinks]
@@ -1285,6 +1352,11 @@ export function ProductProvider({ children }: { children: ReactNode }) {
     artifact,
     artifactStale,
     regenerateArtifact,
+    domainAnalysis,
+    domainAnalysisStale,
+    domainAnalyzing,
+    domainAnalysisLabel: analysisDomainLabel,
+    regenerateDomainAnalysis,
     isolationKey: sig,
     syncScopeFromSections,
     setSyncScopeFromSections,

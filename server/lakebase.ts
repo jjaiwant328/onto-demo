@@ -239,4 +239,18 @@ export async function ensureLakebaseTables(): Promise<void> {
     created_at timestamptz,
     updated_at timestamptz
   )`);
+  // Generated domain analysis (ROI-ranked use cases + data-gap analysis) per
+  // schema+domain. LLM-authored (grounded in the domain's products/DDL) with a
+  // deterministic fallback; canonical source the Domain Analysis tab reads.
+  await lbQuery(`CREATE TABLE IF NOT EXISTS jai_domain_analysis (
+    analysis_id text PRIMARY KEY,
+    schema_label text,
+    domain_name text,
+    domain_label text,
+    signature text,
+    analysis_json text,
+    llm_used boolean,
+    generated_by text,
+    generated_at timestamptz
+  )`);
 }
