@@ -26,12 +26,13 @@ import {
   Input,
   Label,
 } from '@databricks/appkit-ui/react';
-import { CheckCircle2, FileText, FileDown, Layers, Database, MessageSquare, BarChart3, Plus } from 'lucide-react';
+import { CheckCircle2, FileText, FileDown, Layers, Database, MessageSquare, BarChart3, Plus, Package } from 'lucide-react';
 import { useNavigate } from 'react-router';
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useProduct } from '../lib/product';
 import { CatalogLoadingSkeleton } from '../components/LoadingSkeleton';
 import { fetchProductLinks, attachLink, deleteLink, type ProductLink } from '../lib/productLinks';
+import { parseSpec } from '../lib/useCaseProduct';
 
 function maturityVariant(m: string): 'default' | 'secondary' | 'outline' {
   const s = (m || '').toLowerCase();
@@ -171,7 +172,10 @@ export function DataProducts() {
     catalogLoading,
     rebuilding,
     refreshGraphLinks,
+    useCaseDrafts,
   } = useProduct();
+  // completed use-case data products (drafted in the staging tab, marked done)
+  const completedDrafts = useCaseDrafts.filter((d) => d.status === 'completed');
   const schemaLabel =
     selectedSchemaIds.length === 1
       ? (schemaEntries.find((s) => s.id === selectedSchemaIds[0])?.label ?? '1 schema')
@@ -393,6 +397,61 @@ export function DataProducts() {
           </Table>
         </CardContent>
       </Card>
+
+      {/* completed use-case data products (promoted from the Product Drafts staging tab) */}
+      {completedDrafts.length > 0 && (
+        <Card className="shadow-sm border-emerald-300">
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2">
+              <Package className="h-4 w-4 text-primary" /> Data products from use cases
+              <Badge variant="default" className="text-[10px]">
+                {completedDrafts.length}
+              </Badge>
+            </CardTitle>
+            <CardDescription>
+              Completed use-case data products drafted in the Product Drafts tab. Manage or revert
+              them there.
+            </CardDescription>
+          </CardHeader>
+          <CardContent>
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead>Product (from use case)</TableHead>
+                  <TableHead>KPIs</TableHead>
+                  <TableHead>Tables</TableHead>
+                  <TableHead>Genie / metric views</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {completedDrafts.map((d) => {
+                  const spec = parseSpec(d);
+                  return (
+                    <TableRow key={d.draft_id} className="align-top">
+                      <TableCell className="font-medium align-top py-3 whitespace-normal break-words">
+                        {d.use_case_title}
+                        <Badge variant="outline" className="ml-1.5 text-[10px] font-normal">
+                          from use case
+                        </Badge>
+                      </TableCell>
+                      <TableCell className="text-xs text-muted-foreground align-top py-3">
+                        {(spec?.kpis ?? []).map((k) => k.name).join(', ') || '—'}
+                      </TableCell>
+                      <TableCell className="text-xs text-muted-foreground align-top py-3 whitespace-normal break-words">
+                        {(spec?.tables ?? []).join(', ') || '—'}
+                      </TableCell>
+                      <TableCell className="text-xs text-muted-foreground align-top py-3">
+                        {(spec?.genie_spaces ?? []).length} genie · {(spec?.metric_views ?? []).length} metric views
+                        <span className="text-[10px]"> (proposed)</span>
+                      </TableCell>
+                    </TableRow>
+                  );
+                })}
+              </TableBody>
+            </Table>
+          </CardContent>
+        </Card>
+      )}
 
       {/* selected product detail */}
       <Card className="shadow-sm">

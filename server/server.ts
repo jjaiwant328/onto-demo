@@ -2605,18 +2605,28 @@ createApp({
         scored.sort((a, b) => b.readiness - a.readiness);
         const tier = (i: number, n: number): 'High' | 'Medium' | 'Low' =>
           i < Math.ceil(n / 3) ? 'High' : i < Math.ceil((2 * n) / 3) ? 'Medium' : 'Low';
-        const use_cases = scored.map((s, i) => ({
-          title: s.p.display_name ?? s.p.product_name,
-          roi_tier: tier(i, scored.length),
-          value_driver: s.p.business_outcome ?? 'Operational efficiency and decision support.',
-          data_readiness:
-            s.tables.length >= 3 ? 'Strong — multiple backing tables' : s.tables.length > 0 ? 'Partial — limited backing tables' : 'Weak — no backing tables identified',
-          effort: s.tables.length >= 3 ? 'Medium' : 'Low',
-          time_to_value: s.readiness >= 5 ? '2-4 weeks' : '4-8 weeks',
-          products: [s.p.product_name],
-          tables: s.tables,
-          description: s.p.issue ?? s.p.business_outcome ?? '',
-        }));
+        const use_cases = scored.map((s, i) => {
+          const roi_tier = tier(i, scored.length);
+          const effort = s.tables.length >= 3 ? 'Medium' : 'Low';
+          // composite 0-100: ROI tier dominates, boosted by data readiness, penalized by effort
+          const tierPts = roi_tier === 'High' ? 60 : roi_tier === 'Medium' ? 40 : 20;
+          const readinessPts = Math.min(30, s.readiness * 4);
+          const effortPts = effort === 'Low' ? 10 : effort === 'Medium' ? 5 : 0;
+          const opportunity_score = Math.max(0, Math.min(100, tierPts + readinessPts + effortPts));
+          return {
+            title: s.p.display_name ?? s.p.product_name,
+            roi_tier,
+            opportunity_score,
+            value_driver: s.p.business_outcome ?? 'Operational efficiency and decision support.',
+            data_readiness:
+              s.tables.length >= 3 ? 'Strong — multiple backing tables' : s.tables.length > 0 ? 'Partial — limited backing tables' : 'Weak — no backing tables identified',
+            effort,
+            time_to_value: s.readiness >= 5 ? '2-4 weeks' : '4-8 weeks',
+            products: [s.p.product_name],
+            tables: s.tables,
+            description: s.p.issue ?? s.p.business_outcome ?? '',
+          };
+        });
         const data_gaps = [
           {
             gap: 'External/contextual signals (e.g. weather, mobility, macro)',
@@ -2699,11 +2709,13 @@ createApp({
           (b.components_summary ? `SCHEMA DETAIL:\n${b.components_summary.slice(0, 6000)}\n\n` : '') +
           `Return ONLY a JSON object (no prose) with this exact shape:\n` +
           `{"flagship":{"use_case":"","rationale":""},` +
-          `"use_cases":[{"title":"","roi_tier":"High|Medium|Low","value_driver":"",` +
+          `"use_cases":[{"title":"","roi_tier":"High|Medium|Low","opportunity_score":0,"value_driver":"",` +
           `"data_readiness":"","effort":"Low|Medium|High","time_to_value":"","products":[""],` +
           `"tables":[""],"description":""}],` +
           `"data_gaps":[{"gap":"","why_it_matters":"","severity":"Critical|Important|Nice-to-have","unblocks":[""]}]}\n` +
-          `Rank use_cases by ROI tier (High first). Map each to the products/tables above. ` +
+          `opportunity_score is an integer 0-100 reflecting overall opportunity (value vs. data ` +
+          `readiness and effort); higher = better. Rank use_cases by opportunity_score (highest ` +
+          `first), consistent with roi_tier. Map each to the products/tables above. ` +
           `Name data gaps a domain expert would flag as missing for these use cases.`;
 
         let analysis: Record<string, unknown> | null = null;
@@ -2712,12 +2724,29 @@ createApp({
         if (raw) {
           const parsed = parseAnalysisJson(raw);
           if (parsed && Array.isArray(parsed.use_cases)) {
+            // normalize opportunity_score (LLM may omit or return out-of-range);
+            // derive a fallback from roi_tier so the numeric column is always present.
+            const useCases = (parsed.use_cases as Record<string, unknown>[]).map((u) => {
+              const tierVal = String(u.roi_tier ?? 'Medium');
+              const rawScore = Number(u.opportunity_score);
+              const score = Number.isFinite(rawScore)
+                ? Math.max(0, Math.min(100, Math.round(rawScore)))
+                : tierVal === 'High'
+                  ? 75
+                  : tierVal === 'Low'
+                    ? 30
+                    : 50;
+              return { ...u, opportunity_score: score };
+            });
+            useCases.sort(
+              (a, b) => Number(b.opportunity_score ?? 0) - Number(a.opportunity_score ?? 0)
+            );
             analysis = {
               domain,
               domain_label: domainLabel,
               llm_used: true,
               flagship: parsed.flagship ?? { use_case: '', rationale: '' },
-              use_cases: parsed.use_cases,
+              use_cases: useCases,
               data_gaps: Array.isArray(parsed.data_gaps) ? parsed.data_gaps : [],
             };
             llmUsed = true;
@@ -2788,6 +2817,173 @@ createApp({
           });
         } catch (err) {
           res.json({ analysis: null, error: humanizeSqlError(err) });
+        }
+      });
+
+      // ============ Use-case data-product drafts (staging → completed) =======
+      // Describe a Domain Analysis use case as a data product (KPIs, tables,
+      // proposed Genie spaces + metric views). Drafts stage here; only 'completed'
+      // ones surface in Data Products. LLM-authored with a deterministic fallback.
+      type UseCaseProductSpec = {
+        title: string;
+        summary: string;
+        kpis: { name: string; definition: string }[];
+        tables: string[];
+        genie_spaces: { name: string; purpose: string }[];
+        metric_views: { name: string; dimensions: string[]; measures: string[] }[];
+        products: string[];
+      };
+      const slugify = (s: string) =>
+        s.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 40) || 'use_case';
+
+      const heuristicSpec = (
+        title: string,
+        useCase: { value_driver?: string; description?: string; kpis?: string[]; tables?: string[]; products?: string[] }
+      ): UseCaseProductSpec => {
+        const slug = slugify(title);
+        const tables = useCase.tables ?? [];
+        return {
+          title,
+          summary: useCase.description || useCase.value_driver || `Data product for "${title}".`,
+          kpis: (useCase.kpis ?? []).map((k) => ({ name: k, definition: '' })),
+          tables,
+          genie_spaces: [
+            { name: `${slug}_genie`, purpose: `Natural-language Q&A over the ${title} data product.` },
+          ],
+          metric_views: [
+            {
+              name: `jai_${slug}_metrics`,
+              dimensions: ['date', 'store', 'product'].filter(Boolean),
+              measures: useCase.kpis ?? [],
+            },
+          ],
+          products: useCase.products ?? [],
+        };
+      };
+
+      app.post('/api/use-case-product/describe', async (req, res) => {
+        const b = (req.body ?? {}) as {
+          schema_label?: string;
+          domain_name?: string;
+          use_case?: {
+            title?: string;
+            value_driver?: string;
+            description?: string;
+            kpis?: string[];
+            tables?: string[];
+            products?: string[];
+          };
+        };
+        const schema = String(b.schema_label ?? '').trim();
+        const domain = String(b.domain_name ?? '').trim();
+        const uc = b.use_case ?? {};
+        const title = String(uc.title ?? '').trim();
+        if (!schema || !domain || !title) {
+          res.status(400).json({ ok: false, error: 'schema_label, domain_name and use_case.title required' });
+          return;
+        }
+
+        const prompt =
+          `You are a data product manager. Describe the analytics use case "${title}" as a concrete ` +
+          `DATA PRODUCT, using ONLY the inputs below — do not invent tables. Propose Genie space(s) ` +
+          `and metric view(s) by NAME and definition (they will be created later; do not assume they ` +
+          `exist).\n\n` +
+          `USE CASE: ${title}\n` +
+          `VALUE DRIVER: ${uc.value_driver ?? ''}\n` +
+          `DESCRIPTION: ${uc.description ?? ''}\n` +
+          `KPIs: ${(uc.kpis ?? []).join(', ') || 'n/a'}\n` +
+          `TABLES: ${(uc.tables ?? []).join(', ') || 'n/a'}\n` +
+          `SOURCE PRODUCTS: ${(uc.products ?? []).join(', ') || 'n/a'}\n\n` +
+          `Return ONLY JSON with this exact shape:\n` +
+          `{"title":"","summary":"","kpis":[{"name":"","definition":""}],"tables":[""],` +
+          `"genie_spaces":[{"name":"","purpose":""}],` +
+          `"metric_views":[{"name":"","dimensions":[""],"measures":[""]}],"products":[""]}`;
+
+        let spec: UseCaseProductSpec | null = null;
+        let llmUsed = false;
+        const raw = await llmComplete(prompt, 2000, { label: 'use-case-product' });
+        if (raw) {
+          const parsed = parseAnalysisJson(raw) as UseCaseProductSpec | null;
+          if (parsed && Array.isArray(parsed.kpis)) {
+            spec = { ...parsed, title };
+            llmUsed = true;
+          }
+        }
+        if (!spec) spec = heuristicSpec(title, uc);
+
+        const draftId = `ucp_${createHash('sha256').update(`${schema}|${domain}|${title}`).digest('hex').slice(0, 40)}`;
+        try {
+          const who = await whoami();
+          await lbQuery(
+            `INSERT INTO jai_use_case_product (draft_id, schema_label, domain_name, use_case_title, ` +
+              `spec_json, llm_used, status, created_by, created_at, updated_at) ` +
+              `VALUES ($1,$2,$3,$4,$5,$6,'draft',$7, now(), now()) ` +
+              `ON CONFLICT (draft_id) DO UPDATE SET spec_json=EXCLUDED.spec_json, ` +
+              `llm_used=EXCLUDED.llm_used, updated_at=now()`,
+            [draftId, schema, domain, title, JSON.stringify(spec), llmUsed, who]
+          );
+          res.json({ ok: true, draft_id: draftId, llm_used: llmUsed, spec });
+        } catch (err) {
+          res.json({ ok: true, draft_id: draftId, llm_used: llmUsed, spec, persist_warning: humanizeSqlError(err) });
+        }
+      });
+
+      app.get('/api/use-case-products', async (req, res) => {
+        const schema = String(req.query.schema ?? '').trim();
+        const domain = String(req.query.domain ?? '').trim();
+        if (!schema) {
+          res.json({ drafts: [] });
+          return;
+        }
+        const params: unknown[] = [schema];
+        let clause = `schema_label = $1`;
+        if (domain) {
+          params.push(domain);
+          clause += ` AND domain_name = $2`;
+        }
+        try {
+          const rows = await lbQuery(
+            `SELECT draft_id, schema_label, domain_name, use_case_title, spec_json, llm_used, status, ` +
+              `created_by, to_char(updated_at, 'YYYY-MM-DD HH24:MI:SS') AS updated_at ` +
+              `FROM jai_use_case_product WHERE ${clause} ORDER BY updated_at DESC LIMIT 500`,
+            params
+          );
+          res.json({ drafts: rows });
+        } catch (err) {
+          res.json({ drafts: [], error: humanizeSqlError(err) });
+        }
+      });
+
+      app.post('/api/use-case-product/status', async (req, res) => {
+        const b = (req.body ?? {}) as { draft_id?: string; status?: string };
+        const draftId = String(b.draft_id ?? '').trim();
+        const status = String(b.status ?? '').trim();
+        if (!draftId || !['draft', 'completed'].includes(status)) {
+          res.status(400).json({ ok: false, error: "draft_id and status ('draft'|'completed') required" });
+          return;
+        }
+        try {
+          await lbQuery(`UPDATE jai_use_case_product SET status = $1, updated_at = now() WHERE draft_id = $2`, [
+            status,
+            draftId,
+          ]);
+          res.json({ ok: true });
+        } catch (err) {
+          res.json({ ok: false, error: humanizeSqlError(err) });
+        }
+      });
+
+      app.post('/api/use-case-product/delete', async (req, res) => {
+        const draftId = String((req.body as { draft_id?: string })?.draft_id ?? '').trim();
+        if (!draftId) {
+          res.status(400).json({ ok: false, error: 'draft_id required' });
+          return;
+        }
+        try {
+          await lbQuery(`DELETE FROM jai_use_case_product WHERE draft_id = $1`, [draftId]);
+          res.json({ ok: true });
+        } catch (err) {
+          res.json({ ok: false, error: humanizeSqlError(err) });
         }
       });
 

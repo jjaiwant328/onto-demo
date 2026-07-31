@@ -253,4 +253,19 @@ export async function ensureLakebaseTables(): Promise<void> {
     generated_by text,
     generated_at timestamptz
   )`);
+  // Use-case data-product DRAFTS: a use case from the Domain Analysis described
+  // as a data product (KPIs, tables, proposed genie spaces + metric views). Lives
+  // in a staging tab; only status='completed' drafts surface in Data Products.
+  await lbQuery(`CREATE TABLE IF NOT EXISTS jai_use_case_product (
+    draft_id text PRIMARY KEY,
+    schema_label text,
+    domain_name text,
+    use_case_title text,
+    spec_json text,
+    llm_used boolean,
+    status text DEFAULT 'draft',
+    created_by text,
+    created_at timestamptz,
+    updated_at timestamptz
+  )`);
 }

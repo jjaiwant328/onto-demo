@@ -50,7 +50,17 @@ import {
   toAnalysisProduct,
   type DomainAnalysis,
   type DomainAnalysisResult,
+  type UseCase,
 } from './domainAnalysis';
+import {
+  describeUseCaseProduct,
+  fetchUseCaseProducts,
+  setUseCaseProductStatus,
+  deleteUseCaseProduct,
+  type UseCaseProductDraft,
+  type DescribeResult,
+  type DraftStatus,
+} from './useCaseProduct';
 
 const DEFAULT_CATALOG = catalogJson as unknown as Catalog;
 const DEFAULT_SCHEMA = schemaJson as unknown as Schema;
@@ -183,6 +193,11 @@ export type ProductContextValue = {
   domainAnalyzing: boolean;
   domainAnalysisLabel: string;
   regenerateDomainAnalysis: () => Promise<DomainAnalysisResult>;
+  // use-case data-product drafts (staging; completed ones surface in Data Products)
+  useCaseDrafts: UseCaseProductDraft[];
+  describeUseCaseAsProduct: (useCase: UseCase) => Promise<DescribeResult>;
+  setUseCaseDraftStatus: (draftId: string, status: DraftStatus) => Promise<boolean>;
+  removeUseCaseDraft: (draftId: string) => Promise<boolean>;
   // token that changes whenever the active schema selection changes; session-
   // scoped panels (Action queue, Copilot conversation) reset on it so no
   // schema's state leaks into another.
@@ -1274,6 +1289,47 @@ export function ProductProvider({ children }: { children: ReactNode }) {
     }
   }, [activeSchemaLabel, analysisDomainName, analysisDomainLabel, currentAnalysisSig, analysisProducts]);
 
+  // ---- use-case data-product drafts (staging → completed) ----
+  const [useCaseDrafts, setUseCaseDrafts] = useState<UseCaseProductDraft[]>([]);
+  const refreshUseCaseDrafts = useCallback(async () => {
+    if (!activeSchemaLabel) {
+      setUseCaseDrafts([]);
+      return;
+    }
+    setUseCaseDrafts(await fetchUseCaseProducts(activeSchemaLabel));
+  }, [activeSchemaLabel]);
+  useEffect(() => {
+    void refreshUseCaseDrafts();
+  }, [refreshUseCaseDrafts]);
+  const describeUseCaseAsProduct = useCallback(
+    async (useCase: UseCase): Promise<DescribeResult> => {
+      const r = await describeUseCaseProduct({
+        schema_label: activeSchemaLabel,
+        domain_name: analysisDomainName,
+        use_case: useCase,
+      });
+      if (r.ok) await refreshUseCaseDrafts();
+      return r;
+    },
+    [activeSchemaLabel, analysisDomainName, refreshUseCaseDrafts]
+  );
+  const setUseCaseDraftStatus = useCallback(
+    async (draftId: string, status: DraftStatus) => {
+      const ok = await setUseCaseProductStatus(draftId, status);
+      if (ok) await refreshUseCaseDrafts();
+      return ok;
+    },
+    [refreshUseCaseDrafts]
+  );
+  const removeUseCaseDraft = useCallback(
+    async (draftId: string) => {
+      const ok = await deleteUseCaseProduct(draftId);
+      if (ok) await refreshUseCaseDrafts();
+      return ok;
+    },
+    [refreshUseCaseDrafts]
+  );
+
   const enterpriseGraph = useMemo(
     () => buildEnterpriseGraph(catalog, schema, conformance?.conformedTables, graphLinks),
     [catalog, schema, conformance, graphLinks]
@@ -1357,6 +1413,10 @@ export function ProductProvider({ children }: { children: ReactNode }) {
     domainAnalyzing,
     domainAnalysisLabel: analysisDomainLabel,
     regenerateDomainAnalysis,
+    useCaseDrafts,
+    describeUseCaseAsProduct,
+    setUseCaseDraftStatus,
+    removeUseCaseDraft,
     isolationKey: sig,
     syncScopeFromSections,
     setSyncScopeFromSections,

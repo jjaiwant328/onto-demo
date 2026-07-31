@@ -4,6 +4,7 @@
 // Lakebase, and loaded back; regenerable with a staleness indicator. Scope comes
 // from the left-panel Domain selection (ALL domains → whole catalog).
 import { useState } from 'react';
+import { useNavigate } from 'react-router';
 import {
   Card,
   CardContent,
@@ -19,9 +20,9 @@ import {
   TableHeader,
   TableRow,
 } from '@databricks/appkit-ui/react';
-import { Sparkles, Loader2, AlertTriangle, Star, ArrowRight, RefreshCw, Info } from 'lucide-react';
+import { Sparkles, Loader2, AlertTriangle, Star, ArrowRight, RefreshCw, Info, Package, Check } from 'lucide-react';
 import { useProduct } from '../lib/product';
-import type { RoiTier, GapSeverity } from '../lib/domainAnalysis';
+import type { RoiTier, GapSeverity, UseCase } from '../lib/domainAnalysis';
 
 const ROI_BADGE: Record<RoiTier, string> = {
   High: 'bg-emerald-600 text-white',
@@ -41,8 +42,24 @@ export function DomainAnalysis() {
     domainAnalyzing,
     domainAnalysisLabel,
     regenerateDomainAnalysis,
+    describeUseCaseAsProduct,
+    useCaseDrafts,
   } = useProduct();
+  const navigate = useNavigate();
   const [note, setNote] = useState<string | null>(null);
+  const [describingTitle, setDescribingTitle] = useState<string | null>(null);
+
+  // titles that already have a draft (so the button reads "View draft")
+  const draftedTitles = new Set(useCaseDrafts.map((d) => d.use_case_title));
+
+  const describe = async (uc: UseCase) => {
+    setNote(null);
+    setDescribingTitle(uc.title);
+    const r = await describeUseCaseAsProduct(uc);
+    setDescribingTitle(null);
+    if (!r.ok) setNote(`Could not describe "${uc.title}": ${r.error ?? 'unknown error'}`);
+    else void navigate('/data-product-drafts');
+  };
 
   const run = async () => {
     setNote(null);
@@ -123,47 +140,94 @@ export function DomainAnalysis() {
               {domainAnalysis.use_cases.length === 0 ? (
                 <p className="text-sm text-muted-foreground">No use cases produced.</p>
               ) : (
-                <Table>
-                  <TableHeader>
-                    <TableRow>
-                      <TableHead>Use case</TableHead>
-                      <TableHead>ROI</TableHead>
-                      <TableHead>Value driver</TableHead>
-                      <TableHead>Data readiness</TableHead>
-                      <TableHead>Effort</TableHead>
-                      <TableHead>Time to value</TableHead>
-                      <TableHead>Products</TableHead>
-                    </TableRow>
-                  </TableHeader>
-                  <TableBody>
-                    {domainAnalysis.use_cases.map((u, i) => (
-                      <TableRow key={`${u.title}-${i}`}>
-                        <TableCell className="font-medium">
-                          {u.title}
-                          {u.description && (
-                            <div className="text-xs text-muted-foreground font-normal mt-0.5">
-                              {u.description}
-                            </div>
-                          )}
-                        </TableCell>
-                        <TableCell>
-                          <Badge className={`text-[10px] ${ROI_BADGE[u.roi_tier] ?? ''}`}>
-                            {u.roi_tier}
-                          </Badge>
-                        </TableCell>
-                        <TableCell className="text-xs text-muted-foreground max-w-[220px]">
-                          {u.value_driver}
-                        </TableCell>
-                        <TableCell className="text-xs text-muted-foreground">{u.data_readiness}</TableCell>
-                        <TableCell className="text-xs">{u.effort}</TableCell>
-                        <TableCell className="text-xs">{u.time_to_value}</TableCell>
-                        <TableCell className="text-xs text-muted-foreground">
-                          {(u.products ?? []).join(', ')}
-                        </TableCell>
+                <div className="overflow-x-auto">
+                  <Table className="min-w-[1150px] table-fixed">
+                    <TableHeader>
+                      <TableRow>
+                        <TableHead className="w-[24%]">Use case</TableHead>
+                        <TableHead className="w-[80px]">ROI</TableHead>
+                        <TableHead className="w-[90px]">Opportunity</TableHead>
+                        <TableHead className="w-[22%]">Value driver</TableHead>
+                        <TableHead className="w-[16%]">Data readiness</TableHead>
+                        <TableHead className="w-[70px]">Effort</TableHead>
+                        <TableHead className="w-[90px]">Time to value</TableHead>
+                        <TableHead className="w-[14%]">Products</TableHead>
+                        <TableHead className="w-[150px]">Data product</TableHead>
                       </TableRow>
-                    ))}
-                  </TableBody>
-                </Table>
+                    </TableHeader>
+                    <TableBody>
+                      {domainAnalysis.use_cases.map((u, i) => (
+                        <TableRow key={`${u.title}-${i}`} className="align-top">
+                          <TableCell className="font-medium align-top whitespace-normal break-words py-3">
+                            {u.title}
+                            {u.description && (
+                              <div className="text-xs text-muted-foreground font-normal mt-1 whitespace-normal break-words">
+                                {u.description}
+                              </div>
+                            )}
+                          </TableCell>
+                          <TableCell className="align-top py-3">
+                            <Badge className={`text-[10px] ${ROI_BADGE[u.roi_tier] ?? ''}`}>
+                              {u.roi_tier}
+                            </Badge>
+                          </TableCell>
+                          <TableCell className="align-top py-3">
+                            <div className="flex items-center gap-2">
+                              <span className="text-sm font-semibold tabular-nums">
+                                {Math.round(u.opportunity_score ?? 0)}
+                              </span>
+                              <div className="h-1.5 flex-1 rounded-full bg-muted overflow-hidden">
+                                <div
+                                  className="h-full bg-primary"
+                                  style={{ width: `${Math.max(0, Math.min(100, u.opportunity_score ?? 0))}%` }}
+                                />
+                              </div>
+                            </div>
+                          </TableCell>
+                          <TableCell className="text-xs text-muted-foreground align-top whitespace-normal break-words py-3">
+                            {u.value_driver}
+                          </TableCell>
+                          <TableCell className="text-xs text-muted-foreground align-top whitespace-normal break-words py-3">
+                            {u.data_readiness}
+                          </TableCell>
+                          <TableCell className="text-xs align-top py-3">{u.effort}</TableCell>
+                          <TableCell className="text-xs align-top py-3">{u.time_to_value}</TableCell>
+                          <TableCell className="text-xs text-muted-foreground align-top whitespace-normal break-words py-3">
+                            {(u.products ?? []).join(', ')}
+                          </TableCell>
+                          <TableCell className="align-top py-3">
+                            {draftedTitles.has(u.title) ? (
+                              <Button
+                                size="sm"
+                                variant="ghost"
+                                className="h-7 gap-1 px-2 text-xs text-emerald-600"
+                                onClick={() => void navigate('/data-product-drafts')}
+                              >
+                                <Check className="h-3.5 w-3.5" /> View draft
+                              </Button>
+                            ) : (
+                              <Button
+                                size="sm"
+                                variant="outline"
+                                className="h-7 gap-1 px-2 text-xs"
+                                disabled={describingTitle === u.title}
+                                title="Describe this use case as a data product (staged separately)"
+                                onClick={() => void describe(u)}
+                              >
+                                {describingTitle === u.title ? (
+                                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                                ) : (
+                                  <Package className="h-3.5 w-3.5" />
+                                )}
+                                Describe
+                              </Button>
+                            )}
+                          </TableCell>
+                        </TableRow>
+                      ))}
+                    </TableBody>
+                  </Table>
+                </div>
               )}
             </CardContent>
           </Card>

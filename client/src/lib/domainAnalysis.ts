@@ -11,6 +11,9 @@ export type GapSeverity = 'Critical' | 'Important' | 'Nice-to-have';
 export type UseCase = {
   title: string;
   roi_tier: RoiTier;
+  // composite opportunity score 0-100 (weighs ROI tier, data readiness, effort);
+  // a sortable numeric call-out since we have DDLs/metadata, not live financials.
+  opportunity_score: number;
   value_driver: string;
   data_readiness: string;
   effort: string;

@@ -45,6 +45,7 @@ import { ScenarioImpact } from './pages/ScenarioImpact';
 import { DataProducts } from './pages/DataProducts';
 import { OntologyStudio } from './pages/OntologyStudio';
 import { DomainAnalysis } from './pages/DomainAnalysis';
+import { DataProductDrafts } from './pages/DataProductDrafts';
 import { SemanticExplorer } from './pages/SemanticExplorer';
 import { BusinessView } from './pages/BusinessView';
 import { GraphExplorer } from './pages/GraphExplorer';
@@ -67,6 +68,7 @@ const NAV_BUSINESS = [
 const NAV_BUILDER = [
   { to: '/data-products', label: 'Data Products' },
   { to: '/domain-analysis', label: 'Domain Analysis' },
+  { to: '/data-product-drafts', label: 'Product Drafts' },
   { to: '/ontology-studio', label: 'Ontology Studio' },
   { to: '/semantic-explorer', label: 'Semantic Explorer' },
   { to: '/graph-explorer', label: 'Graph Explorer' },
@@ -584,6 +586,7 @@ const router = createBrowserRouter([
       { path: '/scenario-impact', element: <ScenarioImpact /> },
       { path: '/data-products', element: <DataProducts /> },
       { path: '/domain-analysis', element: <DomainAnalysis /> },
+      { path: '/data-product-drafts', element: <DataProductDrafts /> },
       { path: '/ontology-studio', element: <OntologyStudio /> },
       { path: '/semantic-explorer', element: <SemanticExplorer /> },
       { path: '/graph-explorer', element: <GraphExplorer /> },
