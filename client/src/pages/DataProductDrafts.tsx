@@ -15,7 +15,7 @@ import {
   Badge,
   Button,
 } from '@databricks/appkit-ui/react';
-import { Package, Check, Undo2, Trash2, Sparkles, Database, MessageSquare, Gauge, FileDown } from 'lucide-react';
+import { Package, Check, Undo2, Trash2, Sparkles, Database, MessageSquare, Gauge, FileDown, FileText } from 'lucide-react';
 import { useProduct } from '../lib/product';
 import { parseSpec } from '../lib/useCaseProduct';
 
@@ -116,7 +116,8 @@ export function DataProductDrafts() {
               </div>
             </CardHeader>
             {spec && (
-              <CardContent className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <CardContent className="space-y-4">
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                 <Section icon={<Gauge className="h-3.5 w-3.5" />} title={`KPIs (${spec.kpis.length})`}>
                   {spec.kpis.length === 0 ? (
                     <Empty />
@@ -184,6 +185,67 @@ export function DataProductDrafts() {
                     </ul>
                   )}
                 </Section>
+                </div>
+
+                {spec.contract && (
+                  <Section
+                    icon={<FileText className="h-3.5 w-3.5" />}
+                    title="Data contract"
+                  >
+                    <div className="space-y-2 text-xs">
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-x-4 gap-y-1">
+                        <div>
+                          <span className="text-muted-foreground">Serving object: </span>
+                          <span className="font-mono">{spec.contract.serving_object}</span>{' '}
+                          <span className="text-[10px] text-muted-foreground">(proposed)</span>
+                        </div>
+                        <div>
+                          <span className="text-muted-foreground">Grain: </span>
+                          {spec.contract.grain}
+                        </div>
+                        <div>
+                          <span className="text-muted-foreground">Freshness: </span>
+                          {spec.contract.freshness?.sla}
+                        </div>
+                        <div>
+                          <span className="text-muted-foreground">Lineage: </span>
+                          {(spec.contract.lineage?.sources ?? []).join(', ') || '—'} →{' '}
+                          <span className="font-mono">{spec.contract.lineage?.serving}</span>
+                        </div>
+                      </div>
+                      {spec.contract.schema?.length > 0 && (
+                        <div>
+                          <div className="text-muted-foreground mb-0.5">
+                            Schema ({spec.contract.schema.length} columns)
+                          </div>
+                          <div className="flex flex-wrap gap-1">
+                            {spec.contract.schema.map((c, i) => (
+                              <Badge key={`${c.name}-${i}`} variant="outline" className="text-[10px] font-normal">
+                                {c.name}:{c.type}
+                                {c.key ? ' · key' : ''}
+                              </Badge>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+                      {spec.contract.quality_checks?.length > 0 && (
+                        <div>
+                          <div className="text-muted-foreground mb-0.5">
+                            Quality checks ({spec.contract.quality_checks.length})
+                          </div>
+                          <ul className="space-y-0.5">
+                            {spec.contract.quality_checks.map((q, i) => (
+                              <li key={`${q.id}-${i}`}>
+                                <span className="font-medium">{q.id}</span>:{' '}
+                                <code className="text-[11px]">{q.rule}</code>
+                              </li>
+                            ))}
+                          </ul>
+                        </div>
+                      )}
+                    </div>
+                  </Section>
+                )}
               </CardContent>
             )}
           </Card>

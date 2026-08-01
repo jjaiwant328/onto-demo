@@ -6,6 +6,20 @@ import type { UseCase } from './domainAnalysis';
 
 export type DraftStatus = 'draft' | 'completed';
 
+// Data contract generated alongside the draft (mirrors the ontos DataContract
+// shape used elsewhere, kept self-contained for the LLM-authored draft).
+export type DraftContractColumn = { name: string; type: string; nullable: boolean; key: boolean };
+export type DraftContract = {
+  serving_object: string;
+  grain: string;
+  schema: DraftContractColumn[];
+  quality_checks: { id: string; rule: string }[];
+  freshness: { sla: string; basis: string };
+  scope: { included: string; excluded: string };
+  assumptions: string[];
+  lineage: { sources: string[]; serving: string };
+};
+
 export type UseCaseProductSpec = {
   title: string;
   summary: string;
@@ -14,6 +28,7 @@ export type UseCaseProductSpec = {
   genie_spaces: { name: string; purpose: string }[];
   metric_views: { name: string; dimensions: string[]; measures: string[] }[];
   products: string[];
+  contract?: DraftContract;
 };
 
 export type UseCaseProductDraft = {

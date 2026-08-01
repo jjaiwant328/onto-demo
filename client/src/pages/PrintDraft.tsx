@@ -154,6 +154,96 @@ export function PrintDraft() {
         </table>
       </section>
 
+      {spec.contract && (
+        <section>
+          <h2>6 · Data Contract</h2>
+          <table className="kv">
+            <tbody>
+              <tr>
+                <th>Serving object</th>
+                <td>
+                  {spec.contract.serving_object} <span className="muted">(proposed)</span>
+                </td>
+              </tr>
+              <tr>
+                <th>Grain</th>
+                <td>{spec.contract.grain}</td>
+              </tr>
+              <tr>
+                <th>Freshness SLA</th>
+                <td>
+                  {spec.contract.freshness?.sla} (basis: {spec.contract.freshness?.basis})
+                </td>
+              </tr>
+              <tr>
+                <th>Scope — included</th>
+                <td>{spec.contract.scope?.included}</td>
+              </tr>
+              <tr>
+                <th>Scope — excluded</th>
+                <td>{spec.contract.scope?.excluded}</td>
+              </tr>
+              <tr>
+                <th>Lineage</th>
+                <td>
+                  {(spec.contract.lineage?.sources ?? []).join(', ') || '—'} →{' '}
+                  {spec.contract.lineage?.serving}
+                </td>
+              </tr>
+            </tbody>
+          </table>
+
+          <h3>Schema ({spec.contract.schema?.length ?? 0} columns)</h3>
+          <table className="grid">
+            <thead>
+              <tr>
+                <th>Column</th>
+                <th>Type</th>
+                <th>Nullable</th>
+                <th>Key</th>
+              </tr>
+            </thead>
+            <tbody>
+              {(spec.contract.schema ?? []).map((c, i) => (
+                <tr key={`${c.name}-${i}`}>
+                  <td>{c.name}</td>
+                  <td>{c.type}</td>
+                  <td>{c.nullable ? 'yes' : 'no'}</td>
+                  <td>{c.key ? 'key' : ''}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+
+          <h3>Quality checks</h3>
+          <table className="grid">
+            <thead>
+              <tr>
+                <th>ID</th>
+                <th>Rule</th>
+              </tr>
+            </thead>
+            <tbody>
+              {(spec.contract.quality_checks ?? []).map((q, i) => (
+                <tr key={`${q.id}-${i}`}>
+                  <td>{q.id}</td>
+                  <td>
+                    <code>{q.rule}</code>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+
+          <h3>Assumptions</h3>
+          <ul>
+            {(spec.contract.assumptions ?? []).map((a, i) => (
+              <li key={i}>{a}</li>
+            ))}
+          </ul>
+        </section>
+      )}
+
       <div className="doc-footer">
         Ontology-demo · use-case data product · {draft.use_case_title} · generated {generated}
       </div>

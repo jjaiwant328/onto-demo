@@ -2824,6 +2824,16 @@ createApp({
       // Describe a Domain Analysis use case as a data product (KPIs, tables,
       // proposed Genie spaces + metric views). Drafts stage here; only 'completed'
       // ones surface in Data Products. LLM-authored with a deterministic fallback.
+      type DraftContract = {
+        serving_object: string;
+        grain: string;
+        schema: { name: string; type: string; nullable: boolean; key: boolean }[];
+        quality_checks: { id: string; rule: string }[];
+        freshness: { sla: string; basis: string };
+        scope: { included: string; excluded: string };
+        assumptions: string[];
+        lineage: { sources: string[]; serving: string };
+      };
       type UseCaseProductSpec = {
         title: string;
         summary: string;
@@ -2832,9 +2842,49 @@ createApp({
         genie_spaces: { name: string; purpose: string }[];
         metric_views: { name: string; dimensions: string[]; measures: string[] }[];
         products: string[];
+        contract?: DraftContract;
       };
       const slugify = (s: string) =>
         s.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 40) || 'use_case';
+
+      // Build a deterministic data contract from a spec (serving view over the
+      // draft's tables/KPIs). Used as the fallback and to backfill an LLM omission.
+      const buildDraftContract = (slug: string, tables: string[], kpiNames: string[]): DraftContract => {
+        const serving = `jai_ontos.demo_schema.jai_${slug}_serving`;
+        const schema = [
+          { name: 'entity_key', type: 'string', nullable: false, key: true },
+          { name: 'business_date', type: 'date', nullable: false, key: true },
+          ...kpiNames.map((k) => ({
+            name: k.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '') || 'measure',
+            type: 'decimal(18,4)',
+            nullable: true,
+            key: false,
+          })),
+        ];
+        const quality_checks = [
+          { id: 'unique_grain', rule: 'count(*) = count(distinct entity_key, business_date)' },
+          ...kpiNames.slice(0, 4).map((k) => ({
+            id: `non_negative_${k.toLowerCase().replace(/[^a-z0-9]+/g, '_')}`,
+            rule: `min(${k.toLowerCase().replace(/[^a-z0-9]+/g, '_') || 'measure'}) >= 0`,
+          })),
+        ];
+        return {
+          serving_object: serving,
+          grain: 'one row per (entity_key, business_date)',
+          schema,
+          quality_checks: quality_checks.length ? quality_checks : [{ id: 'row_count_positive', rule: 'count(*) > 0' }],
+          freshness: { sla: 'data available by 06:00 local for prior business_date', basis: 'business_date' },
+          scope: {
+            included: `Records derived from ${tables.join(', ') || 'the source tables'} for this data product.`,
+            excluded: 'Rows outside the product grain; PII beyond what the KPIs require.',
+          },
+          assumptions: [
+            'Serving object is proposed (not yet materialized).',
+            'Column types are indicative; confirm against the physical schema.',
+          ],
+          lineage: { sources: tables, serving },
+        };
+      };
 
       const heuristicSpec = (
         title: string,
@@ -2842,10 +2892,11 @@ createApp({
       ): UseCaseProductSpec => {
         const slug = slugify(title);
         const tables = useCase.tables ?? [];
+        const kpiNames = useCase.kpis ?? [];
         return {
           title,
           summary: useCase.description || useCase.value_driver || `Data product for "${title}".`,
-          kpis: (useCase.kpis ?? []).map((k) => ({ name: k, definition: '' })),
+          kpis: kpiNames.map((k) => ({ name: k, definition: '' })),
           tables,
           genie_spaces: [
             { name: `${slug}_genie`, purpose: `Natural-language Q&A over the ${title} data product.` },
@@ -2854,10 +2905,11 @@ createApp({
             {
               name: `jai_${slug}_metrics`,
               dimensions: ['date', 'store', 'product'].filter(Boolean),
-              measures: useCase.kpis ?? [],
+              measures: kpiNames,
             },
           ],
           products: useCase.products ?? [],
+          contract: buildDraftContract(slug, tables, kpiNames),
         };
       };
 
@@ -2894,18 +2946,33 @@ createApp({
           `KPIs: ${(uc.kpis ?? []).join(', ') || 'n/a'}\n` +
           `TABLES: ${(uc.tables ?? []).join(', ') || 'n/a'}\n` +
           `SOURCE PRODUCTS: ${(uc.products ?? []).join(', ') || 'n/a'}\n\n` +
+          `Also produce a DATA CONTRACT for the serving object (a governed view over the tables): ` +
+          `grain, schema columns (name/type/nullable/key), quality checks, freshness SLA, scope, ` +
+          `assumptions, and lineage (source tables → serving object).\n` +
           `Return ONLY JSON with this exact shape:\n` +
           `{"title":"","summary":"","kpis":[{"name":"","definition":""}],"tables":[""],` +
           `"genie_spaces":[{"name":"","purpose":""}],` +
-          `"metric_views":[{"name":"","dimensions":[""],"measures":[""]}],"products":[""]}`;
+          `"metric_views":[{"name":"","dimensions":[""],"measures":[""]}],"products":[""],` +
+          `"contract":{"serving_object":"","grain":"","schema":[{"name":"","type":"","nullable":true,"key":false}],` +
+          `"quality_checks":[{"id":"","rule":""}],"freshness":{"sla":"","basis":""},` +
+          `"scope":{"included":"","excluded":""},"assumptions":[""],` +
+          `"lineage":{"sources":[""],"serving":""}}}`;
 
         let spec: UseCaseProductSpec | null = null;
         let llmUsed = false;
-        const raw = await llmComplete(prompt, 2000, { label: 'use-case-product' });
+        const raw = await llmComplete(prompt, 2500, { label: 'use-case-product' });
         if (raw) {
           const parsed = parseAnalysisJson(raw) as UseCaseProductSpec | null;
           if (parsed && Array.isArray(parsed.kpis)) {
             spec = { ...parsed, title };
+            // backfill the contract if the LLM omitted it or returned an empty one
+            if (!spec.contract || !Array.isArray(spec.contract.schema) || spec.contract.schema.length === 0) {
+              spec.contract = buildDraftContract(
+                slugify(title),
+                spec.tables ?? [],
+                (spec.kpis ?? []).map((k) => k.name)
+              );
+            }
             llmUsed = true;
           }
         }
