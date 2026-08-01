@@ -20,6 +20,8 @@ export type DraftContract = {
   lineage: { sources: string[]; serving: string };
 };
 
+export type DraftDataGap = { gap: string; why_it_matters: string; severity: string };
+
 export type UseCaseProductSpec = {
   title: string;
   summary: string;
@@ -29,6 +31,8 @@ export type UseCaseProductSpec = {
   metric_views: { name: string; dimensions: string[]; measures: string[] }[];
   products: string[];
   contract?: DraftContract;
+  // data gaps (from the domain analysis) relevant to this data product
+  data_gaps?: DraftDataGap[];
 };
 
 export type UseCaseProductDraft = {
@@ -65,6 +69,7 @@ export async function describeUseCaseProduct(args: {
   schema_label: string;
   domain_name: string;
   use_case: UseCase;
+  data_gaps?: DraftDataGap[];
 }): Promise<DescribeResult> {
   try {
     const resp = await fetch('/api/use-case-product/describe', {
@@ -81,6 +86,7 @@ export async function describeUseCaseProduct(args: {
           tables: args.use_case.tables,
           products: args.use_case.products,
         },
+        data_gaps: args.data_gaps ?? [],
       }),
     });
     return (await resp.json()) as DescribeResult;
@@ -102,6 +108,23 @@ export async function fetchUseCaseProducts(
     return Array.isArray(d.drafts) ? d.drafts : [];
   } catch {
     return [];
+  }
+}
+
+export async function updateUseCaseProduct(
+  draftId: string,
+  spec: UseCaseProductSpec
+): Promise<boolean> {
+  try {
+    const resp = await fetch('/api/use-case-product/update', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ draft_id: draftId, spec }),
+    });
+    const d = (await resp.json()) as { ok?: boolean };
+    return Boolean(d.ok);
+  } catch {
+    return false;
   }
 }
 

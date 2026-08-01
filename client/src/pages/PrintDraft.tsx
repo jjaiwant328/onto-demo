@@ -154,9 +154,34 @@ export function PrintDraft() {
         </table>
       </section>
 
+      {(spec.data_gaps ?? []).length > 0 && (
+        <section>
+          <h2>6 · Data Gaps</h2>
+          <p className="muted">Missing or weak data that affects this product.</p>
+          <table className="grid">
+            <thead>
+              <tr>
+                <th>Severity</th>
+                <th>Gap</th>
+                <th>Why it matters</th>
+              </tr>
+            </thead>
+            <tbody>
+              {spec.data_gaps!.map((g, i) => (
+                <tr key={`${g.gap}-${i}`}>
+                  <td>{g.severity}</td>
+                  <td>{g.gap}</td>
+                  <td>{g.why_it_matters}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </section>
+      )}
+
       {spec.contract && (
         <section>
-          <h2>6 · Data Contract</h2>
+          <h2>7 · Data Contract</h2>
           <table className="kv">
             <tbody>
               <tr>

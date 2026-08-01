@@ -56,8 +56,10 @@ import {
   describeUseCaseProduct,
   fetchUseCaseProducts,
   setUseCaseProductStatus,
+  updateUseCaseProduct,
   deleteUseCaseProduct,
   type UseCaseProductDraft,
+  type UseCaseProductSpec,
   type DescribeResult,
   type DraftStatus,
 } from './useCaseProduct';
@@ -198,6 +200,7 @@ export type ProductContextValue = {
   describeUseCaseAsProduct: (useCase: UseCase) => Promise<DescribeResult>;
   setUseCaseDraftStatus: (draftId: string, status: DraftStatus) => Promise<boolean>;
   removeUseCaseDraft: (draftId: string) => Promise<boolean>;
+  updateUseCaseDraft: (draftId: string, spec: UseCaseProductSpec) => Promise<boolean>;
   // token that changes whenever the active schema selection changes; session-
   // scoped panels (Action queue, Copilot conversation) reset on it so no
   // schema's state leaks into another.
@@ -1303,15 +1306,25 @@ export function ProductProvider({ children }: { children: ReactNode }) {
   }, [refreshUseCaseDrafts]);
   const describeUseCaseAsProduct = useCallback(
     async (useCase: UseCase): Promise<DescribeResult> => {
+      // surface the domain data gaps that unblock THIS use case (or, if none are
+      // explicitly linked, all domain gaps) so the draft can call them out.
+      const allGaps = domainAnalysis?.data_gaps ?? [];
+      const linked = allGaps.filter((g) => (g.unblocks ?? []).includes(useCase.title));
+      const gaps = (linked.length ? linked : allGaps).map((g) => ({
+        gap: g.gap,
+        why_it_matters: g.why_it_matters,
+        severity: g.severity,
+      }));
       const r = await describeUseCaseProduct({
         schema_label: activeSchemaLabel,
         domain_name: analysisDomainName,
         use_case: useCase,
+        data_gaps: gaps,
       });
       if (r.ok) await refreshUseCaseDrafts();
       return r;
     },
-    [activeSchemaLabel, analysisDomainName, refreshUseCaseDrafts]
+    [activeSchemaLabel, analysisDomainName, refreshUseCaseDrafts, domainAnalysis]
   );
   const setUseCaseDraftStatus = useCallback(
     async (draftId: string, status: DraftStatus) => {
@@ -1324,6 +1337,14 @@ export function ProductProvider({ children }: { children: ReactNode }) {
   const removeUseCaseDraft = useCallback(
     async (draftId: string) => {
       const ok = await deleteUseCaseProduct(draftId);
+      if (ok) await refreshUseCaseDrafts();
+      return ok;
+    },
+    [refreshUseCaseDrafts]
+  );
+  const updateUseCaseDraft = useCallback(
+    async (draftId: string, spec: UseCaseProductSpec) => {
+      const ok = await updateUseCaseProduct(draftId, spec);
       if (ok) await refreshUseCaseDrafts();
       return ok;
     },
@@ -1417,6 +1438,7 @@ export function ProductProvider({ children }: { children: ReactNode }) {
     describeUseCaseAsProduct,
     setUseCaseDraftStatus,
     removeUseCaseDraft,
+    updateUseCaseDraft,
     isolationKey: sig,
     syncScopeFromSections,
     setSyncScopeFromSections,

@@ -15,14 +15,16 @@ import {
   Badge,
   Button,
 } from '@databricks/appkit-ui/react';
-import { Package, Check, Undo2, Trash2, Sparkles, Database, MessageSquare, Gauge, FileDown, FileText } from 'lucide-react';
+import { Package, Check, Undo2, Trash2, Sparkles, Database, MessageSquare, Gauge, FileDown, FileText, AlertTriangle, Pencil } from 'lucide-react';
 import { useProduct } from '../lib/product';
 import { parseSpec } from '../lib/useCaseProduct';
+import { DraftEditor } from '../components/DraftEditor';
 
 export function DataProductDrafts() {
   const { useCaseDrafts, setUseCaseDraftStatus, removeUseCaseDraft, domainAnalysisLabel } = useProduct();
   const navigate = useNavigate();
   const [busyId, setBusyId] = useState<string | null>(null);
+  const [editId, setEditId] = useState<string | null>(null);
 
   const toggle = async (draftId: string, completed: boolean) => {
     setBusyId(draftId);
@@ -44,8 +46,8 @@ export function DataProductDrafts() {
           </CardTitle>
           <CardDescription>
             Use cases described as data products (KPIs, tables, proposed Genie spaces, and metric
-            views). Drafts stay here until you mark them <span className="font-medium">completed</span>{' '}
-            — completed drafts also appear in the Data Products view.
+            views). Edit a draft here, then <span className="font-medium">Add to Data Products page</span>{' '}
+            to publish it — published products also appear in the Data Products view.
           </CardDescription>
         </CardHeader>
         <CardContent>
@@ -56,7 +58,7 @@ export function DataProductDrafts() {
             </p>
           ) : (
             <p className="text-sm text-muted-foreground">
-              {useCaseDrafts.filter((d) => d.status === 'completed').length} completed ·{' '}
+              {useCaseDrafts.filter((d) => d.status === 'completed').length} on Data Products ·{' '}
               {useCaseDrafts.filter((d) => d.status !== 'completed').length} in draft
             </p>
           )}
@@ -73,7 +75,7 @@ export function DataProductDrafts() {
                 <CardTitle className="flex items-center gap-2 text-base">
                   {d.use_case_title}
                   <Badge variant={completed ? 'default' : 'outline'} className="text-[10px]">
-                    {completed ? 'completed' : 'draft'}
+                    {completed ? 'on Data Products' : 'draft'}
                   </Badge>
                   {!d.llm_used && (
                     <Badge variant="outline" className="text-[10px] text-muted-foreground">
@@ -88,6 +90,15 @@ export function DataProductDrafts() {
                   size="sm"
                   variant="outline"
                   className="h-7 gap-1 px-2 text-xs"
+                  title="Edit this data product"
+                  onClick={() => setEditId(d.draft_id)}
+                >
+                  <Pencil className="h-3.5 w-3.5" /> Edit
+                </Button>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="h-7 gap-1 px-2 text-xs"
                   title="Export this data product as a PDF"
                   onClick={() => void navigate(`/print/draft/${d.draft_id}`)}
                 >
@@ -98,10 +109,15 @@ export function DataProductDrafts() {
                   variant={completed ? 'outline' : 'default'}
                   className="h-7 gap-1 px-2 text-xs"
                   disabled={busyId === d.draft_id}
+                  title={
+                    completed
+                      ? 'Remove this data product from the Data Products page'
+                      : 'Add this data product to the Data Products page'
+                  }
                   onClick={() => void toggle(d.draft_id, !completed)}
                 >
                   {completed ? <Undo2 className="h-3.5 w-3.5" /> : <Check className="h-3.5 w-3.5" />}
-                  {completed ? 'Revert to draft' : 'Mark completed'}
+                  {completed ? 'Remove from Data Products' : 'Add to Data Products page'}
                 </Button>
                 <Button
                   size="sm"
@@ -117,6 +133,27 @@ export function DataProductDrafts() {
             </CardHeader>
             {spec && (
               <CardContent className="space-y-4">
+                {(spec.data_gaps ?? []).length > 0 && (
+                  <div className="rounded-md border border-amber-300 bg-amber-50 p-3">
+                    <div className="flex items-center gap-1.5 text-xs font-semibold text-amber-800 mb-1.5">
+                      <AlertTriangle className="h-3.5 w-3.5" /> Data gaps affecting this product (
+                      {spec.data_gaps!.length})
+                    </div>
+                    <ul className="space-y-1">
+                      {spec.data_gaps!.map((g, i) => (
+                        <li key={`${g.gap}-${i}`} className="text-xs text-amber-900">
+                          <Badge variant="outline" className="mr-1.5 text-[10px] border-amber-400">
+                            {g.severity}
+                          </Badge>
+                          <span className="font-medium">{g.gap}</span>
+                          {g.why_it_matters && (
+                            <span className="text-amber-800"> — {g.why_it_matters}</span>
+                          )}
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                 <Section icon={<Gauge className="h-3.5 w-3.5" />} title={`KPIs (${spec.kpis.length})`}>
                   {spec.kpis.length === 0 ? (
@@ -251,6 +288,14 @@ export function DataProductDrafts() {
           </Card>
         );
       })}
+
+      {editId &&
+        (() => {
+          const d = useCaseDrafts.find((x) => x.draft_id === editId);
+          return d ? (
+            <DraftEditor draft={d} open={true} onOpenChange={(v) => !v && setEditId(null)} />
+          ) : null;
+        })()}
     </div>
   );
 }

@@ -18,9 +18,13 @@ import {
   TableCell,
   TableHead,
   TableHeader,
+  Tooltip,
+  TooltipTrigger,
+  TooltipContent,
+  TooltipProvider,
   TableRow,
 } from '@databricks/appkit-ui/react';
-import { Sparkles, Loader2, AlertTriangle, Star, ArrowRight, RefreshCw, Info, Package, Check } from 'lucide-react';
+import { Sparkles, Loader2, AlertTriangle, Star, ArrowRight, RefreshCw, Info, Package, Check, HelpCircle } from 'lucide-react';
 import { useProduct } from '../lib/product';
 import type { RoiTier, GapSeverity, UseCase } from '../lib/domainAnalysis';
 
@@ -42,6 +46,14 @@ function displayScore(u: UseCase): number {
   const s = Number(u.opportunity_score);
   if (Number.isFinite(s) && s > 0) return Math.round(s);
   return u.roi_tier === 'High' ? 75 : u.roi_tier === 'Low' ? 30 : 50;
+}
+
+// Illustrative $K revenue/impact. Falls back to a tier benchmark for analyses
+// generated before the field existed (or an LLM omission).
+function displayRevenueK(u: UseCase): number {
+  const r = Number(u.revenue_potential_k);
+  if (Number.isFinite(r) && r > 0) return Math.round(r);
+  return u.roi_tier === 'High' ? 1500 : u.roi_tier === 'Low' ? 200 : 600;
 }
 
 export function DomainAnalysis() {
@@ -150,17 +162,47 @@ export function DomainAnalysis() {
                 <p className="text-sm text-muted-foreground">No use cases produced.</p>
               ) : (
                 <div className="overflow-x-auto">
-                  <Table className="min-w-[1150px] table-fixed">
+                  <Table className="min-w-[1280px] table-fixed">
                     <TableHeader>
                       <TableRow>
-                        <TableHead className="w-[24%]">Use case</TableHead>
+                        <TableHead className="w-[22%]">Use case</TableHead>
                         <TableHead className="w-[80px]">ROI</TableHead>
-                        <TableHead className="w-[90px]">Opportunity</TableHead>
-                        <TableHead className="w-[22%]">Value driver</TableHead>
-                        <TableHead className="w-[16%]">Data readiness</TableHead>
+                        <TableHead className="w-[110px]">
+                          <TooltipProvider>
+                            <Tooltip>
+                              <TooltipTrigger asChild>
+                                <span className="inline-flex items-center gap-1 cursor-help underline decoration-dotted underline-offset-2">
+                                  Opportunity <HelpCircle className="h-3 w-3 text-muted-foreground" />
+                                </span>
+                              </TooltipTrigger>
+                              <TooltipContent className="max-w-xs">
+                                A composite 0–100 score weighing ROI tier, data readiness (backing
+                                tables/KPIs available), and implementation effort. Higher = a better
+                                near-term opportunity. Not a financial figure.
+                              </TooltipContent>
+                            </Tooltip>
+                          </TooltipProvider>
+                        </TableHead>
+                        <TableHead className="w-[100px]">
+                          <TooltipProvider>
+                            <Tooltip>
+                              <TooltipTrigger asChild>
+                                <span className="inline-flex items-center gap-1 cursor-help underline decoration-dotted underline-offset-2">
+                                  Revenue ($K) <HelpCircle className="h-3 w-3 text-muted-foreground" />
+                                </span>
+                              </TooltipTrigger>
+                              <TooltipContent className="max-w-xs">
+                                Illustrative annual impact in thousands of USD, based on industry
+                                benchmarks for this use-case type — not derived from your data.
+                              </TooltipContent>
+                            </Tooltip>
+                          </TooltipProvider>
+                        </TableHead>
+                        <TableHead className="w-[18%]">Value driver</TableHead>
+                        <TableHead className="w-[14%]">Data readiness</TableHead>
                         <TableHead className="w-[70px]">Effort</TableHead>
                         <TableHead className="w-[90px]">Time to value</TableHead>
-                        <TableHead className="w-[14%]">Products</TableHead>
+                        <TableHead className="w-[12%]">Products</TableHead>
                         <TableHead className="w-[150px]">Data product</TableHead>
                       </TableRow>
                     </TableHeader>
@@ -194,6 +236,12 @@ export function DomainAnalysis() {
                                 />
                               </div>
                             </div>
+                          </TableCell>
+                          <TableCell className="align-top py-3">
+                            <span className="text-sm font-semibold tabular-nums">
+                              ${displayRevenueK(u).toLocaleString()}K
+                            </span>
+                            <div className="text-[10px] text-muted-foreground">est.</div>
                           </TableCell>
                           <TableCell className="text-xs text-muted-foreground align-top whitespace-normal break-words py-3">
                             {u.value_driver}

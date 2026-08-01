@@ -14,6 +14,9 @@ export type UseCase = {
   // composite opportunity score 0-100 (weighs ROI tier, data readiness, effort);
   // a sortable numeric call-out since we have DDLs/metadata, not live financials.
   opportunity_score: number;
+  // illustrative annual revenue/impact potential in $K (industry benchmark, not
+  // derived from this data — labeled as such in the UI).
+  revenue_potential_k?: number;
   value_driver: string;
   data_readiness: string;
   effort: string;

@@ -26,13 +26,14 @@ import {
   Input,
   Label,
 } from '@databricks/appkit-ui/react';
-import { CheckCircle2, FileText, FileDown, Layers, Database, MessageSquare, BarChart3, Plus, Package } from 'lucide-react';
+import { CheckCircle2, FileText, FileDown, Layers, Database, MessageSquare, BarChart3, Plus, Package, Pencil } from 'lucide-react';
 import { useNavigate } from 'react-router';
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useProduct } from '../lib/product';
 import { CatalogLoadingSkeleton } from '../components/LoadingSkeleton';
 import { fetchProductLinks, attachLink, deleteLink, type ProductLink } from '../lib/productLinks';
 import { parseSpec } from '../lib/useCaseProduct';
+import { DraftEditor } from '../components/DraftEditor';
 
 function maturityVariant(m: string): 'default' | 'secondary' | 'outline' {
   const s = (m || '').toLowerCase();
@@ -176,6 +177,7 @@ export function DataProducts() {
   } = useProduct();
   // completed use-case data products (drafted in the staging tab, marked done)
   const completedDrafts = useCaseDrafts.filter((d) => d.status === 'completed');
+  const [editDraftId, setEditDraftId] = useState<string | null>(null);
   const schemaLabel =
     selectedSchemaIds.length === 1
       ? (schemaEntries.find((s) => s.id === selectedSchemaIds[0])?.label ?? '1 schema')
@@ -421,6 +423,7 @@ export function DataProducts() {
                   <TableHead>KPIs</TableHead>
                   <TableHead>Tables</TableHead>
                   <TableHead>Genie / metric views</TableHead>
+                  <TableHead className="text-right">Actions</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
@@ -443,6 +446,28 @@ export function DataProducts() {
                       <TableCell className="text-xs text-muted-foreground align-top py-3">
                         {(spec?.genie_spaces ?? []).length} genie · {(spec?.metric_views ?? []).length} metric views
                         <span className="text-[10px]"> (proposed)</span>
+                      </TableCell>
+                      <TableCell className="text-right align-top py-3">
+                        <div className="inline-flex items-center gap-1">
+                          <Button
+                            size="sm"
+                            variant="ghost"
+                            className="h-7 gap-1 px-2 text-xs"
+                            title="Edit this data product"
+                            onClick={() => setEditDraftId(d.draft_id)}
+                          >
+                            <Pencil className="h-3.5 w-3.5" /> Edit
+                          </Button>
+                          <Button
+                            size="sm"
+                            variant="ghost"
+                            className="h-7 gap-1 px-2 text-xs"
+                            title="Export this data product as a PDF"
+                            onClick={() => void navigate(`/print/draft/${d.draft_id}`)}
+                          >
+                            <FileDown className="h-3.5 w-3.5" /> Export PDF
+                          </Button>
+                        </div>
                       </TableCell>
                     </TableRow>
                   );
@@ -527,6 +552,14 @@ export function DataProducts() {
           </div>
         </CardContent>
       </Card>
+
+      {editDraftId &&
+        (() => {
+          const d = completedDrafts.find((x) => x.draft_id === editDraftId);
+          return d ? (
+            <DraftEditor draft={d} open={true} onOpenChange={(v) => !v && setEditDraftId(null)} />
+          ) : null;
+        })()}
     </div>
   );
 }

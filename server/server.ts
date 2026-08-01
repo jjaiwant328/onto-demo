@@ -2613,10 +2613,13 @@ createApp({
           const readinessPts = Math.min(30, s.readiness * 4);
           const effortPts = effort === 'Low' ? 10 : effort === 'Medium' ? 5 : 0;
           const opportunity_score = Math.max(0, Math.min(100, tierPts + readinessPts + effortPts));
+          // illustrative annual $K impact scaled by tier (benchmark, not from data)
+          const revenue_potential_k = roi_tier === 'High' ? 1500 : roi_tier === 'Medium' ? 600 : 200;
           return {
             title: s.p.display_name ?? s.p.product_name,
             roi_tier,
             opportunity_score,
+            revenue_potential_k,
             value_driver: s.p.business_outcome ?? 'Operational efficiency and decision support.',
             data_readiness:
               s.tables.length >= 3 ? 'Strong — multiple backing tables' : s.tables.length > 0 ? 'Partial — limited backing tables' : 'Weak — no backing tables identified',
@@ -2709,12 +2712,14 @@ createApp({
           (b.components_summary ? `SCHEMA DETAIL:\n${b.components_summary.slice(0, 6000)}\n\n` : '') +
           `Return ONLY a JSON object (no prose) with this exact shape:\n` +
           `{"flagship":{"use_case":"","rationale":""},` +
-          `"use_cases":[{"title":"","roi_tier":"High|Medium|Low","opportunity_score":0,"value_driver":"",` +
+          `"use_cases":[{"title":"","roi_tier":"High|Medium|Low","opportunity_score":0,"revenue_potential_k":0,"value_driver":"",` +
           `"data_readiness":"","effort":"Low|Medium|High","time_to_value":"","products":[""],` +
           `"tables":[""],"description":""}],` +
           `"data_gaps":[{"gap":"","why_it_matters":"","severity":"Critical|Important|Nice-to-have","unblocks":[""]}]}\n` +
           `opportunity_score is an integer 0-100 reflecting overall opportunity (value vs. data ` +
-          `readiness and effort); higher = better. Rank use_cases by opportunity_score (highest ` +
+          `readiness and effort); higher = better. revenue_potential_k is an illustrative annual ` +
+          `impact in THOUSANDS of USD ($K) based on industry benchmarks for this use-case type ` +
+          `(not derived from this data). Rank use_cases by opportunity_score (highest ` +
           `first), consistent with roi_tier. Map each to the products/tables above. ` +
           `Name data gaps a domain expert would flag as missing for these use cases.`;
 
@@ -2736,7 +2741,17 @@ createApp({
                   : tierVal === 'Low'
                     ? 30
                     : 50;
-              return { ...u, opportunity_score: score };
+              // revenue_potential_k: illustrative $K; fall back to a tier benchmark
+              const rawRev = Number(u.revenue_potential_k);
+              const revenue_potential_k =
+                Number.isFinite(rawRev) && rawRev > 0
+                  ? Math.round(rawRev)
+                  : tierVal === 'High'
+                    ? 1500
+                    : tierVal === 'Low'
+                      ? 200
+                      : 600;
+              return { ...u, opportunity_score: score, revenue_potential_k };
             });
             useCases.sort(
               (a, b) => Number(b.opportunity_score ?? 0) - Number(a.opportunity_score ?? 0)
@@ -2843,6 +2858,7 @@ createApp({
         metric_views: { name: string; dimensions: string[]; measures: string[] }[];
         products: string[];
         contract?: DraftContract;
+        data_gaps?: { gap: string; why_it_matters: string; severity: string }[];
       };
       const slugify = (s: string) =>
         s.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 40) || 'use_case';
@@ -2925,11 +2941,19 @@ createApp({
             tables?: string[];
             products?: string[];
           };
+          data_gaps?: { gap?: string; why_it_matters?: string; severity?: string }[];
         };
         const schema = String(b.schema_label ?? '').trim();
         const domain = String(b.domain_name ?? '').trim();
         const uc = b.use_case ?? {};
         const title = String(uc.title ?? '').trim();
+        const dataGaps = (Array.isArray(b.data_gaps) ? b.data_gaps : [])
+          .filter((g) => g && g.gap)
+          .map((g) => ({
+            gap: String(g.gap),
+            why_it_matters: String(g.why_it_matters ?? ''),
+            severity: String(g.severity ?? 'Important'),
+          }));
         if (!schema || !domain || !title) {
           res.status(400).json({ ok: false, error: 'schema_label, domain_name and use_case.title required' });
           return;
@@ -2977,6 +3001,8 @@ createApp({
           }
         }
         if (!spec) spec = heuristicSpec(title, uc);
+        // attach the domain data gaps relevant to this use case (from the request)
+        spec.data_gaps = dataGaps;
 
         const draftId = `ucp_${createHash('sha256').update(`${schema}|${domain}|${title}`).digest('hex').slice(0, 40)}`;
         try {
@@ -3034,6 +3060,34 @@ createApp({
             status,
             draftId,
           ]);
+          res.json({ ok: true });
+        } catch (err) {
+          res.json({ ok: false, error: humanizeSqlError(err) });
+        }
+      });
+
+      // Update a draft's editable spec (title/summary/KPIs/tables/genie/metric-views).
+      app.post('/api/use-case-product/update', async (req, res) => {
+        const b = (req.body ?? {}) as { draft_id?: string; spec?: UseCaseProductSpec };
+        const draftId = String(b.draft_id ?? '').trim();
+        const spec = b.spec;
+        if (!draftId || !spec || typeof spec !== 'object') {
+          res.status(400).json({ ok: false, error: 'draft_id and spec required' });
+          return;
+        }
+        try {
+          const rows = await lbQuery<{ n: string }>(
+            `SELECT count(*)::text AS n FROM jai_use_case_product WHERE draft_id = $1`,
+            [draftId]
+          );
+          if (rows[0]?.n === '0') {
+            res.json({ ok: false, error: 'draft not found' });
+            return;
+          }
+          await lbQuery(
+            `UPDATE jai_use_case_product SET spec_json = $1, use_case_title = $2, updated_at = now() WHERE draft_id = $3`,
+            [JSON.stringify(spec), String(spec.title ?? ''), draftId]
+          );
           res.json({ ok: true });
         } catch (err) {
           res.json({ ok: false, error: humanizeSqlError(err) });
