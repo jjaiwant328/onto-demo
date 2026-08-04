@@ -1198,54 +1198,103 @@ createApp({
             toColumn?: string;
           }[];
         };
-        const tables = Array.isArray(b.tables) ? b.tables.slice(0, 40) : [];
-        const rels = Array.isArray(b.relationships) ? b.relationships.slice(0, 40) : [];
+        // Caps keep one request bounded, but a silently-truncated run would report
+        // "validated" while only covering part of the ontology — the exact thing this
+        // feature exists to prevent. Record what was dropped and return it so the UI
+        // can say the coverage is partial.
+        const MAX_TABLES = 40;
+        const MAX_KEYS_PER_TABLE = 8;
+        const MAX_RELS = 40;
+        const allTables = Array.isArray(b.tables) ? b.tables : [];
+        const allRels = Array.isArray(b.relationships) ? b.relationships : [];
+        const tables = allTables.slice(0, MAX_TABLES);
+        const rels = allRels.slice(0, MAX_RELS);
+        const truncatedKeyTables: string[] = [];
         const okIdent = (t: string) => /^[A-Za-z0-9_]+(\.[A-Za-z0-9_]+){1,2}$/.test(t);
         const okCol = (c: string) => /^[A-Za-z0-9_]+$/.test(c);
 
-        const tableResults: Record<string, unknown>[] = [];
-        for (const t of tables) {
-          if (!okIdent(t.table)) {
-            tableResults.push({ table: t.table, error: 'invalid identifier' });
-            continue;
-          }
+        // ONE query per table for the row count AND every key's null/distinct stats.
+        // This used to issue 1 + one-per-key statements serially, so a 40-table
+        // product with 8 keys each meant 360 sequential round-trips (~10 min on a
+        // warm warehouse) before the join probes even started.
+        const validateTable = async (t: {
+          table: string;
+          keys?: string[];
+        }): Promise<Record<string, unknown>> => {
+          if (!okIdent(t.table)) return { table: t.table, error: 'invalid identifier' };
+          const keys = (t.keys ?? []).filter(okCol);
+          if (keys.length > MAX_KEYS_PER_TABLE) truncatedKeyTables.push(t.table);
+          const use = keys.slice(0, MAX_KEYS_PER_TABLE);
+          // aliases are positional (k0_nn/k0_dc) so a column name can never collide
+          // with our own output names; identifiers are already allowlisted above.
+          const selects = [
+            'count(*) AS total',
+            ...use.flatMap((k, i) => [
+              `count(${k}) AS k${i}_nn`,
+              `approx_count_distinct(${k}) AS k${i}_dc`,
+            ]),
+          ];
+          const pct = (part: number, total: number) =>
+            total ? Math.round((part / total) * 1000) / 10 : 0;
           try {
-            const cnt = await runSql(`SELECT count(*) AS n FROM ${t.table}`);
-            const rowCount = Number((cnt[0]?.n ?? cnt[0]?.N) ?? 0);
+            const rows = await runSql(`SELECT ${selects.join(', ')} FROM ${t.table}`);
+            const row = rows[0] ?? {};
+            const total = Number(row.total ?? 0) || 0;
+            const keyStats = use.map((k, i) => {
+              const nonNull = Number(row[`k${i}_nn`] ?? 0) || 0;
+              const distinct = Number(row[`k${i}_dc`] ?? 0) || 0;
+              return {
+                column: k,
+                null_pct: pct(total - nonNull, total),
+                distinct_pct: pct(distinct, total),
+              };
+            });
+            return { table: t.table, row_count: total, keys: keyStats };
+          } catch {
+            // The batch is all-or-nothing: one stale/renamed key column fails the whole
+            // statement and would blank the table's stats. Fall back to profiling each
+            // key on its own so the good columns still report and the bad one is named.
+            let total = 0;
+            try {
+              const cnt = await runSql(`SELECT count(*) AS n FROM ${t.table}`);
+              total = Number((cnt[0]?.n ?? cnt[0]?.N) ?? 0) || 0;
+            } catch (e) {
+              return { table: t.table, error: humanizeSqlError(e) || 'no access / cannot validate' };
+            }
             const keyStats: Record<string, unknown>[] = [];
-            for (const k of (t.keys ?? []).filter(okCol).slice(0, 8)) {
+            for (const k of use) {
               try {
                 const s = await runSql(
-                  `SELECT count(*) AS total, count(${k}) AS non_null, approx_count_distinct(${k}) AS distinct_ct ` +
-                    `FROM ${t.table}`
+                  `SELECT count(${k}) AS nn, approx_count_distinct(${k}) AS dc FROM ${t.table}`
                 );
-                const total = Number(s[0]?.total ?? 0) || 0;
-                const nonNull = Number(s[0]?.non_null ?? 0) || 0;
-                const distinct = Number(s[0]?.distinct_ct ?? 0) || 0;
+                const nonNull = Number(s[0]?.nn ?? 0) || 0;
+                const distinct = Number(s[0]?.dc ?? 0) || 0;
                 keyStats.push({
                   column: k,
-                  null_pct: total ? Math.round(((total - nonNull) / total) * 1000) / 10 : 0,
-                  distinct_pct: total ? Math.round((distinct / total) * 1000) / 10 : 0,
+                  null_pct: pct(total - nonNull, total),
+                  distinct_pct: pct(distinct, total),
                 });
               } catch (e) {
                 keyStats.push({ column: k, error: humanizeSqlError(e) });
               }
             }
-            tableResults.push({ table: t.table, row_count: rowCount, keys: keyStats });
-          } catch (e) {
-            tableResults.push({ table: t.table, error: humanizeSqlError(e) || 'no access / cannot validate' });
+            return { table: t.table, row_count: total, keys: keyStats };
           }
-        }
+        };
 
-        const relResults: Record<string, unknown>[] = [];
-        for (const r of rels) {
+        const validateRel = async (r: {
+          from: string;
+          to: string;
+          column: string;
+          fromColumn?: string;
+          toColumn?: string;
+        }): Promise<Record<string, unknown>> => {
           // fromColumn lives on the child (from) table, toColumn on the parent
           // (to). Both default to `column` for same-named heuristic FKs.
           const fromCol = r.fromColumn || r.column;
           const toCol = r.toColumn || r.column;
           if (!okIdent(r.from) || !okIdent(r.to) || !okCol(fromCol) || !okCol(toCol)) {
-            relResults.push({ ...r, error: 'invalid identifier' });
-            continue;
+            return { ...r, error: 'invalid identifier' };
           }
           try {
             // hit-rate = fraction of child (from) rows whose key matches a parent (to) row
@@ -1257,7 +1306,7 @@ createApp({
             const s = await runSql(q);
             const child = Number(s[0]?.child_rows ?? 0) || 0;
             const matched = Number(s[0]?.matched ?? 0) || 0;
-            relResults.push({
+            return {
               from: r.from,
               to: r.to,
               column: r.column,
@@ -1265,13 +1314,58 @@ createApp({
               to_column: toCol,
               hit_rate: child ? Math.round((matched / child) * 1000) / 10 : null,
               child_rows: child,
-            });
+            };
           } catch (e) {
-            relResults.push({ ...r, error: humanizeSqlError(e) || 'no access / cannot validate' });
+            return { ...r, error: humanizeSqlError(e) || 'no access / cannot validate' };
           }
-        }
+        };
 
-        res.json({ product: b.product, tables: tableResults, relationships: relResults });
+        // The probes are independent, so run them with bounded concurrency instead of
+        // strictly serially — but keep the bound low so a validation run can't
+        // saturate a shared warehouse.
+        const CONCURRENCY = 4;
+        const mapLimit = async <I, O>(items: I[], fn: (item: I) => Promise<O>): Promise<O[]> => {
+          const out: O[] = new Array(items.length) as O[];
+          let next = 0;
+          const worker = async (): Promise<void> => {
+            for (;;) {
+              const i = next++;
+              if (i >= items.length) return;
+              out[i] = await fn(items[i]);
+            }
+          };
+          await Promise.all(
+            Array.from({ length: Math.min(CONCURRENCY, items.length) }, () => worker())
+          );
+          return out;
+        };
+
+        const [tableResults, relResults] = await Promise.all([
+          mapLimit(tables, validateTable),
+          mapLimit(rels, validateRel),
+        ]);
+
+        // Partial coverage must never read as a clean bill of health.
+        const truncated =
+          allTables.length > tables.length ||
+          allRels.length > rels.length ||
+          truncatedKeyTables.length > 0
+            ? {
+                tables_checked: tables.length,
+                tables_total: allTables.length,
+                relationships_checked: rels.length,
+                relationships_total: allRels.length,
+                max_keys_per_table: MAX_KEYS_PER_TABLE,
+                tables_with_extra_keys: [...new Set(truncatedKeyTables)],
+              }
+            : null;
+
+        res.json({
+          product: b.product,
+          tables: tableResults,
+          relationships: relResults,
+          truncated,
+        });
       });
 
       // ---- D) Dry-run a generated serving-view's SELECT against the warehouse ----
@@ -2630,18 +2724,30 @@ createApp({
             description: s.p.issue ?? s.p.business_outcome ?? '',
           };
         });
+        // Deterministic fallback used when the model is unavailable. These must stay
+        // INDUSTRY-NEUTRAL and derived from the schema in front of us: the previous
+        // version hardcoded retail gaps ("weather signals", "loyalty identity"), which
+        // were asserted verbatim for a manufacturing or telco schema.
+        const gapProducts = use_cases.slice(0, 2).map((u) => u.title);
         const data_gaps = [
           {
-            gap: 'External/contextual signals (e.g. weather, mobility, macro)',
+            gap: 'External / contextual signals not present in these tables',
             why_it_matters:
-              'Demand and traffic are heavily driven by external factors; without them models misattribute variance to internal levers.',
+              'Outcomes are usually driven partly by factors outside the operational system; without them, analysis misattributes variance to internal levers.',
             severity: 'Important' as const,
-            unblocks: use_cases.slice(0, 2).map((u) => u.title),
+            unblocks: gapProducts,
           },
           {
-            gap: 'Customer / loyalty identity dimension',
+            gap: 'A durable entity/party dimension to join on',
             why_it_matters:
-              'Personalization, CLV, and churn use cases need a durable customer profile beyond transaction-level flags.',
+              'Longitudinal analysis needs a stable identifier for the entity being measured, beyond identifiers that only exist on individual transactions.',
+            severity: 'Important' as const,
+            unblocks: [],
+          },
+          {
+            gap: 'Documented definitions and ownership for the measures above',
+            why_it_matters:
+              'These KPIs were derived from column names and types. Without an owner-confirmed definition they cannot be relied on for decisions.',
             severity: 'Important' as const,
             unblocks: [],
           },
@@ -2892,11 +2998,13 @@ createApp({
           freshness: { sla: 'data available by 06:00 local for prior business_date', basis: 'business_date' },
           scope: {
             included: `Records derived from ${tables.join(', ') || 'the source tables'} for this data product.`,
-            excluded: 'Rows outside the product grain; PII beyond what the KPIs require.',
+            // do not claim PII handling the app has not checked
+            excluded: 'Rows outside the product grain. Personal-data handling is not assessed here — confirm with the data owner.',
           },
           assumptions: [
             'Serving object is proposed (not yet materialized).',
             'Column types are indicative; confirm against the physical schema.',
+            'Grain is proposed, not verified against the data.',
           ],
           lineage: { sources: tables, serving },
         };
@@ -2919,8 +3027,15 @@ createApp({
           ],
           metric_views: [
             {
+              // Dimensions were hardcoded to ['date','store','product'] — retail
+              // concepts that don't exist in most schemas. Derive them from the
+              // product's own dimension tables instead, and propose none rather
+              // than inventing names when there are no dimensions to name.
               name: `jai_${slug}_metrics`,
-              dimensions: ['date', 'store', 'product'].filter(Boolean),
+              dimensions: tables
+                .filter((t) => /(^|\.)(dim_|d_)/i.test(t))
+                .map((t) => (t.split('.').pop() ?? t).replace(/^(dim_|d_)/i, ''))
+                .slice(0, 4),
               measures: kpiNames,
             },
           ],
