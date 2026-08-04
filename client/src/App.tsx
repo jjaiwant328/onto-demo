@@ -36,6 +36,8 @@ import {
   Loader2,
   Settings,
   Save,
+  PanelLeftClose,
+  PanelLeftOpen,
 } from 'lucide-react';
 import { ProductProvider, useProduct, ALL_SCOPE } from './lib/product';
 import { ActionsContext, type ActionItem } from './lib/actions';
@@ -514,13 +516,33 @@ function ScopeSyncToggle() {
   );
 }
 
+// The desktop control panel takes ~26% of the viewport at 1500px. That is a lot of
+// permanent real estate for controls you set once, so it collapses — and the choice
+// persists, since someone working on a wide graph wants it to stay collapsed.
+const SIDEBAR_KEY = 'rt_onto_sidebar_collapsed';
+function readSidebarPref(): boolean {
+  try {
+    return localStorage.getItem(SIDEBAR_KEY) === '1';
+  } catch {
+    return false;
+  }
+}
+
 function Layout() {
   const isMobile = useIsMobile();
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(readSidebarPref);
 
   useEffect(() => {
     if (!isMobile) setMobileNavOpen(false);
   }, [isMobile]);
+  useEffect(() => {
+    try {
+      localStorage.setItem(SIDEBAR_KEY, sidebarCollapsed ? '1' : '0');
+    } catch {
+      /* storage unavailable — preference just won't persist */
+    }
+  }, [sidebarCollapsed]);
 
   return (
     <div className="min-h-screen bg-background flex flex-col">
@@ -541,18 +563,33 @@ function Layout() {
             </SheetContent>
           </Sheet>
         </div>
+        {/* desktop sidebar toggle */}
+        <Button
+          variant="ghost"
+          size="icon"
+          className="hidden md:inline-flex shrink-0"
+          aria-pressed={sidebarCollapsed}
+          title={sidebarCollapsed ? 'Show the controls panel' : 'Hide the controls panel'}
+          onClick={() => setSidebarCollapsed((v) => !v)}
+        >
+          {sidebarCollapsed ? <PanelLeftOpen className="h-5 w-5" /> : <PanelLeftClose className="h-5 w-5" />}
+          <span className="sr-only">
+            {sidebarCollapsed ? 'Show controls panel' : 'Hide controls panel'}
+          </span>
+        </Button>
         <div className="flex items-center gap-2">
           <Store className="h-5 w-5 text-primary" />
           <h1 className="text-lg font-semibold text-foreground">Ontology-demo</h1>
-          <Badge variant="outline" className="hidden sm:inline-flex">
-            AppKit
-          </Badge>
         </div>
       </header>
 
       <div className="flex-1 flex min-h-0">
-        {/* persistent left control panel (desktop) */}
-        <aside className="hidden md:block w-80 lg:w-96 shrink-0 border-r overflow-y-auto p-4">
+        {/* persistent left control panel (desktop) — collapsible for more canvas */}
+        <aside
+          className={`hidden shrink-0 overflow-y-auto ${
+            sidebarCollapsed ? '' : 'md:block w-72 lg:w-80 border-r p-4'
+          }`}
+        >
           <ControlPanel />
         </aside>
 

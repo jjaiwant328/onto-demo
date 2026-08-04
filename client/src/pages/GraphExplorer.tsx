@@ -18,7 +18,20 @@ import {
   TabsTrigger,
   TabsContent,
 } from '@databricks/appkit-ui/react';
-import { X, Database, KeyRound, Link2, Info, Activity, Layers, Search } from 'lucide-react';
+import {
+  X,
+  Database,
+  KeyRound,
+  Link2,
+  Info,
+  Activity,
+  Layers,
+  Search,
+  ChevronDown,
+  ChevronRight,
+  PanelRightClose,
+  PanelRightOpen,
+} from 'lucide-react';
 import { useNavigate } from 'react-router';
 import { useProduct } from '../lib/product';
 import { Badge } from '@databricks/appkit-ui/react';
@@ -29,8 +42,33 @@ import { ONTO_KIND_COLOR, type InspectorNode } from '../lib/graphData';
 import { ENTERPRISE_KIND_COLOR, ENTERPRISE_KIND_LABEL } from '../lib/deriveComponents';
 import type { CyStyle } from '../lib/cytoscape';
 
-// canvas gets the majority of the screen
+// The canvas gets the majority of the screen. Chrome above it is collapsible, so
+// the canvas grows to fill whatever is left rather than sitting at a fixed height
+// that leaves dead space when the help/legend rows are hidden.
 const CANVAS_HEIGHT = 760;
+const CANVAS_HEIGHT_WIDE = 860;
+
+// Collapse preferences persist per browser — someone who wants a maximal canvas
+// should not have to re-collapse on every visit.
+const HELP_KEY = 'rt_onto_gx_help';
+const LEGEND_KEY = 'rt_onto_gx_legend';
+const WIDE_KEY = 'rt_onto_gx_wide';
+
+function readPref(key: string, fallback: boolean): boolean {
+  try {
+    const v = localStorage.getItem(key);
+    return v == null ? fallback : v === '1';
+  } catch {
+    return fallback;
+  }
+}
+function writePref(key: string, value: boolean): void {
+  try {
+    localStorage.setItem(key, value ? '1' : '0');
+  } catch {
+    /* storage unavailable (private mode) — preference just won't persist */
+  }
+}
 
 // Wrap long, underscore-heavy entity names so they fit inside a node box. Cytoscape's
 // `text-wrap: wrap` only breaks on whitespace/newlines — never inside an underscored
@@ -252,6 +290,19 @@ export function GraphExplorer() {
 
   const [tab, setTab] = useState<'explore' | 'onto'>('explore');
 
+  // Chrome around the canvas is collapsible, because this page's whole job is to
+  // show as much of the estate as possible. Choices persist so a user who prefers
+  // a maximal canvas doesn't re-collapse on every visit.
+  const [showHelp, setShowHelp] = useState(() => readPref(HELP_KEY, false));
+  const [showLegend, setShowLegend] = useState(() => readPref(LEGEND_KEY, false));
+  const [wide, setWide] = useState(() => readPref(WIDE_KEY, false));
+  useEffect(() => writePref(HELP_KEY, showHelp), [showHelp]);
+  useEffect(() => writePref(LEGEND_KEY, showLegend), [showLegend]);
+  useEffect(() => writePref(WIDE_KEY, wide), [wide]);
+  // reclaim the rows the collapsed chrome gave back
+  const canvasHeight =
+    (wide ? CANVAS_HEIGHT_WIDE : CANVAS_HEIGHT) + (showHelp ? 0 : 60) + (showLegend ? 0 : 24);
+
   // node search (works on the active tab's node set; jumps to a match)
   const [search, setSearch] = useState('');
   const [searchOpen, setSearchOpen] = useState(false);
@@ -386,17 +437,39 @@ export function GraphExplorer() {
   if (rebuilding) return <CatalogLoadingSkeleton label="Rebuilding…" />;
 
   return (
-    <div className="space-y-3 max-w-[1600px]">
-      <div>
+    <div className="space-y-2 max-w-[1800px]">
+      {/* Title + help on ONE row, with the help text collapsed by default: this page
+          is a canvas, so vertical space above it is the scarcest thing here. */}
+      <div className="flex items-baseline gap-2">
         <h2 className="text-2xl font-bold text-foreground">Graph Explorer</h2>
-        {/* single compact help line at the TOP (guidance moved out of the inspector) */}
+        <button
+          type="button"
+          className="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground"
+          aria-expanded={showHelp}
+          onClick={() => setShowHelp((v) => !v)}
+        >
+          <Info className="h-3.5 w-3.5" />
+          {showHelp ? 'Hide help' : 'How to read this'}
+        </button>
+        <button
+          type="button"
+          className="ml-auto flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground"
+          aria-pressed={wide}
+          title={wide ? 'Show the inspector panel' : 'Hide the inspector for a wider canvas'}
+          onClick={() => setWide((v) => !v)}
+        >
+          {wide ? <PanelRightOpen className="h-3.5 w-3.5" /> : <PanelRightClose className="h-3.5 w-3.5" />}
+          {wide ? 'Show inspector' : 'Widen canvas'}
+        </button>
+      </div>
+      {showHelp && (
         <p className="flex items-start gap-1.5 text-sm text-muted-foreground">
           <Info className="h-3.5 w-3.5 mt-0.5 shrink-0" />
           {isExplore
             ? 'Explore: the full enterprise map (enterprise → domains → products → shared tables → metric views). Your domain/product selection is highlighted; the rest stays visible but dimmed. Click any node to center it and ring its neighbors (green = incoming, red = outgoing) and travel — even across a shared dimension to another product. Back / Overview returns to the full map.'
             : `Ontology + lineage: a per-product bird’s-eye map (source tables → serving view → product → KPIs). Click a node to highlight its connections. Drag to pan, scroll to zoom.${fromArtifact ? ' Rendered from the generated ontology artifact (OWL/TTL).' : ''}`}
         </p>
-      </div>
+      )}
 
       <Tabs value={tab} onValueChange={(v) => setTab(v as 'explore' | 'onto')}>
         <TabsList>
@@ -404,7 +477,13 @@ export function GraphExplorer() {
           <TabsTrigger value="onto">Ontology + lineage</TabsTrigger>
         </TabsList>
 
-        <div className="grid grid-cols-1 lg:grid-cols-[1fr_280px] gap-4 mt-3">
+        {/* inspector is narrower than before (280 -> 240) and can be hidden entirely,
+            which is the single biggest win for seeing a wide estate */}
+        <div
+          className={`grid grid-cols-1 gap-3 mt-2 ${
+            wide ? '' : 'lg:grid-cols-[1fr_240px]'
+          }`}
+        >
           <Card className="shadow-sm overflow-hidden">
             <CardHeader className="py-2.5 gap-2">
               {/* node search — jumps to a matching node in the active view */}
@@ -482,19 +561,38 @@ export function GraphExplorer() {
                   />
                 </div>
               </TabsContent>
-              <div className="flex flex-wrap gap-3">
-                {LEGEND.map((l) => (
-                  <span
-                    key={l.label}
-                    className="flex items-center gap-1.5 text-xs text-muted-foreground"
-                  >
-                    <span
-                      className="inline-block h-2.5 w-2.5 rounded-full"
-                      style={{ background: l.color }}
-                    />
-                    {l.label}
-                  </span>
-                ))}
+              {/* legend collapsed by default — it costs a full row and is reference
+                  information, not something you read on every visit */}
+              <div className="flex items-center gap-3">
+                <button
+                  type="button"
+                  className="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground shrink-0"
+                  aria-expanded={showLegend}
+                  onClick={() => setShowLegend((v) => !v)}
+                >
+                  {showLegend ? (
+                    <ChevronDown className="h-3.5 w-3.5" />
+                  ) : (
+                    <ChevronRight className="h-3.5 w-3.5" />
+                  )}
+                  Legend
+                </button>
+                {showLegend && (
+                  <div className="flex flex-wrap gap-3">
+                    {LEGEND.map((l) => (
+                      <span
+                        key={l.label}
+                        className="flex items-center gap-1.5 text-xs text-muted-foreground"
+                      >
+                        <span
+                          className="inline-block h-2.5 w-2.5 rounded-full"
+                          style={{ background: l.color }}
+                        />
+                        {l.label}
+                      </span>
+                    ))}
+                  </div>
+                )}
               </div>
             </CardHeader>
             <CardContent className="p-0">
@@ -507,7 +605,7 @@ export function GraphExplorer() {
                   onTravel={travelTo}
                   highlightIds={enterpriseHighlight}
                   rootId={'ent:root'}
-                  height={CANVAS_HEIGHT}
+                  height={canvasHeight}
                 />
               </TabsContent>
               <TabsContent value="onto" className="m-0">
@@ -518,32 +616,34 @@ export function GraphExplorer() {
                   layout={ONTO_LAYOUT}
                   selectedId={selOntoId}
                   onSelect={setSelOntoId}
-                  height={CANVAS_HEIGHT}
+                  height={canvasHeight}
                 />
               </TabsContent>
             </CardContent>
           </Card>
 
-          <Inspector
-            node={selectedNode}
-            sharedProducts={
-              isExplore && focusId ? enterpriseGraph.productsForNode(focusId) : []
-            }
-            onOpenProduct={(pn) => {
-              if (syncScopeFromSections) setSelectedProduct(pn);
-              const pnode = `prod:${pn}`;
-              if (enterpriseGraph.nodes[pnode]) travelTo(pnode);
-            }}
-            onClear={() => (isExplore ? reset() : setSelOntoId(null))}
-            onJump={(n) => {
-              // genie/dashboard link nodes → open the external URL in a new window
-              if (n.openUrl) {
-                window.open(n.openUrl, '_blank');
-                return;
+          {!wide && (
+            <Inspector
+              node={selectedNode}
+              sharedProducts={
+                isExplore && focusId ? enterpriseGraph.productsForNode(focusId) : []
               }
-              if (n.openIn) navigate(`/${n.openIn}`);
-            }}
-          />
+              onOpenProduct={(pn) => {
+                if (syncScopeFromSections) setSelectedProduct(pn);
+                const pnode = `prod:${pn}`;
+                if (enterpriseGraph.nodes[pnode]) travelTo(pnode);
+              }}
+              onClear={() => (isExplore ? reset() : setSelOntoId(null))}
+              onJump={(n) => {
+                // genie/dashboard link nodes → open the external URL in a new window
+                if (n.openUrl) {
+                  window.open(n.openUrl, '_blank');
+                  return;
+                }
+                if (n.openIn) navigate(`/${n.openIn}`);
+              }}
+            />
+          )}
         </div>
       </Tabs>
 
