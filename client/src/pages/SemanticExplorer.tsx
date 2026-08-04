@@ -1,6 +1,7 @@
 // Semantic Explorer — lineage relationships (FK edges) + measures/KPIs + an
 // entity → property drill-down, aggregated across the active SCOPE (all/domain/
 // product) so it reflects the left-panel selection, not just one product.
+import type React from 'react';
 import { useMemo, useState } from 'react';
 import {
   Card,
@@ -30,10 +31,12 @@ import {
   TooltipProvider,
   Input,
 } from '@databricks/appkit-ui/react';
-import { ArrowRight, Info, Search, Check, X } from 'lucide-react';
+import { ArrowRight, Info, Search } from 'lucide-react';
 import { useProduct } from '../lib/product';
-import { deriveProduct } from '../lib/deriveComponents';
+import { deriveProduct, type DerivedMeasure } from '../lib/deriveComponents';
 import { CatalogLoadingSkeleton } from '../components/LoadingSkeleton';
+import { ProvenanceBadge } from '../components/ProvenanceBadge';
+import { GlossaryCell } from './OntologyStudio';
 
 export function SemanticExplorer() {
   const {
@@ -50,8 +53,6 @@ export function SemanticExplorer() {
     saveOntologyOverride,
     deleteOntologyOverride,
   } = useProduct();
-  const edgeOverride = (ref: string, action: 'confirm' | 'reject') =>
-    ontologyOverrides.find((o) => o.kind === 'edge_status' && o.ref === ref && o.action === action);
 
   // aggregate relationships + measures + mappings across the SCOPED products
   // (all → every product; a domain → its products; a single product → just it).
@@ -160,7 +161,11 @@ export function SemanticExplorer() {
       <Card className="shadow-sm">
         <CardHeader>
           <CardTitle>Relationships (lineage / foreign keys)</CardTitle>
-          <CardDescription>Shared-key joins inferred from the schema</CardDescription>
+          <CardDescription>
+            Shared-key joins inferred from the schema — a read-only scoped rollup. Confirm/reject is
+            curated in <span className="font-medium">Ontology Studio</span> (the single writer); this view
+            reflects that status.
+          </CardDescription>
         </CardHeader>
         <CardContent className="space-y-4">
           {shownRelationships.length === 0 ? (
@@ -173,10 +178,9 @@ export function SemanticExplorer() {
             <>
               <div className="flex flex-wrap gap-2">
                 {shownRelationships.map((r, i) => {
-                  const ref = `${r.from.join(',')}>${r.to}:${r.predicate}`;
-                  const confirmOv = edgeOverride(ref, 'confirm');
-                  const rejectOv = edgeOverride(ref, 'reject');
                   const conf = r.status === 'confirmed' ? 100 : Math.round((r.confidence ?? 0.6) * 100);
+                  const statusLabel =
+                    r.status === 'confirmed' ? 'Confirmed' : r.status === 'rejected' ? 'Rejected' : 'Suggested';
                   return (
                     <div
                       key={`${r.predicate}-${i}`}
@@ -195,45 +199,12 @@ export function SemanticExplorer() {
                         <ArrowRight className="h-3.5 w-3.5" />
                       </span>
                       <span className="font-medium">{r.to}</span>
-                      <Badge variant="outline" className="text-[10px]">
-                        {r.origin ?? 'heuristic'} · {conf}%
+                      <Badge
+                        variant={r.status === 'confirmed' ? 'default' : 'outline'}
+                        className="text-[10px]"
+                      >
+                        {statusLabel} · {conf}%
                       </Badge>
-                      <button
-                        type="button"
-                        title="Confirm (trusted)"
-                        className={`hover:text-emerald-600 ${r.status === 'confirmed' ? 'text-emerald-600' : 'text-muted-foreground'}`}
-                        onClick={() =>
-                          confirmOv
-                            ? void deleteOntologyOverride(confirmOv.id)
-                            : void saveOntologyOverride({
-                                product: selectedProduct.product_name,
-                                kind: 'edge_status',
-                                ref,
-                                action: 'confirm',
-                                value: { predicate: r.predicate },
-                              })
-                        }
-                      >
-                        <Check className="h-3.5 w-3.5" />
-                      </button>
-                      <button
-                        type="button"
-                        title="Reject (hide)"
-                        className={`hover:text-destructive ${r.status === 'rejected' ? 'text-destructive' : 'text-muted-foreground'}`}
-                        onClick={() =>
-                          rejectOv
-                            ? void deleteOntologyOverride(rejectOv.id)
-                            : void saveOntologyOverride({
-                                product: selectedProduct.product_name,
-                                kind: 'edge_status',
-                                ref,
-                                action: 'reject',
-                                value: { predicate: r.predicate },
-                              })
-                        }
-                      >
-                        <X className="h-3.5 w-3.5" />
-                      </button>
                     </div>
                   );
                 })}
@@ -279,6 +250,30 @@ export function SemanticExplorer() {
               <TabsContent key={kind} value={kind}>
                 <MeasureTable
                   rows={shownMeasures.filter((m) => kind === 'all' || m.type === kind)}
+                  renderGlossary={(m) => {
+                    const gloss = ontologyOverrides.find(
+                      (o) => o.kind === 'glossary' && o.ref === m.measure && o.action === 'define'
+                    );
+                    return (
+                      <GlossaryCell
+                        termType="measure"
+                        name={m.measure}
+                        definition={m.definition}
+                        synonyms={m.synonyms}
+                        hasOverride={Boolean(gloss)}
+                        onSave={(def, syn) =>
+                          void saveOntologyOverride({
+                            product: selectedProduct.product_name,
+                            kind: 'glossary',
+                            ref: m.measure,
+                            action: 'define',
+                            value: { term_type: 'measure', definition: def, synonyms: syn },
+                          })
+                        }
+                        onClear={() => gloss && void deleteOntologyOverride(gloss.id)}
+                      />
+                    );
+                  }}
                 />
               </TabsContent>
             ))}
@@ -342,8 +337,11 @@ export function SemanticExplorer() {
 
 function MeasureTable({
   rows,
+  renderGlossary,
 }: {
-  rows: { measure: string; type: string; unit: string; formula: string; description: string }[];
+  // the real derived shape, so provenance/unverified flags reach the table
+  rows: DerivedMeasure[];
+  renderGlossary?: (m: { measure: string; definition?: string; synonyms?: string[] }) => React.ReactNode;
 }) {
   if (rows.length === 0)
     return <p className="text-sm text-muted-foreground py-3">No measures in this view.</p>;
@@ -355,13 +353,18 @@ function MeasureTable({
           <TableHead>Type</TableHead>
           <TableHead>Unit</TableHead>
           <TableHead>Formula</TableHead>
-          <TableHead>Description</TableHead>
+          <TableHead>Glossary</TableHead>
         </TableRow>
       </TableHeader>
       <TableBody>
         {rows.map((m) => (
           <TableRow key={m.measure}>
-            <TableCell className="font-medium">{m.measure}</TableCell>
+            <TableCell className="font-medium">
+              <div className="flex items-center gap-1.5">
+                {m.measure}
+                <ProvenanceBadge origin={m.origin} evidence={m.evidence} showIcon={false} />
+              </div>
+            </TableCell>
             <TableCell>
               <Badge variant={m.type === 'derived' ? 'default' : 'secondary'}>
                 {m.type === 'derived' ? 'kpi' : 'base'}
@@ -369,9 +372,27 @@ function MeasureTable({
             </TableCell>
             <TableCell className="text-muted-foreground">{m.unit}</TableCell>
             <TableCell>
-              <code className="text-xs whitespace-pre-wrap">{m.formula}</code>
+              {/* An unverified measure has no column behind it, so its "formula" is
+                  a placeholder — style it as absent rather than as real SQL. */}
+              <code
+                className={`text-xs whitespace-pre-wrap ${
+                  m.unverified ? 'text-muted-foreground italic' : ''
+                }`}
+              >
+                {m.formula}
+              </code>
             </TableCell>
-            <TableCell className="text-muted-foreground text-sm">{m.description}</TableCell>
+            <TableCell>
+              <div className="space-y-0.5">
+                {m.definition && (
+                  <div className="text-xs text-muted-foreground max-w-[240px] truncate">
+                    {m.definition}
+                    {m.synonyms?.length ? ` · ${m.synonyms.join(', ')}` : ''}
+                  </div>
+                )}
+                {renderGlossary?.(m)}
+              </div>
+            </TableCell>
           </TableRow>
         ))}
       </TableBody>

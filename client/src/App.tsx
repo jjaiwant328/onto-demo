@@ -35,31 +35,51 @@ import {
   RotateCcw,
   Loader2,
   Settings,
+  Save,
+  PanelLeftClose,
+  PanelLeftOpen,
 } from 'lucide-react';
 import { ProductProvider, useProduct, ALL_SCOPE } from './lib/product';
 import { ActionsContext, type ActionItem } from './lib/actions';
+import { ControlTowerHome } from './pages/ControlTowerHome';
+import { ActionInbox } from './pages/ActionInbox';
+import { ScenarioImpact } from './pages/ScenarioImpact';
 import { DataProducts } from './pages/DataProducts';
 import { OntologyStudio } from './pages/OntologyStudio';
+import { DomainAnalysis } from './pages/DomainAnalysis';
+import { DataProductDrafts } from './pages/DataProductDrafts';
 import { SemanticExplorer } from './pages/SemanticExplorer';
 import { BusinessView } from './pages/BusinessView';
 import { GraphExplorer } from './pages/GraphExplorer';
 import { DataContract } from './pages/DataContract';
+import { About } from './pages/About';
 import { ActionCenter } from './pages/ActionCenter';
 import { PrintProduct } from './pages/PrintProduct';
 import { PrintActions } from './pages/PrintActions';
+import { PrintDraft } from './pages/PrintDraft';
 import { SchemaLoader } from './components/SchemaLoader';
 import { Copilot } from './components/Copilot';
 
-// always-on nav (ontology-focused)
-const NAV_BASE = [
+// The Control Tower demo group: the supply-chain decision surfaces (gated by the
+// "Control Tower demo" Settings toggle).
+const NAV_BUSINESS = [
+  { to: '/', label: 'Home' },
+  { to: '/action-inbox', label: 'Action Inbox' },
+  { to: '/scenario-impact', label: 'Scenario & Impact' },
+  { to: '/action-center', label: 'Action Center' },
+];
+// The technical curation / governance tabs (always shown).
+const NAV_BUILDER = [
   { to: '/data-products', label: 'Data Products' },
+  { to: '/domain-analysis', label: 'Domain Analysis' },
+  { to: '/data-product-drafts', label: 'Product Drafts' },
   { to: '/ontology-studio', label: 'Ontology Studio' },
   { to: '/semantic-explorer', label: 'Semantic Explorer' },
   { to: '/graph-explorer', label: 'Graph Explorer' },
   { to: '/data-contract', label: 'Data Contract' },
+  { to: '/about', label: 'About' },
 ];
-// optional nav entries, gated by settings toggles (default OFF)
-const NAV_ACTION_CENTER = { to: '/action-center', label: 'Action Center' };
+// optional, gated by a settings toggle
 const NAV_BUSINESS_VIEW = { to: '/business-view', label: 'Business View' };
 
 // in-session action queue provider (shared by Action Center + Copilot).
@@ -82,6 +102,14 @@ function ActionsProvider({ children }: { children: React.ReactNode }) {
   );
 }
 
+// Index route: the Control Tower home is part of the demo nav group. When that
+// group is toggled off, land on the generic Data Products page instead so the
+// app still has a usable entry point.
+function HomeRoute() {
+  const { showControlTower } = useProduct();
+  return showControlTower ? <ControlTowerHome /> : <Navigate to="/data-products" replace />;
+}
+
 const navLinkClass = ({ isActive }: { isActive: boolean }) =>
   `px-3 py-1.5 rounded-md text-sm font-medium transition-colors ${
     isActive
@@ -100,16 +128,18 @@ function NavLinks({
   linkClass: NavLinkClassFn;
   onClick?: () => void;
 }) {
-  const { showActionCenter, showBusinessView } = useProduct();
+  const { showBusinessView, showControlTower } = useProduct();
+  // The generic ontology/builder tabs are always shown; the Control Tower demo
+  // group is gated by its Settings toggle.
   const nav = [
-    ...NAV_BASE,
-    ...(showActionCenter ? [NAV_ACTION_CENTER] : []),
+    ...(showControlTower ? NAV_BUSINESS : []),
+    ...NAV_BUILDER,
     ...(showBusinessView ? [NAV_BUSINESS_VIEW] : []),
   ];
   return (
     <nav className={className}>
       {nav.map((n) => (
-        <NavLink key={n.to} to={n.to} className={linkClass} onClick={onClick}>
+        <NavLink key={n.to} to={n.to} end={n.to === '/'} className={linkClass} onClick={onClick}>
           {n.label}
         </NavLink>
       ))}
@@ -148,7 +178,9 @@ function SchemaList() {
     combined,
     isBundledSchema,
     removeSchema,
+    storeSchema,
   } = useProduct();
+  const [storingId, setStoringId] = useState<string | null>(null);
   return (
     <div className="rounded-md border">
       <div className="flex items-center justify-between px-2 py-1.5 border-b">
@@ -167,6 +199,8 @@ function SchemaList() {
         {schemaEntries.map((s) => {
           const bundled = isBundledSchema(s.id);
           const isCurated = s.id === 'fc_entdata_gold';
+          // ephemeral = loaded this session but not yet in the durable store
+          const ephemeral = !bundled && !s.savedId;
           const title = isCurated
             ? 'Delete Retailer — removes the live flagship (restore via Reset)'
             : bundled
@@ -183,6 +217,23 @@ function SchemaList() {
                 aria-label={s.label}
               />
               <span className="truncate flex-1">{s.label}</span>
+              {s.savedId && <Save className="h-3 w-3 text-emerald-600 shrink-0" aria-label="stored" />}
+              {ephemeral && (
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="h-6 w-6 p-0 shrink-0"
+                  title="Store durably (survives reloads)"
+                  disabled={storingId === s.id}
+                  onClick={async () => {
+                    setStoringId(s.id);
+                    await storeSchema(s.id);
+                    setStoringId(null);
+                  }}
+                >
+                  {storingId === s.id ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Save className="h-3.5 w-3.5 text-primary" />}
+                </Button>
+              )}
               <Button
                 variant="ghost"
                 size="sm"
@@ -290,6 +341,14 @@ function DomainControl() {
             <div className="text-xs font-medium text-muted-foreground px-1 pb-1">
               Combine domains ({toMerge.length} selected)
             </div>
+            {/* single check mark to select every domain at once */}
+            <label className="flex items-center gap-2 rounded-md px-2 py-1.5 text-sm font-medium hover:bg-muted cursor-pointer border-b mb-0.5">
+              <Checkbox
+                checked={domains.length > 0 && domains.every((d) => toMerge.includes(d.name))}
+                onCheckedChange={(v) => setToMerge(v ? domains.map((d) => d.name) : [])}
+              />
+              <span>All domains</span>
+            </label>
             <div className="flex flex-col gap-0.5 max-h-56 overflow-auto">
               {domains.map((d) => (
                 <label
@@ -399,9 +458,10 @@ function ControlPanel() {
   );
 }
 
-// Settings — nav visibility toggles (Action Center + Business View, default OFF).
+// Settings — nav visibility toggles: the Control Tower demo group and the
+// optional Business View section.
 function SettingsMenu() {
-  const { showActionCenter, setShowActionCenter, showBusinessView, setShowBusinessView } =
+  const { showBusinessView, setShowBusinessView, showControlTower, setShowControlTower } =
     useProduct();
   return (
     <Popover>
@@ -413,16 +473,17 @@ function SettingsMenu() {
       <PopoverContent className="w-64 p-3 space-y-2.5" align="start">
         <div className="text-xs font-medium text-muted-foreground">Show sections</div>
         <label className="flex items-center gap-2 text-sm cursor-pointer">
-          <Switch checked={showActionCenter} onCheckedChange={setShowActionCenter} />
-          Action Center
+          <Switch checked={showControlTower} onCheckedChange={setShowControlTower} />
+          Control Tower demo
         </label>
-        <label className="flex items-center gap-2 text-sm cursor-pointer">
+        <p className="text-[11px] text-muted-foreground">
+          Show the supply-chain control-tower panels (Home, Action Inbox, Scenario &amp;
+          Impact, Action Center). Turn off to keep only the generic ontology tools.
+        </p>
+        <label className="flex items-center gap-2 text-sm cursor-pointer pt-1">
           <Switch checked={showBusinessView} onCheckedChange={setShowBusinessView} />
           Business View
         </label>
-        <p className="text-[11px] text-muted-foreground pt-1">
-          Off by default. Turn on to add these to the top navigation.
-        </p>
       </PopoverContent>
     </Popover>
   );
@@ -455,13 +516,33 @@ function ScopeSyncToggle() {
   );
 }
 
+// The desktop control panel takes ~26% of the viewport at 1500px. That is a lot of
+// permanent real estate for controls you set once, so it collapses — and the choice
+// persists, since someone working on a wide graph wants it to stay collapsed.
+const SIDEBAR_KEY = 'rt_onto_sidebar_collapsed';
+function readSidebarPref(): boolean {
+  try {
+    return localStorage.getItem(SIDEBAR_KEY) === '1';
+  } catch {
+    return false;
+  }
+}
+
 function Layout() {
   const isMobile = useIsMobile();
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(readSidebarPref);
 
   useEffect(() => {
     if (!isMobile) setMobileNavOpen(false);
   }, [isMobile]);
+  useEffect(() => {
+    try {
+      localStorage.setItem(SIDEBAR_KEY, sidebarCollapsed ? '1' : '0');
+    } catch {
+      /* storage unavailable — preference just won't persist */
+    }
+  }, [sidebarCollapsed]);
 
   return (
     <div className="min-h-screen bg-background flex flex-col">
@@ -482,18 +563,33 @@ function Layout() {
             </SheetContent>
           </Sheet>
         </div>
+        {/* desktop sidebar toggle */}
+        <Button
+          variant="ghost"
+          size="icon"
+          className="hidden md:inline-flex shrink-0"
+          aria-pressed={sidebarCollapsed}
+          title={sidebarCollapsed ? 'Show the controls panel' : 'Hide the controls panel'}
+          onClick={() => setSidebarCollapsed((v) => !v)}
+        >
+          {sidebarCollapsed ? <PanelLeftOpen className="h-5 w-5" /> : <PanelLeftClose className="h-5 w-5" />}
+          <span className="sr-only">
+            {sidebarCollapsed ? 'Show controls panel' : 'Hide controls panel'}
+          </span>
+        </Button>
         <div className="flex items-center gap-2">
           <Store className="h-5 w-5 text-primary" />
           <h1 className="text-lg font-semibold text-foreground">Ontology-demo</h1>
-          <Badge variant="outline" className="hidden sm:inline-flex">
-            AppKit
-          </Badge>
         </div>
       </header>
 
       <div className="flex-1 flex min-h-0">
-        {/* persistent left control panel (desktop) */}
-        <aside className="hidden md:block w-80 lg:w-96 shrink-0 border-r overflow-y-auto p-4">
+        {/* persistent left control panel (desktop) — collapsible for more canvas */}
+        <aside
+          className={`hidden shrink-0 overflow-y-auto ${
+            sidebarCollapsed ? '' : 'md:block w-72 lg:w-80 border-r p-4'
+          }`}
+        >
           <ControlPanel />
         </aside>
 
@@ -503,7 +599,7 @@ function Layout() {
             <div className="overflow-x-auto">
               <NavLinks className="flex gap-1 min-w-max" linkClass={navLinkClass} />
             </div>
-            <div className="ml-auto shrink-0">
+            <div className="ml-auto shrink-0 flex items-center gap-3">
               <ScopeSyncToggle />
             </div>
           </div>
@@ -525,19 +621,25 @@ const router = createBrowserRouter([
   {
     element: <Layout />,
     children: [
-      { index: true, element: <Navigate to="/data-products" replace /> },
+      { index: true, element: <HomeRoute /> },
+      { path: '/action-inbox', element: <ActionInbox /> },
+      { path: '/scenario-impact', element: <ScenarioImpact /> },
       { path: '/data-products', element: <DataProducts /> },
+      { path: '/domain-analysis', element: <DomainAnalysis /> },
+      { path: '/data-product-drafts', element: <DataProductDrafts /> },
       { path: '/ontology-studio', element: <OntologyStudio /> },
       { path: '/semantic-explorer', element: <SemanticExplorer /> },
       { path: '/graph-explorer', element: <GraphExplorer /> },
       { path: '/data-contract', element: <DataContract /> },
+      { path: '/about', element: <About /> },
       { path: '/action-center', element: <ActionCenter /> },
       { path: '/business-view', element: <BusinessView /> },
-      { path: '*', element: <Navigate to="/data-products" replace /> },
+      { path: '*', element: <Navigate to="/" replace /> },
     ],
   },
   // standalone print routes (no app chrome) for clean PDF export
   { path: '/print/actions', element: <PrintActions /> },
+  { path: '/print/draft/:draftId', element: <PrintDraft /> },
   { path: '/print/:productName', element: <PrintProduct /> },
 ]);
 

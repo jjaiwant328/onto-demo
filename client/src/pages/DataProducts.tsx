@@ -26,18 +26,93 @@ import {
   Input,
   Label,
 } from '@databricks/appkit-ui/react';
-import { CheckCircle2, FileText, FileDown, Layers, Database, MessageSquare, BarChart3, Plus } from 'lucide-react';
+import { CheckCircle2, FileText, FileDown, Layers, Database, MessageSquare, BarChart3, Plus, Package, Pencil, AlertTriangle } from 'lucide-react';
 import { useNavigate } from 'react-router';
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useProduct } from '../lib/product';
+import { ProvenanceBadge } from '../components/ProvenanceBadge';
+import type { CatalogDomain, CatalogProduct, Origin } from '../lib/deriveComponents';
 import { CatalogLoadingSkeleton } from '../components/LoadingSkeleton';
 import { fetchProductLinks, attachLink, deleteLink, type ProductLink } from '../lib/productLinks';
+import { parseSpec } from '../lib/useCaseProduct';
+import { DraftEditor } from '../components/DraftEditor';
 
 function maturityVariant(m: string): 'default' | 'secondary' | 'outline' {
   const s = (m || '').toLowerCase();
   if (s === 'ga') return 'default';
   if (s === 'beta') return 'secondary';
   return 'outline';
+}
+
+// How confidently a domain grouping was made. A weak match (one incidental keyword
+// hit) or an unclassified bucket must not look like a curated business domain — on a
+// non-retail schema that is the difference between a useful start and a wrong map.
+function DomainMatchBadge({ domain }: { domain: CatalogDomain }) {
+  // curated/data-backed domains aren't keyword-matched at all
+  if (domain.dataAvailable || !domain.matchStrength || domain.matchStrength === 'strong') return null;
+  const none = domain.matchStrength === 'none';
+  const alts = domain.alternateDomains ?? [];
+  return (
+    <TooltipProvider>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <Badge variant="outline" className="gap-1 text-[10px] font-normal cursor-help">
+            <AlertTriangle className="h-3 w-3 text-amber-600" />
+            {none ? 'unclassified' : 'weak match'}
+          </Badge>
+        </TooltipTrigger>
+        <TooltipContent className="max-w-xs">
+          {domain.matchEvidence}
+          {alts.length > 0 && (
+            <>
+              <br />
+              <span className="text-muted-foreground">
+                Also matched: {alts.join(', ')}. Reassign in Ontology Studio.
+              </span>
+            </>
+          )}
+        </TooltipContent>
+      </Tooltip>
+    </TooltipProvider>
+  );
+}
+
+// "How derived" for one product: the provenance of its labels/KPIs, plus a
+// warning when some KPI names don't resolve to a real column. See /about.
+function ProductProvenance({ product }: { product: CatalogProduct }) {
+  const unverified = product.unverifiedKpis ?? [];
+  // A live or data-backed product is curated and has a real serving object behind
+  // it, so it must not read as an inference like the schema-derived ones do.
+  const curated = product.dataAvailable || product.live;
+  const origin: Origin = curated ? 'observed' : (product.labelOrigin ?? 'heuristic');
+  const evidence = product.dataAvailable
+    ? 'curated product backed by real tables in the serving schema'
+    : product.live
+      ? 'curated product with a governed serving view in the warehouse'
+      : product.labelOrigin === 'llm'
+        ? 'name, business outcome and KPIs refined by the model over the derived draft'
+        : 'derived from table/column names and types by rule';
+  return (
+    <div className="flex flex-wrap items-center gap-1">
+      <ProvenanceBadge origin={origin} evidence={evidence} />
+      {unverified.length > 0 && (
+        <TooltipProvider>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Badge variant="outline" className="gap-1 text-[10px] font-normal cursor-help">
+                <AlertTriangle className="h-3 w-3 text-amber-600" />
+                {unverified.length} unverified KPI{unverified.length > 1 ? 's' : ''}
+              </Badge>
+            </TooltipTrigger>
+            <TooltipContent className="max-w-xs">
+              These KPI names do not match a column on this product&apos;s fact tables, so they
+              cannot be computed yet and need a definition: {unverified.join(', ')}
+            </TooltipContent>
+          </Tooltip>
+        </TooltipProvider>
+      )}
+    </div>
+  );
 }
 
 // A Genie-Space or Dashboard cell: opens the attached URL in a new window, or
@@ -162,6 +237,7 @@ export function DataProducts() {
     scopedDomains,
     selectedProduct,
     setSelectedDomain,
+    setSelectedProduct,
     syncScopeFromSections,
     schemaEntries,
     combined,
@@ -169,7 +245,12 @@ export function DataProducts() {
     selectedSchemaIds,
     catalogLoading,
     rebuilding,
+    refreshGraphLinks,
+    useCaseDrafts,
   } = useProduct();
+  // completed use-case data products (drafted in the staging tab, marked done)
+  const completedDrafts = useCaseDrafts.filter((d) => d.status === 'completed');
+  const [editDraftId, setEditDraftId] = useState<string | null>(null);
   const schemaLabel =
     selectedSchemaIds.length === 1
       ? (schemaEntries.find((s) => s.id === selectedSchemaIds[0])?.label ?? '1 schema')
@@ -186,6 +267,19 @@ export function DataProducts() {
     setFocusDomainName(name);
     setFocusProductName(null);
     if (syncScopeFromSections) setSelectedDomain(name);
+  };
+
+  // Pick a product row. Sets the local preview focus, and — when "Selections
+  // update scope" is on — carries the selection to the global scope so other
+  // tabs (Ontology Studio, etc.) open on this product. Domain is set first
+  // because setSelectedDomain resets product to ALL; setSelectedProduct after.
+  const pickProduct = (domainName: string, productName: string) => {
+    setFocusDomainName(domainName);
+    setFocusProductName(productName);
+    if (syncScopeFromSections) {
+      setSelectedDomain(domainName);
+      setSelectedProduct(productName);
+    }
   };
 
   const focusDomain = useMemo(
@@ -216,7 +310,10 @@ export function DataProducts() {
       map.get(key)!.push(l);
     }
     setLinksByProduct(map);
-  }, []);
+    // also refresh the enterprise/ontology graph overlay so newly attached/
+    // detached links (incl. dashboards) show without a full page reload.
+    void refreshGraphLinks();
+  }, [refreshGraphLinks]);
   useEffect(() => {
     void loadLinks();
   }, [loadLinks]);
@@ -280,7 +377,10 @@ export function DataProducts() {
                   <CardDescription>{d.description}</CardDescription>
                 </CardHeader>
                 <CardContent className="text-xs text-muted-foreground">
-                  {d.products.length} products
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    <span>{d.products.length} products</span>
+                    <DomainMatchBadge domain={d} />
+                  </div>
                 </CardContent>
               </Card>
             </button>
@@ -301,6 +401,7 @@ export function DataProducts() {
                 <TableHead>Product</TableHead>
                 <TableHead>Maturity</TableHead>
                 <TableHead>Status</TableHead>
+                <TableHead>How derived</TableHead>
                 <TableHead>Source tables</TableHead>
                 <TableHead>Genie Space</TableHead>
                 <TableHead>Dashboard</TableHead>
@@ -308,12 +409,27 @@ export function DataProducts() {
             </TableHeader>
             <TableBody>
               {(focusDomain?.products ?? []).map((p) => {
-                // rows are display-only; the only interactive controls are the
-                // Genie / Dashboard attach/open cells below.
+                // clicking the product name selects it (and carries to global
+                // scope when the sync toggle is on); Genie/Dashboard cells below
+                // remain the attach/open controls.
                 const links = linksByProduct.get(p.display_name) ?? [];
+                const isSelected = focusProduct?.product_name === p.product_name;
                 return (
-                  <TableRow key={p.product_name}>
-                    <TableCell className="font-medium">{p.display_name}</TableCell>
+                  <TableRow key={p.product_name} data-state={isSelected ? 'selected' : undefined}>
+                    <TableCell className="font-medium">
+                      <button
+                        type="button"
+                        className="text-left hover:underline hover:text-primary"
+                        title={
+                          syncScopeFromSections
+                            ? 'Select — opens in Ontology Studio and updates scope'
+                            : 'Select for preview (enable "Selections update scope" to carry to other tabs)'
+                        }
+                        onClick={() => pickProduct(focusDomain?.name ?? '', p.product_name)}
+                      >
+                        {p.display_name}
+                      </button>
+                    </TableCell>
                     <TableCell>
                       <Badge variant={maturityVariant(p.maturity)}>{p.maturity}</Badge>
                     </TableCell>
@@ -329,6 +445,9 @@ export function DataProducts() {
                       ) : (
                         <Badge variant="outline">schema-derived</Badge>
                       )}
+                    </TableCell>
+                    <TableCell>
+                      <ProductProvenance product={p} />
                     </TableCell>
                     <TableCell className="text-muted-foreground text-xs">
                       {p.fact_tables.length + p.dim_tables.length} tables
@@ -360,6 +479,84 @@ export function DataProducts() {
           </Table>
         </CardContent>
       </Card>
+
+      {/* completed use-case data products (promoted from the Product Drafts staging tab) */}
+      {completedDrafts.length > 0 && (
+        <Card className="shadow-sm border-emerald-300">
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2">
+              <Package className="h-4 w-4 text-primary" /> Data products from use cases
+              <Badge variant="default" className="text-[10px]">
+                {completedDrafts.length}
+              </Badge>
+            </CardTitle>
+            <CardDescription>
+              Completed use-case data products drafted in the Product Drafts tab. Manage or revert
+              them there.
+            </CardDescription>
+          </CardHeader>
+          <CardContent>
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead>Product (from use case)</TableHead>
+                  <TableHead>KPIs</TableHead>
+                  <TableHead>Tables</TableHead>
+                  <TableHead>Genie / metric views</TableHead>
+                  <TableHead className="text-right">Actions</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {completedDrafts.map((d) => {
+                  const spec = parseSpec(d);
+                  return (
+                    <TableRow key={d.draft_id} className="align-top">
+                      <TableCell className="font-medium align-top py-3 whitespace-normal break-words">
+                        {d.use_case_title}
+                        <Badge variant="outline" className="ml-1.5 text-[10px] font-normal">
+                          from use case
+                        </Badge>
+                      </TableCell>
+                      <TableCell className="text-xs text-muted-foreground align-top py-3">
+                        {(spec?.kpis ?? []).map((k) => k.name).join(', ') || '—'}
+                      </TableCell>
+                      <TableCell className="text-xs text-muted-foreground align-top py-3 whitespace-normal break-words">
+                        {(spec?.tables ?? []).join(', ') || '—'}
+                      </TableCell>
+                      <TableCell className="text-xs text-muted-foreground align-top py-3">
+                        {(spec?.genie_spaces ?? []).length} genie · {(spec?.metric_views ?? []).length} metric views
+                        <span className="text-[10px]"> (proposed)</span>
+                      </TableCell>
+                      <TableCell className="text-right align-top py-3">
+                        <div className="inline-flex items-center gap-1">
+                          <Button
+                            size="sm"
+                            variant="ghost"
+                            className="h-7 gap-1 px-2 text-xs"
+                            title="Edit this data product"
+                            onClick={() => setEditDraftId(d.draft_id)}
+                          >
+                            <Pencil className="h-3.5 w-3.5" /> Edit
+                          </Button>
+                          <Button
+                            size="sm"
+                            variant="ghost"
+                            className="h-7 gap-1 px-2 text-xs"
+                            title="Export this data product as a PDF"
+                            onClick={() => void navigate(`/print/draft/${d.draft_id}`)}
+                          >
+                            <FileDown className="h-3.5 w-3.5" /> Export PDF
+                          </Button>
+                        </div>
+                      </TableCell>
+                    </TableRow>
+                  );
+                })}
+              </TableBody>
+            </Table>
+          </CardContent>
+        </Card>
+      )}
 
       {/* selected product detail */}
       <Card className="shadow-sm">
@@ -426,15 +623,48 @@ export function DataProducts() {
           <div>
             <div className="text-xs uppercase tracking-wide text-muted-foreground mb-1">KPIs</div>
             <div className="flex flex-wrap gap-1.5">
-              {(focusProduct?.kpis ?? []).map((k) => (
-                <Badge key={k} variant="secondary">
-                  {k}
-                </Badge>
-              ))}
+              {(focusProduct?.kpis ?? []).map((k) => {
+                // A KPI that maps to a real measure column can be computed today;
+                // one that doesn't is a proposal needing a definition. Showing both
+                // as plain badges was the app's most misleading output.
+                const unverified = (focusProduct?.unverifiedKpis ?? []).includes(k);
+                return unverified ? (
+                  <TooltipProvider key={k}>
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <Badge
+                          variant="outline"
+                          className="gap-1 cursor-help border-dashed text-muted-foreground"
+                        >
+                          <AlertTriangle className="h-3 w-3 text-amber-600" />
+                          {k}
+                        </Badge>
+                      </TooltipTrigger>
+                      <TooltipContent className="max-w-xs">
+                        No column named <code>{k}</code> on this product&apos;s fact tables. It may
+                        be a valid composite (a ratio or rate), but it needs a definition before it
+                        can be computed — it is not a column-backed measure.
+                      </TooltipContent>
+                    </Tooltip>
+                  </TooltipProvider>
+                ) : (
+                  <Badge key={k} variant="secondary">
+                    {k}
+                  </Badge>
+                );
+              })}
             </div>
           </div>
         </CardContent>
       </Card>
+
+      {editDraftId &&
+        (() => {
+          const d = completedDrafts.find((x) => x.draft_id === editDraftId);
+          return d ? (
+            <DraftEditor draft={d} open={true} onOpenChange={(v) => !v && setEditDraftId(null)} />
+          ) : null;
+        })()}
     </div>
   );
 }

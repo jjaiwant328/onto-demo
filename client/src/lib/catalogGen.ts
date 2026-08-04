@@ -5,7 +5,14 @@
 // uploaded schema regenerates domains → products → components → graph → contracts.
 // The heuristic runs entirely client-side; an optional server endpoint can refine
 // the draft with a Foundation Model (graceful fallback to the heuristic).
-import type { Catalog, CatalogDomain, CatalogProduct, Schema, SchemaColumn } from './deriveComponents';
+import type {
+  Catalog,
+  CatalogDomain,
+  CatalogProduct,
+  Origin,
+  Schema,
+  SchemaColumn,
+} from './deriveComponents';
 
 // ---------- CSV parse --------------------------------------------------------
 // describe-extended metadata rows to skip (column_name values that are not real columns)
@@ -150,26 +157,94 @@ function isFactLike(cols: SchemaColumn[], table: string): boolean {
   return hasMeasure && hasKey && hasDate;
 }
 
-function domainFor(table: string): DomainDef | null {
-  const name = shortTable(table);
-  for (const d of DOMAIN_DEFS) if (d.re.test(name)) return d;
-  return null;
+// Domain matching, with the evidence kept.
+//
+// The DOMAIN_DEFS keywords describe convenience retail. On any other estate most
+// tables either miss entirely or — worse — hit on an incidental word: a healthcare
+// `patient_transfer` matches /transfer/ and lands in "Merchandise & Inventory" with
+// no hint that the match was a coincidence. First-match-wins also silently discards
+// the fact that a table matched two domains.
+//
+// So: score every domain, keep the runners-up, and report how the match was made so
+// the UI can distinguish a confident grouping from a guess (and offer a correction).
+export type DomainMatch = {
+  domain: DomainDef | null;
+  /** how many distinct domain keywords matched the table name */
+  hits: number;
+  /** other domains that also matched, best-first — candidates for a re-assignment */
+  alternates: DomainDef[];
+};
+
+function matchDomain(table: string): DomainMatch {
+  const name = shortTable(table).toLowerCase();
+  const scored = DOMAIN_DEFS.map((d) => {
+    // count distinct alternatives in the domain's pattern that hit, so a table
+    // matching several of a domain's keywords ranks above an incidental single hit
+    const alts = d.re.source.split('|');
+    const hits = alts.filter((a) => {
+      try {
+        return new RegExp(a, 'i').test(name);
+      } catch {
+        return false;
+      }
+    }).length;
+    return { d, hits };
+  })
+    .filter((s) => s.hits > 0)
+    .sort((a, b) => b.hits - a.hits);
+  if (scored.length === 0) return { domain: null, hits: 0, alternates: [] };
+  return {
+    domain: scored[0].d,
+    hits: scored[0].hits,
+    alternates: scored.slice(1).map((s) => s.d),
+  };
 }
+
+// Domain key prefix for tables no business-domain keyword matched.
+const UNCLASSIFIED_PREFIX = 'unclassified_';
+
+// The business domains tables are matched against. Exported so the About page can
+// describe the real list instead of duplicating it (and drifting from it).
+export const DOMAIN_LABELS: string[] = DOMAIN_DEFS.map((d) => d.label);
+// How many products a single domain may carry (see buildCatalogFromSchema).
+export const MAX_PRODUCTS_PER_DOMAIN = 4;
+// How many leading numeric measures become a product's headline KPIs.
+export const MAX_KPIS_PER_PRODUCT = 3;
 
 export function buildCatalogFromSchema(schema: Schema): Catalog {
   const tables = Object.keys(schema);
 
-  // group tables by domain (keyword bucket; fall back to UC schema name)
+  // group tables by domain (keyword bucket; unmatched tables are grouped by source
+  // schema and labelled as such, rather than being quietly folded into a business
+  // domain they were never matched to)
   const domainTables = new Map<string, string[]>();
-  const domainMeta = new Map<string, { label: string; description: string }>();
+  const domainMeta = new Map<
+    string,
+    { label: string; description: string; origin?: Origin; evidence?: string }
+  >();
   for (const d of DOMAIN_DEFS) domainMeta.set(d.name, { label: d.label, description: d.description });
 
+  // per-domain evidence, so the UI can show why a table landed where it did
+  const matchHits = new Map<string, number>();
+  const altsByTable = new Map<string, string[]>();
+
   for (const t of tables) {
-    const d = domainFor(t);
-    const key = d ? d.name : `schema_${t.split('.')[0]}`;
+    const m = matchDomain(t);
+    const ucSchema = t.split('.')[0];
+    const key = m.domain ? m.domain.name : `${UNCLASSIFIED_PREFIX}${ucSchema}`;
     if (!domainMeta.has(key)) {
-      const ucSchema = t.split('.')[0];
-      domainMeta.set(key, { label: humanize(ucSchema), description: `Tables in ${ucSchema}.` });
+      // Unmatched: name it after the source schema and SAY it is unclassified, so a
+      // user can see how much of their estate the keyword rules did not understand.
+      domainMeta.set(key, {
+        label: `${humanize(ucSchema)} (unclassified)`,
+        description: `Tables in ${ucSchema} that did not match any known business domain. Group and rename these in Ontology Studio.`,
+        origin: 'heuristic',
+        evidence: 'no business-domain keyword matched these table names',
+      });
+    }
+    if (m.domain) {
+      matchHits.set(key, Math.max(matchHits.get(key) ?? 0, m.hits));
+      if (m.alternates.length) altsByTable.set(t, m.alternates.map((a) => a.label));
     }
     (domainTables.get(key) ?? domainTables.set(key, []).get(key)!).push(t);
   }
@@ -186,7 +261,7 @@ export function buildCatalogFromSchema(schema: Schema): Catalog {
     if (anchors.length === 0) {
       anchors = [...tbls].sort((a, b) => (schema[b]?.length ?? 0) - (schema[a]?.length ?? 0)).slice(0, 1);
     }
-    anchors = anchors.slice(0, 4);
+    anchors = anchors.slice(0, MAX_PRODUCTS_PER_DOMAIN);
 
     const products: CatalogProduct[] = anchors.map((anchor) => {
       const anchorCols = schema[anchor] ?? [];
@@ -197,15 +272,15 @@ export function buildCatalogFromSchema(schema: Schema): Catalog {
         for (const k of dk) if (anchorKeys.has(k)) return true;
         return false;
       });
-      // ensure a couple of conformed dims if nothing matched
-      const dimTables = joined.length
-        ? joined.slice(0, 4)
-        : dimPool.filter((d) => /dim_store|dim_calendar/i.test(d)).slice(0, 2);
+      // Ensure a couple of conformed dims if no shared key matched. The fallback
+      // used to name dim_store/dim_calendar specifically, which found nothing outside
+      // convenience retail — prefer any dimension table in the domain instead.
+      const dimTables = joined.length ? joined.slice(0, 4) : dims.slice(0, 2);
 
       const measures = anchorCols
         .filter((c) => isNumeric(c.type) && !isKey(c.name))
         .map((c) => c.name);
-      const kpis = measures.slice(0, 3);
+      const kpis = measures.slice(0, MAX_KPIS_PER_PRODUCT);
 
       const label = humanize(anchor);
       return {
@@ -221,7 +296,27 @@ export function buildCatalogFromSchema(schema: Schema): Catalog {
 
     if (products.length === 0) continue;
     const meta = domainMeta.get(domName)!;
-    domains.push({ name: domName, label: meta.label, description: meta.description, products });
+    const hits = matchHits.get(domName) ?? 0;
+    const unclassified = domName.startsWith(UNCLASSIFIED_PREFIX);
+    domains.push({
+      name: domName,
+      label: meta.label,
+      description: meta.description,
+      products,
+      // How this grouping was arrived at. A single incidental keyword hit is a much
+      // weaker claim than several, and the UI shows the difference.
+      labelOrigin: meta.origin ?? 'heuristic',
+      matchStrength: unclassified ? 'none' : hits >= 2 ? 'strong' : 'weak',
+      matchEvidence:
+        meta.evidence ??
+        (hits >= 2
+          ? `${hits} domain keywords matched these table names`
+          : 'one domain keyword matched a table name — verify this grouping'),
+      // other domains whose keywords also matched, offered as one-click corrections
+      alternateDomains: [
+        ...new Set(tbls.flatMap((t) => altsByTable.get(t) ?? [])),
+      ].filter((l) => l !== meta.label),
+    });
   }
 
   return { domains };

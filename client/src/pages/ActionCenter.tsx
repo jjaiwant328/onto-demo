@@ -37,7 +37,7 @@ import {
   useAnalyticsQuery,
 } from '@databricks/appkit-ui/react';
 import { sql } from '@databricks/appkit-ui/js';
-import { CheckCircle2, XCircle, Pencil, Zap, AlertTriangle, Info, Database, Loader2, FileDown, MessageSquare } from 'lucide-react';
+import { CheckCircle2, XCircle, Pencil, Zap, AlertTriangle, Info, Database, Loader2, FileDown, MessageSquare, Sparkles, ChevronDown, ChevronRight } from 'lucide-react';
 import { useProduct } from '../lib/product';
 import { fetchProductLinks, attachLink, deleteLink, type ProductLink } from '../lib/productLinks';
 import { useActions, buildExceptionActions, mergeLlmActions, simulatedTrail, type ActionItem, type OpportunityRow } from '../lib/actions';
@@ -45,10 +45,10 @@ import { componentsSummary } from '../lib/summary';
 import {
   logAction,
   fetchActionLog,
-  updateActionStatus,
   type LogContext,
   type LoggedAction,
 } from '../lib/actionLog';
+import { MonitorJobBuilder } from '../components/MonitorJobBuilder';
 
 export function ActionCenter() {
   const navigate = useNavigate();
@@ -62,6 +62,8 @@ export function ActionCenter() {
     schemaEntries,
     selectedSchemaIds,
   } = useProduct();
+  // Monitoring (SQL + schedules) shows whenever the product has backing data.
+  const showMonitor = Boolean(selectedProduct.dataAvailable);
   const { queue, setQueue, addAction } = useActions();
   const live = components.live;
   const dataAvailable = Boolean(selectedProduct.dataAvailable);
@@ -75,6 +77,17 @@ export function ActionCenter() {
     domain: selectedDomain?.label ?? '',
     product: selectedProduct.display_name,
   };
+
+  // Attached Genie / dashboard links for this product — lifted here so both the
+  // Further-analysis panel AND each action card ("Review before approving") share
+  // one source of truth and stay in sync after an attach/remove.
+  const [productLinks, setProductLinks] = useState<ProductLink[]>([]);
+  const reloadLinks = React.useCallback(async () => {
+    setProductLinks(await fetchProductLinks(selectedProduct.display_name));
+  }, [selectedProduct.display_name]);
+  useEffect(() => {
+    void reloadLinks();
+  }, [reloadLinks]);
 
   // Reset the Action Center whenever the SCOPE (schema/domain/product) changes so
   // no previous product's generated actions/analysis linger. Keyed like the
@@ -110,6 +123,7 @@ export function ActionCenter() {
         <TabsList>
           <TabsTrigger value="actions">Actions</TabsTrigger>
           <TabsTrigger value="log">Action Log</TabsTrigger>
+          {showMonitor && <TabsTrigger value="monitor">Monitoring Job</TabsTrigger>}
         </TabsList>
 
         <TabsContent value="actions" className="space-y-6 mt-4">
@@ -122,6 +136,8 @@ export function ActionCenter() {
               schemaLabel={schemaLabel}
               domain={selectedDomain?.label ?? ''}
               backingTables={selectedProduct.fact_tables ?? []}
+              links={productLinks}
+              onChanged={reloadLinks}
             />
           )}
 
@@ -141,23 +157,34 @@ export function ActionCenter() {
 
           <ScenarioPanel onActions={(items) => items.forEach(addAction)} />
 
-          <QueueList queue={queue} setQueue={setQueue} logCtx={logCtx} />
+          <QueueList queue={queue} setQueue={setQueue} logCtx={logCtx} reviewLinks={productLinks} />
         </TabsContent>
 
         <TabsContent value="log" className="mt-4">
           <ActionLogTracker product={selectedProduct.display_name} />
         </TabsContent>
+
+        {showMonitor && (
+          <TabsContent value="monitor" className="mt-4">
+            <MonitorJobBuilder
+              key={`monitor-${selectedDomain?.name ?? ''}`}
+              domain={selectedDomain?.name ?? ''}
+              domainLabel={selectedDomain?.label ?? ''}
+            />
+          </TabsContent>
+        )}
       </Tabs>
     </div>
   );
 }
 
-// Action Log tracker — lists logged actions with decision + track_status and
-// controls to advance open → in_progress → done.
+// Action Log tracker — lists persisted decisions (deduped by product+issue), each
+// row expandable to the full issue / root cause / recommended action detail.
 function ActionLogTracker({ product }: { product: string }) {
   const [rows, setRows] = useState<LoggedAction[]>([]);
   const [loading, setLoading] = useState(false);
   const [scopeToProduct, setScopeToProduct] = useState(true);
+  const [expandedId, setExpandedId] = useState<string | null>(null);
 
   const load = React.useCallback(async () => {
     setLoading(true);
@@ -170,20 +197,13 @@ function ActionLogTracker({ product }: { product: string }) {
     void load();
   }, [load]);
 
-  const advance = async (r: LoggedAction) => {
-    const next: LoggedAction['track_status'] =
-      r.track_status === 'open' ? 'in_progress' : r.track_status === 'in_progress' ? 'done' : 'done';
-    const ok = await updateActionStatus(r.action_id, next as 'open' | 'in_progress' | 'done');
-    if (ok) void load();
-  };
-
   return (
     <Card className="shadow-sm">
       <CardHeader>
         <div className="flex items-center justify-between gap-3">
           <div>
             <CardTitle className="text-base">Action log</CardTitle>
-            <CardDescription>Persisted decisions from jai_action_log — newest first.</CardDescription>
+            <CardDescription>Persisted decisions from jai_action_log — one row per issue (re-deciding updates it), newest first. Click an issue for detail.</CardDescription>
           </div>
           <div className="flex items-center gap-3">
             <label className="flex items-center gap-1.5 text-xs cursor-pointer">
@@ -206,37 +226,53 @@ function ActionLogTracker({ product }: { product: string }) {
             <TableHeader>
               <TableRow>
                 <TableHead>Issue</TableHead>
+                <TableHead>Source</TableHead>
                 <TableHead>Product</TableHead>
                 <TableHead>Decision</TableHead>
-                <TableHead>Track</TableHead>
                 <TableHead>By</TableHead>
-                <TableHead />
+                <TableHead>Decided</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
-              {rows.map((r) => (
-                <TableRow key={r.action_id}>
-                  <TableCell className="max-w-[280px]">
-                    <div className="font-medium truncate">{r.issue}</div>
-                    <div className="text-xs text-muted-foreground truncate">{r.recommended_action}</div>
+              {rows.map((r) => {
+                const open = expandedId === r.action_id;
+                return (
+                <React.Fragment key={r.action_id}>
+                <TableRow className="cursor-pointer" onClick={() => setExpandedId(open ? null : r.action_id)}>
+                  <TableCell className="max-w-[320px]">
+                    <div className="font-medium flex items-center gap-1">
+                      {open ? <ChevronDown className="h-3.5 w-3.5 shrink-0" /> : <ChevronRight className="h-3.5 w-3.5 shrink-0" />}
+                      <span className={open ? '' : 'truncate'}>{r.issue}</span>
+                    </div>
+                  </TableCell>
+                  <TableCell className="text-xs">
+                    {r.source ? <Badge variant="outline" className="text-[10px]">{r.source}</Badge> : null}
                   </TableCell>
                   <TableCell className="text-xs">{r.product}</TableCell>
                   <TableCell>
-                    <Badge variant={r.decision === 'rejected' ? 'outline' : 'default'}>{r.decision}</Badge>
-                  </TableCell>
-                  <TableCell>
-                    <Badge variant="secondary">{r.track_status}</Badge>
+                    <Badge variant={r.decision === 'rejected' ? 'outline' : r.decision === 'modified' ? 'secondary' : 'default'}>{r.decision}</Badge>
                   </TableCell>
                   <TableCell className="text-xs text-muted-foreground">{r.decided_by}</TableCell>
-                  <TableCell>
-                    {r.track_status !== 'done' && (
-                      <Button size="sm" variant="ghost" className="text-xs" onClick={() => advance(r)}>
-                        {r.track_status === 'open' ? 'Start' : 'Complete'}
-                      </Button>
-                    )}
-                  </TableCell>
+                  <TableCell className="text-xs text-muted-foreground">{r.decided_at ?? r.created_at}</TableCell>
                 </TableRow>
-              ))}
+                {open && (
+                  <TableRow>
+                    <TableCell colSpan={6} className="bg-muted/30">
+                      <div className="space-y-1.5 py-1 text-sm">
+                        {r.priority && (
+                          <div><span className="font-semibold">Priority: </span><Badge variant={priorityVariant(r.priority)} className="text-[10px]">{r.priority}</Badge>
+                          {typeof r.confidence === 'number' && <span className="ml-2 text-xs text-muted-foreground">confidence {Math.round((r.confidence ?? 0) * 100)}%</span>}</div>
+                        )}
+                        <div><span className="font-semibold">Issue: </span><span className="text-muted-foreground">{r.issue}</span></div>
+                        <div><span className="font-semibold">Root cause: </span><span className="text-muted-foreground">{r.root_cause || '—'}</span></div>
+                        <div><span className="font-semibold">Recommended action: </span><span className="text-muted-foreground">{r.recommended_action || '—'}</span></div>
+                      </div>
+                    </TableCell>
+                  </TableRow>
+                )}
+                </React.Fragment>
+                );
+              })}
             </TableBody>
           </Table>
         )}
@@ -248,12 +284,16 @@ function ActionLogTracker({ product }: { product: string }) {
 // Data-backed exceptions: for a "Data Avlbl" product, a "Use Data Avlbl" toggle
 // runs the product's exception SQL against the backing schema (server-side) and
 // LLM-enriches each real row into a prioritized action.
+type PlaybookEntry = { root_cause: string; recommended_action: string; source: 'db' | 'guidance' };
 type DataExResult = {
   actions: Record<string, unknown>[];
   stats: Record<string, unknown> | null;
   rows: Record<string, unknown>[];
   llm?: boolean;
   note?: string;
+  sql?: { aggregate?: string; rows?: string };
+  full_count?: number;
+  playbook?: PlaybookEntry[];
 };
 
 function DataExceptionsPanel({
@@ -266,10 +306,28 @@ function DataExceptionsPanel({
   const [useData, setUseData] = useState(true);
   const [loading, setLoading] = useState(false);
   const [showRows, setShowRows] = useState(false);
+  const [showSql, setShowSql] = useState(false);
+  const [allRows, setAllRows] = useState<Record<string, unknown>[] | null>(null);
+  const [loadingRows, setLoadingRows] = useState(false);
   // rehydrate from the per-scope cache so results survive tab navigation
   const [result, setResult] = useState<DataExResult | null>(
     () => getScopeCache<DataExResult>('dataExceptions') ?? null
   );
+  const loadAllRows = async () => {
+    setLoadingRows(true);
+    try {
+      const r = await fetch('/api/exception-rows', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ product: selectedProduct.product_name, limit: 1000 }),
+      });
+      const d = await r.json();
+      setAllRows(Array.isArray(d?.rows) ? d.rows : []);
+      setShowRows(true);
+    } finally {
+      setLoadingRows(false);
+    }
+  };
 
   const generate = async () => {
     setLoading(true);
@@ -285,6 +343,9 @@ function DataExceptionsPanel({
         stats?: Record<string, unknown> | null;
         llm?: boolean;
         reason?: string;
+        sql?: { aggregate?: string; rows?: string };
+        full_count?: number;
+        playbook?: PlaybookEntry[];
       };
       const actions = d.actions ?? [];
       const items: ActionItem[] = actions.map((a, i) => ({
@@ -297,6 +358,7 @@ function DataExceptionsPanel({
         root_cause: String(a.root_cause ?? ''),
         recommended_action: String(a.recommended_action ?? ''),
         confidence: typeof a.confidence === 'number' ? a.confidence : 0.6,
+        llm: Boolean(d.llm), // recommendation is LLM-summarized when the model ran
         status: 'pending',
       }));
       onSeed((prev) => [...items, ...prev.filter((p) => p.source !== 'exception')]);
@@ -305,6 +367,9 @@ function DataExceptionsPanel({
         stats: d.stats ?? null,
         rows: d.rows ?? [],
         llm: d.llm,
+        sql: d.sql,
+        full_count: d.full_count,
+        playbook: d.playbook,
         note: actions.length
           ? `${actions.length} aggregate action(s) from the backing data${d.llm ? ' (LLM-summarized)' : ''}.`
           : `No exceptions returned${d.reason ? ` — ${d.reason}` : ''}.`,
@@ -346,26 +411,82 @@ function DataExceptionsPanel({
         </div>
 
         {stats && (
-          <div className="flex flex-wrap gap-2">
-            {Object.entries(stats).map(([k, v]) => (
-              <Badge key={k} variant="outline" className="font-normal">
-                {k.replace(/_/g, ' ')}: <span className="font-medium ml-1">{String(v)}</span>
-              </Badge>
+          <div className="space-y-1">
+            <div className="flex items-center gap-1.5">
+              <Badge variant="secondary" className="text-[10px]">Data-derived</Badge>
+              <span className="text-[11px] text-muted-foreground">real SQL aggregates over the backing table</span>
+            </div>
+            <div className="flex flex-wrap gap-2">
+              {Object.entries(stats).map(([k, v]) => (
+                <Badge key={k} variant="outline" className="font-normal">
+                  {k.replace(/_/g, ' ')}: <span className="font-medium ml-1">{String(v)}</span>
+                </Badge>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* exact query behind the numbers (drill-through) */}
+        {result?.sql && (
+          <div>
+            <Button size="sm" variant="ghost" className="text-xs gap-1.5" onClick={() => setShowSql((s) => !s)}>
+              <Database className="h-3.5 w-3.5" /> {showSql ? 'Hide' : 'Show'} supporting query
+            </Button>
+            {showSql && (
+              <div className="mt-1 space-y-1">
+                <div className="text-[11px] text-muted-foreground">Aggregate (the stat numbers):</div>
+                <pre className="text-[11px] bg-muted rounded-md p-2 overflow-x-auto whitespace-pre-wrap">{result.sql.aggregate}</pre>
+                <div className="text-[11px] text-muted-foreground">Exception rows:</div>
+                <pre className="text-[11px] bg-muted rounded-md p-2 overflow-x-auto whitespace-pre-wrap">{result.sql.rows}</pre>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* prescriptive playbook — honest DB-backed vs guidance (renders even w/o LLM) */}
+        {result?.playbook && result.playbook.length > 0 && (
+          <div className="rounded-md border p-3 space-y-2">
+            <div className="flex items-center gap-1.5">
+              <span className="text-xs font-medium">Playbook — root cause → action</span>
+              <Badge variant="secondary" className="text-[10px]">AI guidance</Badge>
+            </div>
+            {result.playbook.map((p, i) => (
+              <div key={i} className="text-xs space-y-0.5">
+                <div>
+                  <Badge variant="outline" className={`text-[9px] mr-1 ${p.source === 'db' ? 'text-success' : 'text-muted-foreground'}`}>
+                    {p.source === 'db' ? 'DB-backed' : 'Guidance'}
+                  </Badge>
+                  <span className="text-muted-foreground">Why: </span>{p.root_cause}
+                </div>
+                <div className="pl-1"><span className="text-muted-foreground">Do: </span><span className="font-medium">{p.recommended_action}</span></div>
+              </div>
             ))}
+            <div className="text-[10px] text-muted-foreground">
+              Root cause / recommended action are AI + curated guidance; the counts above are data-derived. Open the attached Genie space (Further analysis panel) to drill deeper.
+            </div>
           </div>
         )}
 
         {result && result.rows.length > 0 && (
           <div>
-            <Button size="sm" variant="ghost" className="text-xs" onClick={() => setShowRows((s) => !s)}>
-              {showRows ? 'Hide' : 'Show'} representative rows ({result.rows.length})
-            </Button>
-            {showRows && (
-              <div className="mt-2 overflow-x-auto rounded-md border">
+            <div className="flex items-center gap-2">
+              <Button size="sm" variant="ghost" className="text-xs" onClick={() => setShowRows((s) => !s)}>
+                {showRows ? 'Hide' : 'Show'} rows ({(allRows ?? result.rows).length}
+                {result.full_count != null && result.full_count > (allRows ?? result.rows).length ? ` of ${result.full_count}` : ''})
+              </Button>
+              {result.full_count != null && !allRows && result.full_count > result.rows.length && (
+                <Button size="sm" variant="ghost" className="text-xs gap-1.5" disabled={loadingRows} onClick={() => void loadAllRows()}>
+                  {loadingRows ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : null}
+                  Load all {result.full_count} exception rows
+                </Button>
+              )}
+            </div>
+            {showRows && (allRows ?? result.rows).length > 0 && (
+              <div className="mt-2 max-h-96 overflow-auto rounded-md border">
                 <table className="text-xs w-full">
                   <thead>
                     <tr className="bg-muted/50">
-                      {Object.keys(result.rows[0]).map((c) => (
+                      {Object.keys((allRows ?? result.rows)[0]).map((c) => (
                         <th key={c} className="text-left px-2 py-1 font-medium">
                           {c}
                         </th>
@@ -373,7 +494,7 @@ function DataExceptionsPanel({
                     </tr>
                   </thead>
                   <tbody>
-                    {result.rows.map((r, i) => (
+                    {(allRows ?? result.rows).map((r, i) => (
                       <tr key={i} className="border-t">
                         {Object.values(r).map((v, j) => (
                           <td key={j} className="px-2 py-1 whitespace-nowrap">
@@ -401,24 +522,20 @@ function FurtherAnalysisPanel({
   schemaLabel,
   domain,
   backingTables,
+  links,
+  onChanged,
 }: {
   product: string;
   schemaLabel: string;
   domain: string;
   backingTables: string[];
+  links: ProductLink[];
+  onChanged: () => void | Promise<void>;
 }) {
-  const [links, setLinks] = useState<ProductLink[]>([]);
   const [showAttach, setShowAttach] = useState(false);
   const [url, setUrl] = useState('');
   const [label, setLabel] = useState('');
   const [note, setNote] = useState<string | null>(null);
-
-  const load = React.useCallback(async () => {
-    setLinks(await fetchProductLinks(product));
-  }, [product]);
-  useEffect(() => {
-    void load();
-  }, [load]);
 
   const attach = async () => {
     if (!url.trim()) return;
@@ -435,14 +552,14 @@ function FurtherAnalysisPanel({
       setLabel('');
       setShowAttach(false);
       setNote('Genie Space attached.');
-      void load();
+      void onChanged();
     } else {
       setNote(`Attach failed: ${r.error ?? 'unknown'}`);
     }
   };
 
   const remove = async (id: string) => {
-    if (await deleteLink(id)) void load();
+    if (await deleteLink(id)) void onChanged();
   };
 
   return (
@@ -657,6 +774,7 @@ function ScenarioPanel({ onActions }: { onActions: (items: ActionItem[]) => void
           root_cause: String(a.root_cause ?? ''),
           recommended_action: String(a.recommended_action ?? ''),
           confidence: typeof a.confidence === 'number' ? a.confidence : 0.5,
+          llm: true, // scenario actions are LLM-prioritized
           status: 'pending',
         }));
         onActions(items);
@@ -723,10 +841,12 @@ function QueueList({
   queue,
   setQueue,
   logCtx,
+  reviewLinks,
 }: {
   queue: ActionItem[];
   setQueue: React.Dispatch<React.SetStateAction<ActionItem[]>>;
   logCtx: LogContext;
+  reviewLinks: ProductLink[];
 }) {
   if (queue.length === 0) {
     return (
@@ -741,7 +861,7 @@ function QueueList({
   return (
     <div className="space-y-3">
       {queue.map((a) => (
-        <ActionCard key={a.id} action={a} setQueue={setQueue} logCtx={logCtx} />
+        <ActionCard key={a.id} action={a} setQueue={setQueue} logCtx={logCtx} reviewLinks={reviewLinks} />
       ))}
     </div>
   );
@@ -757,14 +877,19 @@ function ActionCard({
   action,
   setQueue,
   logCtx,
+  reviewLinks,
 }: {
   action: ActionItem;
   setQueue: React.Dispatch<React.SetStateAction<ActionItem[]>>;
   logCtx: LogContext;
+  reviewLinks: ProductLink[];
 }) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(action.recommended_action);
   const [logNote, setLogNote] = useState<string | null>(null);
+  // single most-relevant investigation link: prefer the Genie space (works for any
+  // exception), else the first dashboard.
+  const primaryLink = reviewLinks.find((l) => l.link_type === 'genie') ?? reviewLinks[0];
 
   const update = (patch: Partial<ActionItem>) =>
     setQueue((prev) => prev.map((q) => (q.id === action.id ? { ...q, ...patch } : q)));
@@ -794,10 +919,28 @@ function ActionCard({
     <Card className="shadow-sm">
       <CardHeader className="pb-2">
         <div className="flex items-start justify-between gap-3">
-          <CardTitle className="text-base flex items-center gap-2">
+          <CardTitle className="text-base flex items-center gap-2 flex-wrap">
             <Badge variant={priorityVariant(action.priority)}>{action.priority}</Badge>
-            {action.source === 'scenario' && <Badge variant="secondary">Scenario</Badge>}
+            {action.source === 'exception' && (
+              <Badge variant="default" className="gap-1">
+                <Database className="h-3 w-3" /> Data exception
+              </Badge>
+            )}
+            {action.source === 'scenario' && (
+              <Badge variant="secondary" className="gap-1">
+                <Zap className="h-3 w-3" /> Scenario
+              </Badge>
+            )}
             {action.source === 'copilot' && <Badge variant="secondary">Copilot</Badge>}
+            {action.llm ? (
+              <Badge variant="outline" className="gap-1 text-[10px] font-normal">
+                <Sparkles className="h-3 w-3" /> AI (LLM) recommendation
+              </Badge>
+            ) : (
+              <Badge variant="secondary" className="gap-1 text-[10px] font-normal">
+                <Database className="h-3 w-3" /> Data-derived (heuristic)
+              </Badge>
+            )}
             <span>{action.issue}</span>
           </CardTitle>
           <StatusBadge status={action.status} />
@@ -831,10 +974,40 @@ function ActionCard({
           )}
         </div>
 
+        {/* honest provenance split: the numbers are data, the prose is guidance */}
+        <div className="flex items-start gap-1.5 text-[11px] text-muted-foreground">
+          <Info className="h-3 w-3 mt-0.5 shrink-0" />
+          <span>
+            Issue, priority{action.opportunity_usd ? ' and $ opportunity' : ''} are{' '}
+            <span className="font-medium">data-derived</span>; root cause and recommended action are{' '}
+            <span className="font-medium">{action.llm ? 'AI (LLM) guidance' : 'heuristic guidance (no model)'}</span> —
+            review before approving.
+          </span>
+        </div>
+
+        {/* one most-relevant investigation link (the product's Genie space is the
+            general-purpose tool for any exception; else a dashboard) — the full set
+            lives once at the top of the page (Further analysis). */}
+        {primaryLink && action.status !== 'approved' && (
+          <div className="flex flex-wrap items-center gap-2 pt-0.5">
+            <span className="text-[11px] text-muted-foreground">Review before approving:</span>
+            <Button
+              size="sm"
+              variant="outline"
+              className="h-7 gap-1.5 text-xs"
+              onClick={() => window.open(primaryLink.url, '_blank')}
+            >
+              {primaryLink.link_type === 'dashboard' ? <Zap className="h-3.5 w-3.5" /> : <MessageSquare className="h-3.5 w-3.5" />}
+              {primaryLink.link_type === 'dashboard' ? 'Open dashboard' : 'Open in Genie'}
+              {primaryLink.label ? ` · ${primaryLink.label}` : ''}
+            </Button>
+          </div>
+        )}
+
         {action.trail && action.status === 'approved' && (
           <div className="rounded-md bg-success/10 border border-success/30 p-2 text-xs space-y-0.5">
             {action.trail.map((t, i) => (
-              <div key={i} className="text-success-foreground/90">
+              <div key={i} className="text-success font-medium">
                 {t}
               </div>
             ))}

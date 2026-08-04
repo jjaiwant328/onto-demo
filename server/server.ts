@@ -1,12 +1,22 @@
 import { createApp, analytics, server, serving, getWorkspaceClient } from '@databricks/appkit';
-import { randomUUID } from 'node:crypto';
+import { randomUUID, createHash } from 'node:crypto';
 import {
   demoExceptionSql,
   demoAggregateSql,
   demoSnapshotSql,
   isDemoProduct,
   DEMO_PRODUCTS,
+  ALL_DEMO_DOMAINS,
+  QSR_SC_REASONING_RULES,
+  QSR_SC_SCHEMA,
+  QSR_SC_MITIGATIONS,
 } from '../shared/demoDomains';
+import {
+  serializeTtl,
+  serializeJsonLd,
+  artifactCounts,
+  type OntologyArtifact,
+} from '../shared/ontologyArtifact';
 import { lbQuery, ensureLakebaseTables, lakebaseConfigured } from './lakebase';
 
 // The serving plugin is wired to a Foundation Model endpoint (alias "llm",
@@ -137,6 +147,20 @@ createApp({
       } catch (err) {
         console.error('[lakebase] action_log migration skipped:', String(err));
       }
+      // One-time clean slate: the log now keys rows by a deterministic hash of
+      // product+issue (act_<16hex>) so re-deciding a regenerated exception upserts
+      // instead of duplicating. Purge legacy random-id rows, which can never dedupe
+      // against the new scheme. Safe & idempotent: new-format ids never match.
+      try {
+        const del = await lbQuery<{ n: string }>(
+          `WITH d AS (DELETE FROM action_log WHERE action_id !~ '^act_[0-9a-f]{16}$' RETURNING 1) ` +
+            `SELECT count(*)::text AS n FROM d`
+        );
+        const n = Number(del[0]?.n ?? '0');
+        if (n > 0) console.log(`[lakebase] purged ${n} legacy action_log row(s)`);
+      } catch (err) {
+        console.error('[lakebase] action_log cleanup skipped:', String(err));
+      }
       try {
         const existing = await lbQuery<{ n: string }>(`SELECT count(*)::text AS n FROM product_links`);
         if (Number(existing[0]?.n ?? '0') === 0) {
@@ -158,6 +182,24 @@ createApp({
         }
       } catch (err) {
         console.error('[lakebase] product_links migration skipped:', String(err));
+      }
+      // seed business rules from the static const on first run (then table is canonical)
+      try {
+        const existing = await lbQuery<{ n: string }>(`SELECT count(*)::text AS n FROM jai_business_rules`);
+        if (Number(existing[0]?.n ?? '0') === 0) {
+          for (const r of QSR_SC_REASONING_RULES) {
+            await lbQuery(
+              `INSERT INTO jai_business_rules (rule_id, domain, name, if_conditions, then_conclusion, concepts, ` +
+                `evidence, enabled, origin, created_at, updated_at) ` +
+                `VALUES ($1,$2,$3,$4,$5,$6,$7, true, 'seed', now(), now()) ON CONFLICT (rule_id) DO NOTHING`,
+              [r.id, r.domain, r.name, JSON.stringify(r.if_conditions), r.then_conclusion,
+               JSON.stringify(r.concepts ?? []), r.evidence ?? '']
+            ).catch((e) => console.error('[lakebase] seed rule failed:', String(e)));
+          }
+          console.log(`[lakebase] seeded ${QSR_SC_REASONING_RULES.length} business rule(s)`);
+        }
+      } catch (err) {
+        console.error('[lakebase] business-rules seed skipped:', String(err));
       }
     };
     void initLakebase();
@@ -256,6 +298,52 @@ createApp({
         const cat = typeof b.catalog_json === 'string' ? b.catalog_json : JSON.stringify(b.catalog_json);
         try {
           await lbQuery(`UPDATE saved_schemas SET catalog_json = $1 WHERE schema_id = $2`, [cat, id]);
+          res.json({ ok: true });
+        } catch (err) {
+          res.json({ ok: false, error: humanizeSqlError(err) });
+        }
+      });
+
+      // ---- Scope-signature-keyed catalog cache (the "AI refining labels" cache) ----
+      // GET returns a previously-refined catalog for a scope sig, or null (miss).
+      // Covers ALL scopes (combined + built-in), not just single saved schemas.
+      app.get('/api/catalog-cache', async (req, res) => {
+        const sig = String(req.query.sig ?? '').trim();
+        if (!sig) {
+          res.json({ catalog: null });
+          return;
+        }
+        try {
+          const rows = await lbQuery<{ catalog_json: string | null }>(
+            `SELECT catalog_json FROM catalog_cache WHERE sig = $1 LIMIT 1`,
+            [sig]
+          );
+          const raw = rows[0]?.catalog_json;
+          if (!raw) {
+            res.json({ catalog: null });
+            return;
+          }
+          res.json({ catalog: typeof raw === 'string' ? JSON.parse(raw) : raw });
+        } catch (err) {
+          res.json({ catalog: null, error: humanizeSqlError(err) });
+        }
+      });
+
+      // POST upserts a refined catalog for a scope sig (called after LLM polish).
+      app.post('/api/catalog-cache', async (req, res) => {
+        const b = (req.body ?? {}) as { sig?: string; catalog_json?: unknown };
+        const sig = String(b.sig ?? '').trim();
+        if (!sig || b.catalog_json == null) {
+          res.status(400).json({ ok: false, error: 'sig and catalog_json required' });
+          return;
+        }
+        const cat = typeof b.catalog_json === 'string' ? b.catalog_json : JSON.stringify(b.catalog_json);
+        try {
+          await lbQuery(
+            `INSERT INTO catalog_cache (sig, catalog_json, created_at) VALUES ($1, $2, now()) ` +
+              `ON CONFLICT (sig) DO UPDATE SET catalog_json = EXCLUDED.catalog_json, created_at = now()`,
+            [sig, cat]
+          );
           res.json({ ok: true });
         } catch (err) {
           res.json({ ok: false, error: humanizeSqlError(err) });
@@ -508,8 +596,36 @@ createApp({
       });
 
       // single-turn LLM completion helper (graceful: returns null if unavailable)
-      const llmComplete = async (prompt: string, maxTokens = 2000): Promise<string | null> => {
+      // LLM completion with a durable response cache. The cache key is a hash of
+      // the exact prompt + token budget: since every caller embeds its inputs in
+      // the prompt, unchanged inputs hit the cache (no model call, no tokens) while
+      // any input change produces a new key and re-runs. Pass { label } for
+      // observability and { cache:false } to force a fresh call.
+      const llmComplete = async (
+        prompt: string,
+        maxTokens = 2000,
+        opts: { cache?: boolean; label?: string } = {}
+      ): Promise<string | null> => {
         if (!hasLlm) return null;
+        const useCache = opts.cache !== false;
+        const cacheKey = `llm_${createHash('sha256').update(`${maxTokens}\n${prompt}`).digest('hex')}`;
+        if (useCache) {
+          try {
+            const hit = await lbQuery<{ response: string }>(
+              `SELECT response FROM jai_llm_cache WHERE cache_key = $1`,
+              [cacheKey]
+            );
+            if (hit[0]?.response != null) {
+              void lbQuery(
+                `UPDATE jai_llm_cache SET hits = hits + 1, last_hit_at = now() WHERE cache_key = $1`,
+                [cacheKey]
+              ).catch(() => {});
+              return hit[0].response;
+            }
+          } catch {
+            /* cache unavailable — fall through to a live call */
+          }
+        }
         try {
           const body = {
             messages: [{ role: 'user', content: prompt }],
@@ -523,7 +639,15 @@ createApp({
           };
           if (r && r.ok === false) return null;
           const payload = r?.data ?? (r as { choices?: { message?: { content?: string } }[] });
-          return payload?.choices?.[0]?.message?.content ?? null;
+          const content = payload?.choices?.[0]?.message?.content ?? null;
+          if (useCache && content != null) {
+            void lbQuery(
+              `INSERT INTO jai_llm_cache (cache_key, label, response, created_at, last_hit_at, hits) ` +
+                `VALUES ($1,$2,$3, now(), now(), 0) ON CONFLICT (cache_key) DO NOTHING`,
+              [cacheKey, opts.label ?? '', content]
+            ).catch(() => {});
+          }
+          return content;
         } catch {
           return null;
         }
@@ -577,7 +701,8 @@ createApp({
         const b = (req.body ?? {}) as { product?: string };
         const product = (b.product ?? '').trim();
         const meta = DEMO_PRODUCTS[product];
-        const aggSql = demoAggregateSql(product);
+        // net out any resolved mitigations so the Action Center count matches the Home
+        const aggSql = netAggregateSql(product, (await activeMitigationPredicates())[product] ?? []);
         const rowSql = demoExceptionSql(product, 8); // a few representative examples
         if (!meta || !aggSql || !rowSql) {
           res.status(400).json({ actions: [], reason: 'not a data-backed product', rows: [], stats: null });
@@ -598,16 +723,24 @@ createApp({
           res.json({ actions: [], rows: [], stats, llm: hasLlm, reason: 'no exceptions found' });
           return;
         }
+        // supporting-data + prescriptive playbook returned on every response so the
+        // panel can drill to the exact query and render guidance even without the LLM
+        const extra = {
+          sql: { aggregate: aggSql, rows: rowSql },
+          full_count: total,
+          playbook: meta.playbook ?? [],
+        };
         if (!hasLlm) {
-          // deterministic fallback: ONE aggregate action from the config framing
+          // deterministic fallback grounded in the curated playbook (renders w/o a model)
+          const pb = meta.playbook ?? [];
           res.json({
             actions: [
               {
                 id: `dx-${product}-agg`,
                 priority: 'HIGH',
                 issue: `${total} exception(s) — ${meta.issue}`,
-                root_cause: 'Aggregate of data-backed exception rows.',
-                recommended_action: meta.action_hint,
+                root_cause: pb[0]?.root_cause ?? 'Aggregate of data-backed exception rows.',
+                recommended_action: pb[0]?.recommended_action ?? meta.action_hint,
                 confidence: 0.6,
                 stats,
               },
@@ -615,9 +748,13 @@ createApp({
             rows,
             stats,
             llm: false,
+            ...extra,
           });
           return;
         }
+        const playbookText = (meta.playbook ?? [])
+          .map((p) => `- (${p.source}) ${p.root_cause} → ${p.recommended_action}`)
+          .join('\n');
         const prompt =
           `You are an ops analyst for the data product "${meta.display_name}" ` +
           `(domain: ${meta.domainLabel}). Below are AGGREGATE stats over the real exception rows ` +
@@ -626,16 +763,19 @@ createApp({
           `"12 DQ tests failing (4 critical) across 5 tables — triage critical failures". Return ONLY a ` +
           `JSON array; each item: {id, priority ("HIGH"|"MEDIUM"|"LOW"), issue, root_cause, ` +
           `recommended_action, confidence (0..1)}. Put the concrete counts in "issue". Bucket priority ` +
-          `by severity/impact. Keep root_cause and recommended_action to one sentence each. A good ` +
-          `action looks like: ${meta.action_hint}\n\nAGGREGATE STATS:\n${JSON.stringify(stats)}\n\n` +
+          `by severity/impact. Keep root_cause and recommended_action to one sentence each. ` +
+          (playbookText
+            ? `GROUND your root_cause/recommended_action in this curated playbook and do not contradict it:\n${playbookText}\n\n`
+            : `A good action looks like: ${meta.action_hint}\n\n`) +
+          `AGGREGATE STATS:\n${JSON.stringify(stats)}\n\n` +
           `REPRESENTATIVE ROWS:\n${JSON.stringify(rows).slice(0, 12000)}`;
         const content = await llmComplete(prompt, 2000);
         const json = extractJsonArray(content ?? '');
         if (json) {
-          res.json({ actions: json.slice(0, 6), rows, stats, llm: true, product });
+          res.json({ actions: json.slice(0, 6), rows, stats, llm: true, product, ...extra });
           return;
         }
-        res.json({ actions: [], rows, stats, llm: false, reason: 'model returned no usable JSON' });
+        res.json({ actions: [], rows, stats, llm: false, reason: 'model returned no usable JSON', ...extra });
       });
 
       // ---- Feature 2: Ontology Copilot ----
@@ -650,6 +790,7 @@ createApp({
           product?: string;
           live?: boolean;
           useData?: boolean;
+          execMode?: boolean; // Executive Copilot — structured exec answer
         };
         const question = (b.question ?? '').trim();
         if (!question) {
@@ -694,11 +835,18 @@ createApp({
           .slice(-6)
           .map((h) => `${h.role}: ${h.content}`)
           .join('\n');
+        const execInstr = b.execMode
+          ? `You are an EXECUTIVE COPILOT for a supply-chain control tower. Structure the answer as ` +
+            `short labeled lines — "Explanation:", "Evidence:" (cite the counts/numbers from the ` +
+            `snapshot), "Recommendation:", "Confidence:" (Low/Medium/High), "Business impact:" (a ` +
+            `qualitative or $ estimate). Keep each to one sentence. `
+          : `Be concise (2-5 sentences). `;
         const prompt =
           `You are the Ontology Copilot for a governed data-product app. Answer the user's question ` +
           `GROUNDED ONLY in the product context (ontology classes, measures/KPIs + formulas, ` +
           `relationships) and any live snapshot provided — do not invent tables, columns, or numbers. ` +
-          `Be concise (2-5 sentences). If the user is asking to DO something operational (e.g. fix a ` +
+          execInstr +
+          `If the user is asking to DO something operational (e.g. fix a ` +
           `store, adjust staffing), you MAY additionally propose ONE action as a fenced \`\`\`json ` +
           `block with {priority, issue, root_cause, recommended_action, confidence}. Otherwise omit it.` +
           `\n\nPRODUCT (${b.product ?? ''}) CONTEXT:\n${b.productContext ?? ''}${snapshot}` +
@@ -735,7 +883,10 @@ createApp({
           return;
         }
         const decidedBy = await whoami();
-        const actionId = `act_${Date.now().toString(36)}_${randomUUID().slice(0, 8)}`;
+        // Deterministic id from product+issue so re-deciding a regenerated (non-
+        // persisted) exception UPSERTS instead of creating a duplicate log row.
+        const dedupKey = `${String(b.product ?? '')}|${String(b.issue ?? '')}`;
+        const actionId = `act_${createHash('sha1').update(dedupKey).digest('hex').slice(0, 16)}`;
         const conf = typeof b.confidence === 'number' ? (b.confidence as number) : Number(b.confidence) || 0;
         try {
           await lbQuery(
@@ -743,7 +894,11 @@ createApp({
               `(action_id, created_at, updated_at, schema_label, domain, product, source, priority, ` +
               `issue, root_cause, recommended_action, confidence, decision, track_status, decided_by, ` +
               `decided_at, ref_entity, notes) VALUES (` +
-              `$1, now(), now(), $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'open', $12, now(), $13, $14)`,
+              `$1, now(), now(), $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'open', $12, now(), $13, $14) ` +
+              `ON CONFLICT (action_id) DO UPDATE SET updated_at = now(), priority = EXCLUDED.priority, ` +
+              `root_cause = EXCLUDED.root_cause, recommended_action = EXCLUDED.recommended_action, ` +
+              `confidence = EXCLUDED.confidence, decision = EXCLUDED.decision, decided_by = EXCLUDED.decided_by, ` +
+              `decided_at = now()`,
             [
               actionId,
               String(b.schema_label ?? ''),
@@ -891,16 +1046,22 @@ createApp({
           action?: string;
           value?: unknown;
         };
-        const kinds = ['entity', 'relationship', 'mapping', 'edge_status'];
-        const actions = ['rename', 'merge', 'set_role', 'set_pii', 'delete', 'confirm', 'reject'];
+        const kinds = ['entity', 'relationship', 'mapping', 'edge_status', 'glossary', 'suggest_status'];
+        const actions = ['rename', 'merge', 'set_role', 'set_pii', 'delete', 'confirm', 'reject', 'add', 'define'];
         if (!b.schema_label || !kinds.includes(String(b.kind)) || !actions.includes(String(b.action)) || !b.ref) {
           res.status(400).json({ ok: false, error: 'schema_label, kind, action, ref required' });
           return;
         }
         const createdBy = await whoami();
         const value = b.value == null ? '' : typeof b.value === 'string' ? b.value : JSON.stringify(b.value);
-        // deterministic id so the same target+action upserts in place
-        const id = `ov_${Buffer.from(`${b.schema_label}|${b.product ?? ''}|${b.kind}|${b.ref}|${b.action}`).toString('base64url').slice(0, 48)}`;
+        // deterministic id so the same target+action upserts in place. Hash the
+        // FULL key (not a truncated base64 of it): long schema labels used to push
+        // kind/ref/action past a 48-char cut-off, collapsing every override for a
+        // schema+product to one id so they clobbered each other via ON CONFLICT.
+        const id = `ov_${createHash('sha256')
+          .update(`${b.schema_label}|${b.product ?? ''}|${b.kind}|${b.ref}|${b.action}`)
+          .digest('hex')
+          .slice(0, 48)}`;
         try {
           await lbQuery(
             `INSERT INTO ontology_overrides (id, schema_label, product, kind, ref, action, value, created_by, created_at) ` +
@@ -955,6 +1116,2235 @@ createApp({
           res.json({ ok: false, error: String(err) });
         }
       });
+
+      // ---- B) LLM-suggested relationships the shared-key heuristic missed ----
+      // Body: { product, componentsSummary, tables:[{table, columns:[]}] }.
+      // Returns sanitized [{from,to,predicate,column,rationale,confidence}] that
+      // only reference tables/columns present in `tables`. [] if LLM unavailable.
+      app.post('/api/suggest-relationships', async (req, res) => {
+        const b = (req.body ?? {}) as {
+          product?: string;
+          componentsSummary?: string;
+          tables?: { table: string; columns: string[] }[];
+        };
+        const tables = Array.isArray(b.tables) ? b.tables : [];
+        if (!hasLlm || tables.length < 2) {
+          res.json({ suggestions: [], llm: hasLlm, reason: hasLlm ? 'need >=2 tables' : 'no serving endpoint' });
+          return;
+        }
+        const tableCols = new Map<string, Set<string>>();
+        for (const t of tables) tableCols.set(t.table, new Set((t.columns ?? []).map((c) => String(c))));
+        const shape = tables
+          .map((t) => `${t.table}: ${(t.columns ?? []).slice(0, 30).join(', ')}`)
+          .join('\n')
+          .slice(0, 12000);
+        const prompt =
+          `You are a data modeler. Below are the REAL tables and columns of the data product ` +
+          `"${b.product}". Propose plausible JOIN relationships (foreign keys) that a naive shared-` +
+          `key match would MISS — e.g. semantically-equivalent column names (customer_id ↔ cust_id), ` +
+          `or a dimension key referenced under a different name. ONLY use tables and columns listed ` +
+          `below; do NOT invent any. Return ONLY a JSON array; each item: ` +
+          `{from (table), to (table), predicate (short label), column (the join column on 'from'), ` +
+          `toColumn (the matching column on 'to' — may differ in name from column), ` +
+          `rationale (one sentence), confidence (0..1)}.\n\nTABLES:\n${shape}`;
+        const content = await llmComplete(prompt, 2000);
+        const raw = extractJsonArray(content ?? '') ?? [];
+        // sanitize: keep only suggestions referencing real tables (drop hallucinations)
+        const suggestions = raw
+          .map((s) => {
+            const column = String(s.column ?? '');
+            // fall back to the from-column name when the LLM omits toColumn
+            const toColumn = String(s.toColumn ?? s.to_column ?? column);
+            return {
+              from: String(s.from ?? ''),
+              to: String(s.to ?? ''),
+              predicate: String(s.predicate ?? s.column ?? 'related'),
+              column,
+              toColumn,
+              rationale: String(s.rationale ?? ''),
+              confidence: typeof s.confidence === 'number' ? s.confidence : 0.4,
+            };
+          })
+          .filter(
+            (s) =>
+              s.from &&
+              s.to &&
+              s.from !== s.to &&
+              tableCols.has(s.from) &&
+              tableCols.has(s.to) &&
+              // named columns must exist on their respective tables
+              (!s.column || tableCols.get(s.from)!.has(s.column)) &&
+              (!s.toColumn || tableCols.get(s.to)!.has(s.toColumn))
+          )
+          .slice(0, 12);
+        res.json({ suggestions, llm: true });
+      });
+
+      // ---- C) Validate ontology against live warehouse data (opt-in) ----
+      // Body: { product, tables:[<catalog.schema.table>], relationships:[{from,to,column}] }
+      // Returns per-table row_count + per-key null/distinct %, per-FK join hit-rate.
+      // Per-target errors (inaccessible catalog) are caught → "no access".
+      app.post('/api/validate-ontology', async (req, res) => {
+        const b = (req.body ?? {}) as {
+          product?: string;
+          tables?: { table: string; keys?: string[] }[];
+          // `column` is the shared-name fallback; fromColumn/toColumn let a FK
+          // join differently-named keys (e.g. cust_id ↔ customer_id).
+          relationships?: {
+            from: string;
+            to: string;
+            column: string;
+            fromColumn?: string;
+            toColumn?: string;
+          }[];
+        };
+        // Caps keep one request bounded, but a silently-truncated run would report
+        // "validated" while only covering part of the ontology — the exact thing this
+        // feature exists to prevent. Record what was dropped and return it so the UI
+        // can say the coverage is partial.
+        const MAX_TABLES = 40;
+        const MAX_KEYS_PER_TABLE = 8;
+        const MAX_RELS = 40;
+        const allTables = Array.isArray(b.tables) ? b.tables : [];
+        const allRels = Array.isArray(b.relationships) ? b.relationships : [];
+        const tables = allTables.slice(0, MAX_TABLES);
+        const rels = allRels.slice(0, MAX_RELS);
+        const truncatedKeyTables: string[] = [];
+        const okIdent = (t: string) => /^[A-Za-z0-9_]+(\.[A-Za-z0-9_]+){1,2}$/.test(t);
+        const okCol = (c: string) => /^[A-Za-z0-9_]+$/.test(c);
+
+        // ONE query per table for the row count AND every key's null/distinct stats.
+        // This used to issue 1 + one-per-key statements serially, so a 40-table
+        // product with 8 keys each meant 360 sequential round-trips (~10 min on a
+        // warm warehouse) before the join probes even started.
+        const validateTable = async (t: {
+          table: string;
+          keys?: string[];
+        }): Promise<Record<string, unknown>> => {
+          if (!okIdent(t.table)) return { table: t.table, error: 'invalid identifier' };
+          const keys = (t.keys ?? []).filter(okCol);
+          if (keys.length > MAX_KEYS_PER_TABLE) truncatedKeyTables.push(t.table);
+          const use = keys.slice(0, MAX_KEYS_PER_TABLE);
+          // aliases are positional (k0_nn/k0_dc) so a column name can never collide
+          // with our own output names; identifiers are already allowlisted above.
+          const selects = [
+            'count(*) AS total',
+            ...use.flatMap((k, i) => [
+              `count(${k}) AS k${i}_nn`,
+              `approx_count_distinct(${k}) AS k${i}_dc`,
+            ]),
+          ];
+          const pct = (part: number, total: number) =>
+            total ? Math.round((part / total) * 1000) / 10 : 0;
+          try {
+            const rows = await runSql(`SELECT ${selects.join(', ')} FROM ${t.table}`);
+            const row = rows[0] ?? {};
+            const total = Number(row.total ?? 0) || 0;
+            const keyStats = use.map((k, i) => {
+              const nonNull = Number(row[`k${i}_nn`] ?? 0) || 0;
+              const distinct = Number(row[`k${i}_dc`] ?? 0) || 0;
+              return {
+                column: k,
+                null_pct: pct(total - nonNull, total),
+                distinct_pct: pct(distinct, total),
+              };
+            });
+            return { table: t.table, row_count: total, keys: keyStats };
+          } catch {
+            // The batch is all-or-nothing: one stale/renamed key column fails the whole
+            // statement and would blank the table's stats. Fall back to profiling each
+            // key on its own so the good columns still report and the bad one is named.
+            let total = 0;
+            try {
+              const cnt = await runSql(`SELECT count(*) AS n FROM ${t.table}`);
+              total = Number((cnt[0]?.n ?? cnt[0]?.N) ?? 0) || 0;
+            } catch (e) {
+              return { table: t.table, error: humanizeSqlError(e) || 'no access / cannot validate' };
+            }
+            const keyStats: Record<string, unknown>[] = [];
+            for (const k of use) {
+              try {
+                const s = await runSql(
+                  `SELECT count(${k}) AS nn, approx_count_distinct(${k}) AS dc FROM ${t.table}`
+                );
+                const nonNull = Number(s[0]?.nn ?? 0) || 0;
+                const distinct = Number(s[0]?.dc ?? 0) || 0;
+                keyStats.push({
+                  column: k,
+                  null_pct: pct(total - nonNull, total),
+                  distinct_pct: pct(distinct, total),
+                });
+              } catch (e) {
+                keyStats.push({ column: k, error: humanizeSqlError(e) });
+              }
+            }
+            return { table: t.table, row_count: total, keys: keyStats };
+          }
+        };
+
+        const validateRel = async (r: {
+          from: string;
+          to: string;
+          column: string;
+          fromColumn?: string;
+          toColumn?: string;
+        }): Promise<Record<string, unknown>> => {
+          // fromColumn lives on the child (from) table, toColumn on the parent
+          // (to). Both default to `column` for same-named heuristic FKs.
+          const fromCol = r.fromColumn || r.column;
+          const toCol = r.toColumn || r.column;
+          if (!okIdent(r.from) || !okIdent(r.to) || !okCol(fromCol) || !okCol(toCol)) {
+            return { ...r, error: 'invalid identifier' };
+          }
+          try {
+            // hit-rate = fraction of child (from) rows whose key matches a parent (to) row
+            const q =
+              `SELECT count(*) AS child_rows, ` +
+              `count(p.k) AS matched FROM ${r.from} c ` +
+              `LEFT JOIN (SELECT DISTINCT ${toCol} AS k FROM ${r.to}) p ON c.${fromCol} = p.k ` +
+              `WHERE c.${fromCol} IS NOT NULL`;
+            const s = await runSql(q);
+            const child = Number(s[0]?.child_rows ?? 0) || 0;
+            const matched = Number(s[0]?.matched ?? 0) || 0;
+            return {
+              from: r.from,
+              to: r.to,
+              column: r.column,
+              from_column: fromCol,
+              to_column: toCol,
+              hit_rate: child ? Math.round((matched / child) * 1000) / 10 : null,
+              child_rows: child,
+            };
+          } catch (e) {
+            return { ...r, error: humanizeSqlError(e) || 'no access / cannot validate' };
+          }
+        };
+
+        // The probes are independent, so run them with bounded concurrency instead of
+        // strictly serially — but keep the bound low so a validation run can't
+        // saturate a shared warehouse.
+        const CONCURRENCY = 4;
+        const mapLimit = async <I, O>(items: I[], fn: (item: I) => Promise<O>): Promise<O[]> => {
+          const out: O[] = new Array(items.length) as O[];
+          let next = 0;
+          const worker = async (): Promise<void> => {
+            for (;;) {
+              const i = next++;
+              if (i >= items.length) return;
+              out[i] = await fn(items[i]);
+            }
+          };
+          await Promise.all(
+            Array.from({ length: Math.min(CONCURRENCY, items.length) }, () => worker())
+          );
+          return out;
+        };
+
+        const [tableResults, relResults] = await Promise.all([
+          mapLimit(tables, validateTable),
+          mapLimit(rels, validateRel),
+        ]);
+
+        // Partial coverage must never read as a clean bill of health.
+        const truncated =
+          allTables.length > tables.length ||
+          allRels.length > rels.length ||
+          truncatedKeyTables.length > 0
+            ? {
+                tables_checked: tables.length,
+                tables_total: allTables.length,
+                relationships_checked: rels.length,
+                relationships_total: allRels.length,
+                max_keys_per_table: MAX_KEYS_PER_TABLE,
+                tables_with_extra_keys: [...new Set(truncatedKeyTables)],
+              }
+            : null;
+
+        res.json({
+          product: b.product,
+          tables: tableResults,
+          relationships: relResults,
+          truncated,
+        });
+      });
+
+      // ---- D) Dry-run a generated serving-view's SELECT against the warehouse ----
+      // Body: { sql } — the full generated `CREATE ... VIEW ... AS <select>;`.
+      // We strip the DDL wrapper + comments and EXPLAIN the SELECT so the planner
+      // resolves every column/join WITHOUT creating the view or scanning data.
+      // Returns { ok, error? } so the UI can prove the DDL will run before anyone
+      // copies it. Read-only: only EXPLAIN of a single SELECT is allowed.
+      app.post('/api/verify-view-sql', async (req, res) => {
+        const raw = String((req.body as { sql?: string })?.sql ?? '');
+        // drop line comments, then take the body after the first `AS`, minus `;`
+        const noComments = raw.replace(/^\s*--.*$/gm, '').trim();
+        const asMatch = noComments.match(/\bAS\b([\s\S]*)$/i);
+        const select = (asMatch ? asMatch[1] : noComments).trim().replace(/;\s*$/, '');
+        if (!/^select\b/i.test(select)) {
+          res.json({ ok: false, error: 'No SELECT body found to verify.' });
+          return;
+        }
+        // reject anything that could mutate — EXPLAIN of one read-only SELECT only
+        if (/;|\b(insert|update|delete|drop|create|alter|merge|grant|truncate)\b/i.test(select)) {
+          res.json({ ok: false, error: 'Only a single read-only SELECT can be verified.' });
+          return;
+        }
+        try {
+          const rows = await runSql(`EXPLAIN ${select}`);
+          // DBSQL EXPLAIN may embed an analysis error in the plan text instead
+          // of failing the statement — inspect the returned plan for errors.
+          const plan = rows.map((r) => Object.values(r).join(' ')).join('\n');
+          if (/AnalysisException|cannot be resolved|UNRESOLVED_COLUMN|UnresolvedRelation|TABLE_OR_VIEW_NOT_FOUND/i.test(plan)) {
+            // reuse humanizeSqlError so unresolved tables get the friendly message
+            res.json({ ok: false, error: humanizeSqlError(plan) });
+            return;
+          }
+          res.json({ ok: true });
+        } catch (e) {
+          res.json({ ok: false, error: humanizeSqlError(e) || 'verification failed' });
+        }
+      });
+
+      // ======================================================================
+      // Domain-level MONITORING JOB builder (Action Center).
+      // Aggregate-only by construction: computation runs ONLY demoAggregateSql
+      // (one summary row per product) and stores results in jai_monitor_run,
+      // which has NO decision/recommendation columns. It never proposes or takes
+      // action — that stays in action_log. Everything keys on `domain`.
+      // ======================================================================
+      const monitorJobId = (domain: string) => `jai_monitor_${domain}`;
+      const monitorJobName = (domain: string) => `jai_monitor_${domain}_daily`;
+      const monitorDomain = (name: string) => ALL_DEMO_DOMAINS.find((d) => d.name === name);
+      // the aggregate column aliases a product's aggregate_select emits (AS <key>)
+      const metricKeys = (productName: string): string[] => {
+        const sql = demoAggregateSql(productName) ?? '';
+        const keys: string[] = [];
+        const re = /\bAS\s+([A-Za-z0-9_]+)/gi;
+        let m: RegExpExecArray | null;
+        while ((m = re.exec(sql)) !== null) keys.push(m[1]);
+        return keys;
+      };
+
+      // Shared run helper — mirrored by the Phase-2 scheduled Databricks Job.
+      // Loops all products in the domain, runs the aggregate SQL, and upserts one
+      // jai_monitor_run row per (job, product, day). Returns per-product results.
+      const runMonitorJob = async (
+        domain: string,
+        trigger: 'scheduled' | 'on_demand'
+      ): Promise<{ ok: boolean; run_id?: string; results?: Record<string, unknown>[]; error?: string }> => {
+        const dom = monitorDomain(domain);
+        if (!dom) return { ok: false, error: 'unknown domain' };
+        const jobId = monitorJobId(domain);
+        const runDate = new Date().toISOString().slice(0, 10);
+        // run-level id for the response; each stored row gets its own unique id
+        // (run_id is the table PK, so it must be unique per product row).
+        const runId = `jai_run_${Date.now().toString(36)}_${randomUUID().slice(0, 8)}`;
+
+        // 1) compute aggregate stats per product
+        const results: Record<string, unknown>[] = [];
+        for (const p of dom.products) {
+          const aggSql = demoAggregateSql(p.product_name);
+          if (!aggSql) {
+            results.push({ product: p.product_name, status: 'error', error: 'no aggregate SQL' });
+            continue;
+          }
+          try {
+            const rows = await runSql(aggSql);
+            const stats = rows[0] ?? {};
+            // headline count = first numeric aggregate column (generalizes across domains)
+            const firstNum = Object.values(stats).find((v) => typeof v === 'number' || (!isNaN(Number(v)) && v !== null && v !== ''));
+            const total = Number(firstNum ?? 0) || 0;
+            results.push({
+              product: p.product_name,
+              display_name: p.display_name,
+              status: total > 0 ? 'breach' : 'ok',
+              exception_total: total,
+              metrics: stats,
+            });
+          } catch (e) {
+            results.push({ product: p.product_name, status: 'error', error: humanizeSqlError(e) });
+          }
+        }
+
+        // 2) optional ONE domain-level narrative (aggregate-only; no actions).
+        // Best-effort: an LLM failure must NOT abort the run (the aggregate counts
+        // are the real deliverable) — otherwise the whole request 500s as HTML.
+        let llmSummary: string | null = null;
+        if (hasLlm) {
+          try {
+            const prompt =
+              `You are a monitoring analyst for the "${dom.label}" domain. Below are AGGREGATE health ` +
+              `metrics for each data product (one summary row each). Write a 1-2 sentence AGGREGATE status ` +
+              `summary of the domain's health — cite the key counts. Do NOT propose actions, do NOT resolve ` +
+              `anything, do NOT list individual rows. Plain text only.\n\n${JSON.stringify(results).slice(0, 8000)}`;
+            llmSummary = await llmComplete(prompt, 400);
+          } catch {
+            llmSummary = null;
+          }
+        }
+
+        // 3) upsert one row per product (idempotent per day)
+        try {
+          for (const r of results) {
+            await lbQuery(
+              `INSERT INTO jai_monitor_run (run_id, job_id, domain, run_ts, run_date, trigger, product, ` +
+                `metrics_json, exception_total, status, error, llm_summary, created_at) ` +
+                `VALUES ($1,$2,$3, now(), $4::date, $5, $6, $7, $8, $9, $10, $11, now()) ` +
+                `ON CONFLICT (job_id, product, run_date) DO UPDATE SET ` +
+                `run_id = EXCLUDED.run_id, run_ts = EXCLUDED.run_ts, trigger = EXCLUDED.trigger, ` +
+                `metrics_json = EXCLUDED.metrics_json, exception_total = EXCLUDED.exception_total, ` +
+                `status = EXCLUDED.status, error = EXCLUDED.error, llm_summary = EXCLUDED.llm_summary`,
+              [
+                `${runId}_${String(r.product)}`,
+                jobId,
+                domain,
+                runDate,
+                trigger,
+                String(r.product),
+                JSON.stringify(r.metrics ?? {}),
+                Number(r.exception_total ?? 0) || 0,
+                String(r.status ?? 'ok'),
+                r.error ? String(r.error) : null,
+                llmSummary,
+              ]
+            );
+          }
+        } catch (e) {
+          return { ok: false, error: humanizeSqlError(e) };
+        }
+        return { ok: true, run_id: runId, results };
+      };
+
+      // GET saved definition for a domain (or null).
+      app.get('/api/monitor-job', async (req, res) => {
+        const domain = String(req.query.domain ?? '').trim();
+        if (!domain) {
+          res.json({ job: null });
+          return;
+        }
+        try {
+          const rows = await lbQuery(
+            `SELECT job_id, domain, domain_label, job_name, schedule_cron, schedule_tz, products_json, ` +
+              `aggregates_json, summary_prompt, enabled, version, created_by, ` +
+              `to_char(updated_at, 'YYYY-MM-DD HH24:MI:SS') AS updated_at ` +
+              `FROM jai_monitor_job WHERE domain = $1 LIMIT 1`,
+            [domain]
+          );
+          res.json({ job: rows[0] ?? null });
+        } catch (err) {
+          res.json({ job: null, error: humanizeSqlError(err) });
+        }
+      });
+
+      // Upsert (save/revise) a domain's monitoring definition; bumps version.
+      app.post('/api/monitor-job', async (req, res) => {
+        const b = (req.body ?? {}) as {
+          domain?: string;
+          schedule_cron?: string;
+          schedule_tz?: string;
+          aggregates_json?: unknown;
+          summary_prompt?: string;
+          enabled?: boolean;
+        };
+        const domain = String(b.domain ?? '').trim();
+        const dom = monitorDomain(domain);
+        if (!dom) {
+          res.status(400).json({ ok: false, error: 'unknown or non-data-backed domain' });
+          return;
+        }
+        const jobId = monitorJobId(domain);
+        const jobName = monitorJobName(domain);
+        const products = dom.products.map((p) => p.product_name);
+        const agg =
+          b.aggregates_json == null
+            ? '[]'
+            : typeof b.aggregates_json === 'string'
+              ? b.aggregates_json
+              : JSON.stringify(b.aggregates_json);
+        try {
+          const who = await whoami();
+          const rows = await lbQuery<{ version: number }>(
+            `INSERT INTO jai_monitor_job (job_id, domain, domain_label, job_name, schedule_cron, schedule_tz, ` +
+              `products_json, aggregates_json, summary_prompt, enabled, version, created_by, created_at, updated_at) ` +
+              `VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10, 1, $11, now(), now()) ` +
+              `ON CONFLICT (domain) DO UPDATE SET ` +
+              `job_name = EXCLUDED.job_name, schedule_cron = EXCLUDED.schedule_cron, ` +
+              `schedule_tz = EXCLUDED.schedule_tz, products_json = EXCLUDED.products_json, ` +
+              `aggregates_json = EXCLUDED.aggregates_json, summary_prompt = EXCLUDED.summary_prompt, ` +
+              `enabled = EXCLUDED.enabled, version = jai_monitor_job.version + 1, updated_at = now() ` +
+              `RETURNING version`,
+            [
+              jobId,
+              domain,
+              dom.label,
+              jobName,
+              String(b.schedule_cron ?? '0 0 7 * * ?'),
+              String(b.schedule_tz ?? 'America/New_York'),
+              JSON.stringify(products),
+              agg,
+              b.summary_prompt ? String(b.summary_prompt) : null,
+              b.enabled === false ? false : true,
+              who,
+            ]
+          );
+          res.json({ ok: true, job_id: jobId, job_name: jobName, version: rows[0]?.version ?? 1 });
+        } catch (err) {
+          res.json({ ok: false, error: humanizeSqlError(err) });
+        }
+      });
+
+      // Chat builder — helps the user assemble an AGGREGATE monitoring spec.
+      // Guardrailed: may only propose metrics/thresholds, never actions.
+      app.post('/api/monitor-chat', async (req, res) => {
+        const b = (req.body ?? {}) as {
+          domain?: string;
+          question?: string;
+          history?: { role: string; content: string }[];
+          currentSpec?: unknown;
+        };
+        const dom = monitorDomain(String(b.domain ?? ''));
+        if (!dom) {
+          res.status(400).json({ answer: 'Unknown domain.', spec: null });
+          return;
+        }
+        if (!hasLlm) {
+          res.json({ answer: 'The assistant is unavailable (no serving endpoint configured).', spec: null, llm: false });
+          return;
+        }
+        const catalog = dom.products
+          .map((p) => `- ${p.product_name} (${p.display_name}): metrics [${metricKeys(p.product_name).join(', ')}]`)
+          .join('\n');
+        const hist = Array.isArray(b.history)
+          ? b.history.slice(-6).map((h) => `${h.role}: ${h.content}`).join('\n')
+          : '';
+        const prompt =
+          `You are helping define a DAILY AGGREGATE monitoring job for the "${dom.label}" domain. It runs ` +
+          `across ALL products in the domain and stores only aggregate counts — it must NEVER resolve issues, ` +
+          `take action, or reference individual rows. Your job is ONLY to help the user choose which aggregate ` +
+          `metrics (and optional numeric thresholds) to watch per product.\n\n` +
+          `AVAILABLE PRODUCTS AND METRIC KEYS (use ONLY these keys):\n${catalog}\n\n` +
+          (b.currentSpec ? `CURRENT SPEC:\n${JSON.stringify(b.currentSpec).slice(0, 4000)}\n\n` : '') +
+          (hist ? `CONVERSATION:\n${hist}\n\n` : '') +
+          `USER: ${String(b.question ?? '')}\n\n` +
+          `Reply with a short plain-text explanation, then a fenced \`\`\`json block containing the updated spec: ` +
+          `{"aggregates":[{"product_name","metrics":[{"key","label"}],"threshold":{"metric","op":">"|">="|"<"|"<=","value":number}?}]}. ` +
+          `Only include products/metric keys from the list above.`;
+        try {
+          const content = await llmComplete(prompt, 1500);
+          const spec = extractJsonObject(content ?? '');
+          // strip the fenced json from the displayed answer
+          const answer = (content ?? '').replace(/```(?:json)?[\s\S]*?```/g, '').trim() || 'Updated the monitoring spec below.';
+          res.json({ answer, spec: spec ?? null, llm: true });
+        } catch (err) {
+          res.json({ answer: `The assistant hit an error: ${humanizeSqlError(err)}`, spec: null, llm: false });
+        }
+      });
+
+      // Run the domain's aggregates now (on-demand) and store the results.
+      app.post('/api/monitor-run', async (req, res) => {
+        const b = (req.body ?? {}) as { domain?: string; trigger?: string };
+        const trigger = b.trigger === 'scheduled' ? 'scheduled' : 'on_demand';
+        try {
+          const out = await runMonitorJob(String(b.domain ?? ''), trigger);
+          res.json(out);
+        } catch (err) {
+          res.json({ ok: false, error: humanizeSqlError(err) });
+        }
+      });
+
+      // List recent run outputs for a domain (newest first).
+      app.get('/api/monitor-runs', async (req, res) => {
+        const domain = String(req.query.domain ?? '').trim();
+        const limit = Math.min(Math.max(Number(req.query.limit ?? 60) || 60, 1), 500);
+        if (!domain) {
+          res.json({ runs: [] });
+          return;
+        }
+        try {
+          const rows = await lbQuery(
+            `SELECT run_id, job_id, domain, to_char(run_ts, 'YYYY-MM-DD HH24:MI:SS') AS run_ts, ` +
+              `to_char(run_date, 'YYYY-MM-DD') AS run_date, trigger, product, metrics_json, ` +
+              `exception_total, status, error, llm_summary ` +
+              `FROM jai_monitor_run WHERE domain = $1 ORDER BY run_ts DESC LIMIT ${limit}`,
+            [domain]
+          );
+          res.json({ runs: rows });
+        } catch (err) {
+          res.json({ runs: [], error: humanizeSqlError(err) });
+        }
+      });
+
+      // Preview the generated aggregate SQL per product (no execution).
+      app.get('/api/monitor-preview', (req, res) => {
+        const dom = monitorDomain(String(req.query.domain ?? ''));
+        if (!dom) {
+          res.json({ products: [] });
+          return;
+        }
+        res.json({
+          job_name: monitorJobName(dom.name),
+          products: dom.products.map((p) => ({
+            product_name: p.product_name,
+            display_name: p.display_name,
+            metric_keys: metricKeys(p.product_name),
+            sql: demoAggregateSql(p.product_name),
+          })),
+        });
+      });
+
+      // Build the aggregate-monitoring notebook source (Python) for a domain: runs
+      // each product's aggregate SQL and appends a summary row to a Delta results
+      // table. Aggregate-only — mirrors the on-demand run, never row detail/actions.
+      const buildMonitorNotebook = (domain: string, jobId: string): string => {
+        const dom = monitorDomain(domain);
+        const queries: Record<string, string> = {};
+        for (const p of dom?.products ?? []) {
+          const sql = demoAggregateSql(p.product_name);
+          if (sql) queries[p.product_name] = sql;
+        }
+        return [
+          '# Databricks notebook source',
+          `# Auto-generated by RT_onto — daily AGGREGATE monitoring for domain "${domain}".`,
+          '# Aggregate-only: one summary row per product; no row detail, no actions.',
+          'from datetime import datetime',
+          'import json',
+          '',
+          'RESULTS_TABLE = "jai_ontos.demo_schema.jai_monitor_run_scheduled"',
+          `DOMAIN = ${JSON.stringify(domain)}`,
+          `JOB_ID = ${JSON.stringify(jobId)}`,
+          `QUERIES = json.loads(r'''${JSON.stringify(queries)}''')`,
+          '',
+          'spark.sql(f"""CREATE TABLE IF NOT EXISTS {RESULTS_TABLE} (',
+          '  run_id string, job_id string, domain string, run_ts timestamp, run_date date,',
+          '  trigger string, product string, metrics_json string, exception_total bigint,',
+          '  status string, error string) USING delta""")',
+          '',
+          'run_ts = datetime.utcnow()',
+          'run_id = "jai_run_" + run_ts.strftime("%Y%m%d%H%M%S")',
+          'rows = []',
+          'for product, sql in QUERIES.items():',
+          '    try:',
+          '        rec = spark.sql(sql).limit(1).collect()',
+          '        stats = rec[0].asDict() if rec else {}',
+          '        total = 0',
+          '        for v in stats.values():',
+          '            try:',
+          '                total = int(float(v)); break',
+          '            except Exception:',
+          '                pass',
+          '        rows.append((run_id+"_"+product, JOB_ID, DOMAIN, run_ts, run_ts.date(), "scheduled",',
+          '                     product, json.dumps({k: str(v) for k, v in stats.items()}), total,',
+          '                     "breach" if total > 0 else "ok", None))',
+          '    except Exception as e:',
+          '        rows.append((run_id+"_"+product, JOB_ID, DOMAIN, run_ts, run_ts.date(), "scheduled",',
+          '                     product, "{}", 0, "error", str(e)[:500]))',
+          'cols = ["run_id","job_id","domain","run_ts","run_date","trigger","product","metrics_json","exception_total","status","error"]',
+          'spark.createDataFrame(rows, cols).write.mode("append").saveAsTable(RESULTS_TABLE)',
+          'print(f"monitor run {run_id}: wrote {len(rows)} product row(s) to {RESULTS_TABLE}")',
+          '',
+        ].join('\n');
+      };
+
+      // Deploy the saved monitoring definition as a REAL scheduled Databricks Job:
+      // import a generated notebook to the workspace, then create/update a serverless
+      // Job with the quartz cron schedule. Persists the job id/url on jai_monitor_job.
+      app.post('/api/monitor-deploy-job', async (req, res) => {
+        const b = (req.body ?? {}) as { domain?: string };
+        const domain = String(b.domain ?? '').trim();
+        const dom = monitorDomain(domain);
+        if (!dom) {
+          res.status(400).json({ ok: false, error: 'unknown or non-data-backed domain' });
+          return;
+        }
+        const jobId = monitorJobId(domain);
+        const jobName = monitorJobName(domain);
+        try {
+          // read the saved definition (schedule + existing databricks job, if any)
+          const saved = await lbQuery<{ schedule_cron: string; schedule_tz: string; databricks_job_id: string | null }>(
+            `SELECT schedule_cron, schedule_tz, databricks_job_id FROM jai_monitor_job WHERE domain = $1`,
+            [domain]
+          );
+          if (!saved[0]) {
+            res.json({ ok: false, error: 'Save the monitoring definition first, then deploy.' });
+            return;
+          }
+          const cron = saved[0].schedule_cron || '0 0 7 * * ?';
+          const tz = saved[0].schedule_tz || 'America/New_York';
+          const who = (await whoami()) || 'unknown';
+          const nbDir = `/Users/${who}/jai_monitor`;
+          const nbPath = `${nbDir}/${jobName}`;
+
+          // 1) import the notebook (create the parent dir, then overwrite the file)
+          await authFetch('/api/2.0/workspace/mkdirs', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            rawBody: JSON.stringify({ path: nbDir }),
+          }).catch(() => {});
+          const nbContent = Buffer.from(buildMonitorNotebook(domain, jobId)).toString('base64');
+          const impResp = await authFetch('/api/2.0/workspace/import', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            rawBody: JSON.stringify({ path: nbPath, format: 'SOURCE', language: 'PYTHON', content: nbContent, overwrite: true }),
+          });
+          if (!impResp.ok) {
+            res.json({ ok: false, error: `notebook import failed (${impResp.status}): ${(await impResp.text()).slice(0, 300)}` });
+            return;
+          }
+
+          // 2) create or update the scheduled Job (serverless notebook task)
+          const settings = {
+            name: jobName,
+            tags: { app: 'rt_onto', domain },
+            schedule: { quartz_cron_expression: cron, timezone_id: tz, pause_status: 'UNPAUSED' },
+            tasks: [
+              {
+                task_key: 'aggregate_monitor',
+                notebook_task: { notebook_path: nbPath, source: 'WORKSPACE' },
+              },
+            ],
+          };
+          const existingJob = saved[0].databricks_job_id;
+          let dbJobId = existingJob ?? '';
+          if (existingJob) {
+            const rs = await authFetch('/api/2.1/jobs/reset', {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              rawBody: JSON.stringify({ job_id: Number(existingJob), new_settings: settings }),
+            });
+            if (!rs.ok) {
+              // stale id (deleted in the workspace) — fall through to create
+              if (rs.status === 400 || rs.status === 404) dbJobId = '';
+              else {
+                res.json({ ok: false, error: `jobs/reset failed (${rs.status}): ${(await rs.text()).slice(0, 300)}` });
+                return;
+              }
+            }
+          }
+          if (!dbJobId) {
+            const cr = await authFetch('/api/2.1/jobs/create', {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              rawBody: JSON.stringify(settings),
+            });
+            const crText = await cr.text();
+            if (!cr.ok) {
+              res.json({ ok: false, error: `jobs/create failed (${cr.status}): ${crText.slice(0, 300)}` });
+              return;
+            }
+            dbJobId = String((JSON.parse(crText) as { job_id?: number }).job_id ?? '');
+          }
+          const host = (cachedHost ?? '').startsWith('http') ? cachedHost : `https://${cachedHost}`;
+          const jobUrl = `${host}/jobs/${dbJobId}`;
+          await lbQuery(
+            `UPDATE jai_monitor_job SET databricks_job_id = $1, job_url = $2, job_notebook_path = $3, ` +
+              `job_deployed_at = now() WHERE domain = $4`,
+            [dbJobId, jobUrl, nbPath, domain]
+          );
+          res.json({ ok: true, job_id: jobId, databricks_job_id: dbJobId, job_url: jobUrl, notebook_path: nbPath, schedule_cron: cron });
+        } catch (err) {
+          res.json({ ok: false, error: humanizeSqlError(err) });
+        }
+      });
+
+      // List every provisioned/defined monitoring job (for the Jobs & schedules panel).
+      app.get('/api/monitor-jobs', async (_req, res) => {
+        try {
+          const rows = await lbQuery(
+            `SELECT j.domain, j.domain_label, j.job_name, j.schedule_cron, j.schedule_tz, j.enabled, ` +
+              `j.version, j.databricks_job_id, j.job_url, j.job_notebook_path, ` +
+              `to_char(j.job_deployed_at, 'YYYY-MM-DD HH24:MI:SS') AS job_deployed_at, ` +
+              `(SELECT to_char(max(run_ts), 'YYYY-MM-DD HH24:MI:SS') FROM jai_monitor_run r WHERE r.domain = j.domain) AS last_run, ` +
+              `(SELECT count(*) FROM jai_monitor_run r WHERE r.domain = j.domain) AS run_count ` +
+              `FROM jai_monitor_job j ORDER BY j.updated_at DESC`
+          );
+          res.json({ jobs: rows });
+        } catch (err) {
+          res.json({ jobs: [], error: humanizeSqlError(err) });
+        }
+      });
+
+      // ============ Control Tower (business decision surfaces) ================
+      const sqlStr = (v: unknown) => `'${String(v ?? '').replace(/'/g, "''")}'`;
+      // stat keys that signal a CRITICAL sub-count within a product's aggregate
+      const CRITICAL_KEYS = ['critical_items', 'failures', 'outage_driven', 'severely_late', 'single_source_suppliers'];
+      const humanizeKey = (k: string) => (k || '').replace(/_/g, ' ');
+      const QSR_GENIE_SPACE_ID = process.env.QSR_GENIE_SPACE_ID || '01f17a4306e818a183ff3f10237d5a56';
+      // supply-chain (data-backed) products with their domain
+      const scProducts = () =>
+        ALL_DEMO_DOMAINS.flatMap((d) =>
+          d.products.filter((p) => p.backing_schema === QSR_SC_SCHEMA).map((p) => ({ p, domainName: d.name, domainLabel: d.label }))
+        );
+
+      // The snapshot lives in a Delta table so a scheduled notebook job can maintain
+      // exactly what the app reads (Lakebase isn't writable from a job notebook).
+      const CT_SNAPSHOT = 'jai_ontos.demo_schema.jai_control_tower_snapshot';
+      const CT_SNAPSHOT_DDL =
+        `CREATE TABLE IF NOT EXISTS ${CT_SNAPSHOT} (product_name string, domain string, ` +
+        `headline_metric string, headline_value double, critical_metric string, ` +
+        `critical_value double, severity string, metrics_json string, computed_at timestamp) USING delta`;
+
+      type CtCard = {
+        product_name: string;
+        display_name: string;
+        business_outcome: string;
+        domain: string;
+        domain_label: string;
+        headline_metric: string;
+        headline_value: number;
+        critical_metric: string | null;
+        critical_value: number;
+        kpis: Record<string, unknown>;
+        severity: string;
+      };
+      const parseKpis = (s: string): Record<string, unknown> => {
+        try {
+          return JSON.parse(s || '{}');
+        } catch {
+          return {};
+        }
+      };
+
+      // ---- Mitigation ledger: approved actions the app has "dispatched" to a system
+      // of record (simulated). A RESOLVED mitigation nets its slice out of the exception
+      // aggregates (anti-predicate), so the KPI drops everywhere; source facts untouched.
+      const INTERVENTION_LOG = 'jai_ontos.demo_schema.jai_intervention_log';
+      const INTERVENTION_DDL =
+        `CREATE TABLE IF NOT EXISTS ${INTERVENTION_LOG} (intervention_id string, product_name string, ` +
+        `domain string, action_key string, action_label string, target_system string, work_order_id string, ` +
+        `status string, mitigation_predicate string, effect_label string, expected_delta double, ` +
+        `created_by string, created_at timestamp, resolved_at timestamp) USING delta`;
+      // product_name → anti-predicates from RESOLVED mitigations (best-effort; [] if none)
+      const activeMitigationPredicates = async (): Promise<Record<string, string[]>> => {
+        try {
+          const rows = (await runSql(
+            `SELECT product_name, mitigation_predicate FROM ${INTERVENTION_LOG} WHERE status = 'resolved'`
+          )) as unknown as { product_name: string; mitigation_predicate: string }[];
+          const map: Record<string, string[]> = {};
+          for (const r of rows) (map[r.product_name] ??= []).push(r.mitigation_predicate);
+          return map;
+        } catch {
+          return {}; // ledger not created yet
+        }
+      };
+      // append ` AND NOT (pred)` for each active mitigation to a product's aggregate SQL
+      const netAggregateSql = (productName: string, preds: string[]): string | null => {
+        const base = demoAggregateSql(productName);
+        if (!base || !preds.length) return base;
+        return base + preds.map((p) => ` AND NOT (${p})`).join('');
+      };
+
+      // Compute the cards LIVE (scans the fact tables). Used to build the snapshot and
+      // as a fallback so the Home always has data even if the snapshot can't be written.
+      const computeCardsLive = async (): Promise<CtCard[]> => {
+        const out: CtCard[] = [];
+        const mitig = await activeMitigationPredicates();
+        for (const { p, domainName, domainLabel } of scProducts()) {
+          const sql = netAggregateSql(p.product_name, mitig[p.product_name] ?? []);
+          if (!sql) continue;
+          try {
+            const stats = ((await runSql(sql))[0] ?? {}) as Record<string, unknown>;
+            const [metric, raw] = Object.entries(stats)[0] ?? ['count', 0];
+            const headline = Number(raw) || 0;
+            const criticalKey = CRITICAL_KEYS.find((k) => Number(stats[k] ?? 0) > 0);
+            out.push({
+              product_name: p.product_name,
+              display_name: p.display_name,
+              business_outcome: p.business_outcome,
+              domain: domainName,
+              domain_label: domainLabel,
+              headline_metric: String(metric),
+              headline_value: headline,
+              critical_metric: criticalKey ?? null,
+              critical_value: criticalKey ? Number(stats[criticalKey] ?? 0) : 0,
+              kpis: stats,
+              severity: criticalKey ? 'high' : headline > 0 ? 'medium' : 'ok',
+            });
+          } catch {
+            /* skip a product that fails to aggregate */
+          }
+        }
+        return out;
+      };
+
+      // Recompute + OVERWRITE the Delta snapshot (the fast-read table). Throws if the
+      // write fails (e.g. missing MODIFY grant) so the Refresh button can report it.
+      const refreshControlTowerSnapshot = async (): Promise<number> => {
+        const cards = await computeCardsLive();
+        if (!cards.length) return 0;
+        const values = cards.map(
+          (c) =>
+            `(${sqlStr(c.product_name)}, ${sqlStr(c.domain)}, ${sqlStr(c.headline_metric)}, ${c.headline_value}, ` +
+            `${c.critical_metric ? sqlStr(c.critical_metric) : 'NULL'}, ${c.critical_value}, ${sqlStr(c.severity)}, ` +
+            `${sqlStr(JSON.stringify(c.kpis))}, current_timestamp())`
+        );
+        await runSql(CT_SNAPSHOT_DDL);
+        await runSql(`INSERT OVERWRITE ${CT_SNAPSHOT} VALUES ${values.join(', ')}`);
+        return cards.length;
+      };
+
+      // Read the snapshot (fast path). Returns null if the table is missing/empty or
+      // unreadable, signalling the caller to fall back to a live compute.
+      const readSnapshotCards = async (): Promise<{ cards: CtCard[]; computedAt: string | null } | null> => {
+        const q =
+          `SELECT product_name, domain, headline_metric, cast(headline_value as double) AS headline_value, ` +
+          `critical_metric, cast(critical_value as double) AS critical_value, severity, metrics_json, ` +
+          `cast(computed_at as string) AS computed_at FROM ${CT_SNAPSHOT}`;
+        try {
+          const rows = (await runSql(q)) as unknown as {
+            product_name: string; domain: string; headline_metric: string; headline_value: number;
+            critical_metric: string | null; critical_value: number; severity: string; metrics_json: string; computed_at: string;
+          }[];
+          if (!rows.length) return null;
+          const cards = rows
+            .map((r): CtCard | null => {
+              const meta = DEMO_PRODUCTS[r.product_name];
+              if (!meta) return null;
+              return {
+                product_name: r.product_name,
+                display_name: meta.display_name,
+                business_outcome: meta.business_outcome,
+                domain: r.domain,
+                domain_label: meta.domainLabel,
+                headline_metric: r.headline_metric,
+                headline_value: Number(r.headline_value) || 0,
+                critical_metric: r.critical_metric,
+                critical_value: Number(r.critical_value) || 0,
+                kpis: parseKpis(r.metrics_json),
+                severity: r.severity,
+              };
+            })
+            .filter((c): c is CtCard => c !== null);
+          const computedAt = rows.map((r) => r.computed_at).sort().slice(-1)[0] ?? null;
+          return { cards, computedAt };
+        } catch {
+          return null;
+        }
+      };
+
+      // Cards for the Home/Inbox/Ask: prefer the snapshot; if absent, try to build it
+      // (best-effort); if that also fails (e.g. no write grant), compute live so the UI
+      // is never blank.
+      const getControlTowerCards = async (): Promise<{ cards: CtCard[]; computedAt: string | null; source: 'snapshot' | 'live' }> => {
+        const snap = await readSnapshotCards();
+        if (snap) return { ...snap, source: 'snapshot' };
+        try {
+          await refreshControlTowerSnapshot();
+          const rebuilt = await readSnapshotCards();
+          if (rebuilt) return { ...rebuilt, source: 'snapshot' };
+        } catch {
+          /* write failed — fall through to live compute */
+        }
+        return { cards: await computeCardsLive(), computedAt: null, source: 'live' };
+      };
+
+      // Cross-product "what needs attention today" — READS the pre-aggregated snapshot
+      // (fast; no live fact-table scan). Optional ?domain= narrows to one layer.
+      app.get('/api/control-tower-summary', async (req, res) => {
+        const domainFilter = String(req.query.domain ?? '').trim();
+        try {
+          const { cards: all, computedAt, source } = await getControlTowerCards();
+          const cards = domainFilter ? all.filter((c) => c.domain === domainFilter) : all;
+          const high = cards.filter((c) => c.severity === 'high').length;
+          const medium = cards.filter((c) => c.severity === 'medium').length;
+          const healthScore = Math.max(0, Math.min(100, 100 - high * 12 - medium * 5));
+          res.json({ products: cards, health_score: healthScore, issues_total: high + medium, high, medium, computed_at: computedAt, source });
+        } catch (err) {
+          res.json({ products: [], health_score: 0, issues_total: 0, high: 0, medium: 0, error: humanizeSqlError(err) });
+        }
+      });
+
+      // Force a snapshot recompute (the Home "Refresh" button / a scheduled job).
+      app.post('/api/control-tower-refresh', async (_req, res) => {
+        try {
+          const n = await refreshControlTowerSnapshot();
+          res.json({ ok: true, refreshed: n });
+        } catch (err) {
+          res.json({ ok: false, error: humanizeSqlError(err) });
+        }
+      });
+
+      // ---- Mitigation workflow (closed loop over a simulated system of record) ----
+      const MITIGATION_STEPS = ['submitted', 'acknowledged', 'in_progress', 'resolved'] as const;
+      // Create a mitigation: "dispatch" the approved play to its system of record.
+      app.post('/api/mitigations', async (req, res) => {
+        const product = String((req.body as { product_name?: string })?.product_name ?? '').trim();
+        const meta = DEMO_PRODUCTS[product];
+        const m = QSR_SC_MITIGATIONS[product];
+        if (!meta || !m) {
+          res.status(400).json({ ok: false, error: 'no mitigation defined for this product' });
+          return;
+        }
+        try {
+          // projected effect = the critical slice being cleared (from a live count)
+          let expectedDelta = 0;
+          try {
+            const r = (await runSql(
+              `SELECT count(*) AS n FROM ${meta.backing_schema ?? QSR_SC_SCHEMA}.${meta.table} ` +
+                `WHERE ${meta.exception_where} AND (${m.mitigation_predicate})`
+            ))[0] as { n?: unknown };
+            expectedDelta = Number(r?.n ?? 0) || 0;
+          } catch {
+            /* leave 0 */
+          }
+          const id = `mit_${Date.now().toString(36)}_${randomUUID().slice(0, 6)}`;
+          const wo = `WO-${Math.floor(1000 + Math.random() * 9000)}`;
+          const who = (await whoami()) || 'unknown';
+          const domain = ALL_DEMO_DOMAINS.find((d) => d.products.some((p) => p.product_name === product))?.name ?? '';
+          await runSql(INTERVENTION_DDL);
+          await runSql(
+            `INSERT INTO ${INTERVENTION_LOG} VALUES (${sqlStr(id)}, ${sqlStr(product)}, ${sqlStr(domain)}, ` +
+              `${sqlStr(m.action_key)}, ${sqlStr(m.action_label)}, ${sqlStr(m.target_system)}, ${sqlStr(wo)}, ` +
+              `'submitted', ${sqlStr(m.mitigation_predicate)}, ${sqlStr(m.effect_label)}, ${expectedDelta}, ` +
+              `${sqlStr(who)}, current_timestamp(), NULL)`
+          );
+          // record the decision in the action log too (dedup by product+issue)
+          await lbQuery(
+            `INSERT INTO action_log (action_id, created_at, updated_at, schema_label, domain, product, source, ` +
+              `priority, issue, root_cause, recommended_action, confidence, decision, track_status, decided_by, ` +
+              `decided_at, ref_entity, notes) VALUES ($1, now(), now(), 'QSR Supply Chain', $2, $3, 'exception', ` +
+              `'HIGH', $4, '', $5, 0.7, 'approved', 'in_progress', $6, now(), $7, '') ` +
+              `ON CONFLICT (action_id) DO UPDATE SET decision='approved', track_status='in_progress', ` +
+              `recommended_action=EXCLUDED.recommended_action, decided_at=now(), updated_at=now()`,
+            [
+              `act_${createHash('sha1').update(`${meta.display_name}|${m.action_label}`).digest('hex').slice(0, 16)}`,
+              domain, meta.display_name, `Mitigate: ${meta.issue}`, m.action_label, who, wo,
+            ]
+          ).catch(() => {});
+          res.json({ ok: true, intervention_id: id, work_order_id: wo, target_system: m.target_system, status: 'submitted', expected_delta: expectedDelta, action_label: m.action_label, action_key: m.action_key, mitigation_predicate: m.mitigation_predicate });
+        } catch (err) {
+          res.json({ ok: false, error: humanizeSqlError(err) });
+        }
+      });
+
+      // Advance a mitigation's status (submitted→acknowledged→in_progress→resolved).
+      // On resolve, refresh the snapshot so the KPI drop shows on the Home.
+      app.post('/api/mitigation-advance', async (req, res) => {
+        const id = String((req.body as { intervention_id?: string })?.intervention_id ?? '').trim();
+        if (!id) {
+          res.status(400).json({ ok: false, error: 'intervention_id required' });
+          return;
+        }
+        try {
+          const cur = (await runSql(`SELECT status FROM ${INTERVENTION_LOG} WHERE intervention_id = ${sqlStr(id)}`))[0] as { status?: string };
+          const idx = MITIGATION_STEPS.indexOf((cur?.status ?? 'submitted') as (typeof MITIGATION_STEPS)[number]);
+          const next = MITIGATION_STEPS[Math.min(idx + 1, MITIGATION_STEPS.length - 1)];
+          const resolvedAt = next === 'resolved' ? 'current_timestamp()' : 'resolved_at';
+          await runSql(`UPDATE ${INTERVENTION_LOG} SET status = ${sqlStr(next)}, resolved_at = ${resolvedAt} WHERE intervention_id = ${sqlStr(id)}`);
+          if (next === 'resolved') await refreshControlTowerSnapshot().catch(() => {});
+          res.json({ ok: true, status: next });
+        } catch (err) {
+          res.json({ ok: false, error: humanizeSqlError(err) });
+        }
+      });
+
+      // List mitigations (newest first) for the status/connector surfaces.
+      app.get('/api/mitigations', async (_req, res) => {
+        try {
+          const rows = await runSql(
+            `SELECT intervention_id, product_name, domain, action_key, action_label, target_system, work_order_id, ` +
+              `status, mitigation_predicate, effect_label, expected_delta, ` +
+              `cast(created_at as string) AS created_at, cast(resolved_at as string) AS resolved_at ` +
+              `FROM ${INTERVENTION_LOG} ORDER BY created_at DESC`
+          ).catch(() => [] as Record<string, unknown>[]);
+          res.json({ mitigations: rows });
+        } catch (err) {
+          res.json({ mitigations: [], error: humanizeSqlError(err) });
+        }
+      });
+
+      // Reset the demo: clear all mitigations and rebuild the snapshot.
+      app.post('/api/mitigations-reset', async (_req, res) => {
+        try {
+          await runSql(`DELETE FROM ${INTERVENTION_LOG}`).catch(() => {});
+          await refreshControlTowerSnapshot().catch(() => {});
+          res.json({ ok: true });
+        } catch (err) {
+          res.json({ ok: false, error: humanizeSqlError(err) });
+        }
+      });
+
+      // Unified Action Inbox: one prioritized worklist across ALL supply-chain
+      // products — READS the pre-aggregated snapshot (no live scan), turns each
+      // needs-attention product into an actionable item ranked by severity then size,
+      // and layers the curated playbook so it renders without the LLM.
+      app.get('/api/action-inbox', async (_req, res) => {
+        try {
+          const { cards } = await getControlTowerCards();
+          const items = cards
+            .filter((c) => c.severity !== 'ok')
+            .map((c) => {
+              const meta = DEMO_PRODUCTS[c.product_name];
+              const pb = meta?.playbook ?? [];
+              return {
+                id: `inbox-${c.product_name}`,
+                product_name: c.product_name,
+                product_display: c.display_name,
+                domain: c.domain,
+                domain_label: c.domain_label,
+                severity: c.severity,
+                priority: c.severity === 'high' ? 'HIGH' : c.severity === 'medium' ? 'MEDIUM' : 'LOW',
+                headline_metric: c.headline_metric,
+                headline_value: c.headline_value,
+                critical_metric: c.critical_metric,
+                critical_value: c.critical_value,
+                issue: `${c.headline_value.toLocaleString()} ${humanizeKey(c.headline_metric)} — ${meta?.issue ?? ''}`,
+                root_cause: pb[0]?.root_cause ?? '',
+                recommended_action: pb[0]?.recommended_action ?? meta?.action_hint ?? '',
+                kpis: c.kpis,
+              };
+            });
+          const rank = { HIGH: 0, MEDIUM: 1, LOW: 2 } as Record<string, number>;
+          items.sort((a, b) => (rank[a.priority] - rank[b.priority]) || b.headline_value - a.headline_value);
+          res.json({ items });
+        } catch (err) {
+          res.json({ items: [], error: humanizeSqlError(err) });
+        }
+      });
+
+      // Ask the Control Tower: a fast, grounded, CACHED answer over the LIVE
+      // aggregate signals (role-framed). Genie is offered for deeper exploration.
+      app.post('/api/control-tower-ask', async (req, res) => {
+        const b = (req.body ?? {}) as { question?: string; role?: string };
+        const question = String(b.question ?? '').trim();
+        const role = String(b.role ?? '').trim();
+        if (!question) {
+          res.status(400).json({ answer: null, error: 'question required' });
+          return;
+        }
+        if (!hasLlm) {
+          res.json({ answer: null, llm: false, reason: 'no serving endpoint configured' });
+          return;
+        }
+        // grounding from the snapshot (falls back to live compute if unavailable)
+        const signals: string[] = [];
+        try {
+          const { cards } = await getControlTowerCards();
+          for (const c of cards) {
+            signals.push(`- ${c.display_name}: ${c.headline_value} ${humanizeKey(c.headline_metric)}`);
+          }
+        } catch {
+          /* signals unavailable — answer with none */
+        }
+        const rolePrefix = role ? `You are advising the ${role} of a restaurant chain. ` : '';
+        const prompt =
+          `${rolePrefix}You are the QSR Supply Chain Control Tower assistant. Answer the question using ONLY ` +
+          `the live aggregate signals below — do not invent data. Be concise (2-4 sentences), cite the ` +
+          `relevant numbers, and end with one recommended action.\n\nLIVE SIGNALS (today):\n${signals.join('\n')}\n\n` +
+          `QUESTION: ${question}`;
+        const answer = await llmComplete(prompt, 600, { label: 'control-tower-ask' });
+        res.json({ answer: answer ?? null, llm: Boolean(answer), signals_count: signals.length });
+      });
+
+      // Control Tower config for the client (Genie deep-link + LLM availability).
+      app.get('/api/control-tower-config', async (_req, res) => {
+        let host = '';
+        try {
+          const w = getWorkspaceClient({});
+          await w.config.ensureResolved?.();
+          host = w.config.host ?? process.env.DATABRICKS_HOST ?? '';
+        } catch {
+          host = process.env.DATABRICKS_HOST ?? '';
+        }
+        host = host.startsWith('http') ? host : host ? `https://${host}` : '';
+        let refreshJob: { databricks_job_id: string; job_url: string; schedule_cron: string; job_deployed_at: string } | null = null;
+        try {
+          const row = (await lbQuery(
+            `SELECT databricks_job_id, job_url, schedule_cron, to_char(job_deployed_at,'YYYY-MM-DD HH24:MI:SS') AS job_deployed_at ` +
+              `FROM jai_monitor_job WHERE domain = '__control_tower__' AND databricks_job_id IS NOT NULL`
+          ))[0] as unknown as typeof refreshJob;
+          if (row) refreshJob = row;
+        } catch {
+          /* ignore */
+        }
+        res.json({
+          genie_url: host && QSR_GENIE_SPACE_ID ? `${host}/genie/rooms/${QSR_GENIE_SPACE_ID}` : '',
+          llm: hasLlm,
+          refresh_job: refreshJob,
+        });
+      });
+
+      // Build the Control Tower snapshot-refresh notebook (Python): recompute every
+      // supply-chain product's aggregate and OVERWRITE the Delta snapshot table.
+      const buildControlTowerNotebook = (): string => {
+        const queries: Record<string, { sql: string; domain: string }> = {};
+        for (const { p, domainName } of scProducts()) {
+          const sql = demoAggregateSql(p.product_name);
+          if (sql) queries[p.product_name] = { sql, domain: domainName };
+        }
+        return [
+          '# Databricks notebook source',
+          '# Auto-generated by RT_onto — refreshes the Control Tower snapshot the app reads.',
+          'from datetime import datetime',
+          'import json',
+          `TABLE = ${JSON.stringify(CT_SNAPSHOT)}`,
+          `CRITICAL_KEYS = json.loads(r'''${JSON.stringify(CRITICAL_KEYS)}''')`,
+          `QUERIES = json.loads(r'''${JSON.stringify(queries)}''')`,
+          '',
+          'spark.sql(f"""CREATE TABLE IF NOT EXISTS {TABLE} (product_name string, domain string,',
+          '  headline_metric string, headline_value double, critical_metric string, critical_value double,',
+          '  severity string, metrics_json string, computed_at timestamp) USING delta""")',
+          'now = datetime.utcnow()',
+          'rows = []',
+          'for product, cfg in QUERIES.items():',
+          '    try:',
+          '        rec = spark.sql(cfg["sql"]).limit(1).collect()',
+          '        stats = rec[0].asDict() if rec else {}',
+          '    except Exception:',
+          '        stats = {}',
+          '    items = list(stats.items())',
+          '    metric, raw = (items[0] if items else ("count", 0))',
+          '    try:',
+          '        headline = float(raw) if raw is not None else 0.0',
+          '    except Exception:',
+          '        headline = 0.0',
+          '    def _num(v):',
+          '        try:\n            return float(v)\n        except Exception:\n            return 0.0',
+          '    crit = next((k for k in CRITICAL_KEYS if _num(stats.get(k)) > 0), None)',
+          '    sev = "high" if crit else ("medium" if headline > 0 else "ok")',
+          '    crit_val = _num(stats.get(crit)) if crit else 0.0',
+          '    rows.append((product, cfg["domain"], str(metric), headline, crit, crit_val, sev,',
+          '                 json.dumps({k: str(v) for k, v in stats.items()}), now))',
+          'cols = ["product_name","domain","headline_metric","headline_value","critical_metric","critical_value","severity","metrics_json","computed_at"]',
+          'spark.createDataFrame(rows, cols).write.mode("overwrite").saveAsTable(TABLE)',
+          'print(f"control tower snapshot refreshed: {len(rows)} products")',
+          '',
+        ].join('\n');
+      };
+
+      // Deploy the scheduled Control Tower refresh as a real serverless Databricks Job
+      // (imports the notebook, creates/updates the Job on a cron). Registered in
+      // jai_monitor_job under a synthetic domain so it shows in Jobs & schedules.
+      app.post('/api/control-tower-deploy-job', async (req, res) => {
+        const cron = String((req.body as { cron?: string })?.cron || '0 0 6 * * ?');
+        const tz = 'America/New_York';
+        const jobName = 'jai_control_tower_refresh_daily';
+        try {
+          const who = (await whoami()) || 'unknown';
+          const nbDir = `/Users/${who}/jai_monitor`;
+          const nbPath = `${nbDir}/${jobName}`;
+          await authFetch('/api/2.0/workspace/mkdirs', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            rawBody: JSON.stringify({ path: nbDir }),
+          }).catch(() => {});
+          const nbContent = Buffer.from(buildControlTowerNotebook()).toString('base64');
+          const imp = await authFetch('/api/2.0/workspace/import', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            rawBody: JSON.stringify({ path: nbPath, format: 'SOURCE', language: 'PYTHON', content: nbContent, overwrite: true }),
+          });
+          if (!imp.ok) {
+            res.json({ ok: false, error: `notebook import failed (${imp.status}): ${(await imp.text()).slice(0, 300)}` });
+            return;
+          }
+          const settings = {
+            name: jobName,
+            tags: { app: 'rt_onto', kind: 'control_tower_refresh' },
+            schedule: { quartz_cron_expression: cron, timezone_id: tz, pause_status: 'UNPAUSED' },
+            tasks: [{ task_key: 'refresh_snapshot', notebook_task: { notebook_path: nbPath, source: 'WORKSPACE' } }],
+          };
+          const existing = (await lbQuery<{ databricks_job_id: string | null }>(
+            `SELECT databricks_job_id FROM jai_monitor_job WHERE domain = '__control_tower__'`
+          ))[0]?.databricks_job_id;
+          let dbId = existing ?? '';
+          if (existing) {
+            const rs = await authFetch('/api/2.1/jobs/reset', {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              rawBody: JSON.stringify({ job_id: Number(existing), new_settings: settings }),
+            });
+            if (!rs.ok) {
+              if (rs.status === 400 || rs.status === 404) dbId = '';
+              else {
+                res.json({ ok: false, error: `jobs/reset failed (${rs.status}): ${(await rs.text()).slice(0, 300)}` });
+                return;
+              }
+            }
+          }
+          if (!dbId) {
+            const cr = await authFetch('/api/2.1/jobs/create', {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              rawBody: JSON.stringify(settings),
+            });
+            const crText = await cr.text();
+            if (!cr.ok) {
+              res.json({ ok: false, error: `jobs/create failed (${cr.status}): ${crText.slice(0, 300)}` });
+              return;
+            }
+            dbId = String((JSON.parse(crText) as { job_id?: number }).job_id ?? '');
+          }
+          const host = (cachedHost ?? '').startsWith('http') ? cachedHost : `https://${cachedHost}`;
+          const jobUrl = `${host}/jobs/${dbId}`;
+          await lbQuery(
+            `INSERT INTO jai_monitor_job (job_id, domain, domain_label, job_name, schedule_cron, schedule_tz, ` +
+              `products_json, aggregates_json, enabled, version, created_by, created_at, updated_at, ` +
+              `databricks_job_id, job_url, job_notebook_path, job_deployed_at) ` +
+              `VALUES ('jai_control_tower', '__control_tower__', 'Control Tower refresh', $1, $2, $3, '[]', '[]', ` +
+              `true, 1, $4, now(), now(), $5, $6, $7, now()) ON CONFLICT (domain) DO UPDATE SET ` +
+              `schedule_cron = EXCLUDED.schedule_cron, databricks_job_id = EXCLUDED.databricks_job_id, ` +
+              `job_url = EXCLUDED.job_url, job_notebook_path = EXCLUDED.job_notebook_path, ` +
+              `job_deployed_at = now(), updated_at = now()`,
+            [jobName, cron, tz, who, dbId, jobUrl, nbPath]
+          );
+          res.json({ ok: true, databricks_job_id: dbId, job_url: jobUrl, schedule_cron: cron, notebook_path: nbPath });
+        } catch (err) {
+          res.json({ ok: false, error: humanizeSqlError(err) });
+        }
+      });
+
+      // What-if scenarios: the injected scenario catalog (heat wave, supplier outage…).
+      app.get('/api/scenarios', async (_req, res) => {
+        try {
+          const rows = await runSql(
+            `SELECT scenario_id, scenario_type, scope_kind, scope_value, ` +
+              `cast(start_date as string) AS start_date, cast(end_date as string) AS end_date, ` +
+              `effect, magnitude, description FROM ${QSR_SC_SCHEMA}.jai_scenario ` +
+              `ORDER BY start_date DESC`
+          );
+          res.json({ scenarios: rows });
+        } catch (err) {
+          res.json({ scenarios: [], error: humanizeSqlError(err) });
+        }
+      });
+
+      // Deterministic projected impact for a scenario + the matching curated playbook
+      // and reasoning rule (honest data-vs-guidance split; optional cached narrative).
+      app.post('/api/scenario-impact', async (req, res) => {
+        const b = (req.body ?? {}) as { scenario_id?: string };
+        const id = String(b.scenario_id ?? '').trim();
+        if (!id) {
+          res.status(400).json({ error: 'scenario_id required' });
+          return;
+        }
+        try {
+          const sc = (await runSql(
+            `SELECT scenario_id, scenario_type, scope_kind, scope_value, effect, magnitude, description ` +
+              `FROM ${QSR_SC_SCHEMA}.jai_scenario WHERE scenario_id = ${sqlStr(id)} LIMIT 1`
+          ))[0] as Record<string, unknown> | undefined;
+          if (!sc) {
+            res.json({ error: 'scenario not found' });
+            return;
+          }
+          const type = String(sc.scenario_type ?? '');
+          const scopeKind = String(sc.scope_kind ?? '');
+          const scopeVal = String(sc.scope_value ?? '');
+          const regionClause = scopeKind === 'region' && scopeVal ? ` AND region = ${sqlStr(scopeVal)}` : '';
+          // map scenario type → { impact query, product for playbook, reasoning rule }
+          type ImpactDef = { label: string; sql: string; product?: string; ruleId?: string };
+          const T: Record<string, ImpactDef> = {
+            supplier_outage: {
+              label: 'ingredient positions at stockout risk from the outage',
+              sql: `SELECT count(*) AS impact_count, count(distinct restaurant_id) AS restaurants FROM ${QSR_SC_SCHEMA}.jai_inventory_event WHERE stockout_risk = true AND impacted_by_supplier_outage = true`,
+              product: 'sc_inventory_stockout',
+              ruleId: 'RR4',
+            },
+            heat_wave: {
+              label: 'demand-surge forecast days in scope',
+              sql: `SELECT count(*) AS impact_count, count(distinct restaurant_id) AS restaurants, round(avg(beverage_demand_index),2) AS avg_beverage_index FROM ${QSR_SC_SCHEMA}.jai_forecast WHERE heat_wave_active = true${regionClause}`,
+              product: 'sc_forecast_demand',
+              ruleId: 'RR1',
+            },
+            promotion: {
+              label: 'promotion-driven surge days in scope',
+              sql: `SELECT count(*) AS impact_count, count(distinct restaurant_id) AS restaurants FROM ${QSR_SC_SCHEMA}.jai_forecast WHERE promo_active = true${regionClause}`,
+              product: 'sc_forecast_demand',
+              ruleId: 'RR1',
+            },
+            holiday: {
+              label: 'promotion/holiday surge days in scope',
+              sql: `SELECT count(*) AS impact_count, count(distinct restaurant_id) AS restaurants FROM ${QSR_SC_SCHEMA}.jai_forecast WHERE promo_active = true${regionClause}`,
+              product: 'sc_forecast_demand',
+            },
+            snowstorm: {
+              label: 'high-dollar waste events in scope',
+              sql: `SELECT count(*) AS impact_count, round(sum(waste_usd),0) AS waste_usd, count(distinct restaurant_id) AS restaurants FROM ${QSR_SC_SCHEMA}.jai_waste_event WHERE waste_usd > 120${regionClause}`,
+              product: 'sc_waste',
+              ruleId: 'RR3',
+            },
+            equipment_failure: {
+              label: 'equipment readings in failure / low health',
+              sql: `SELECT count(*) AS impact_count, count(distinct restaurant_id) AS restaurants FROM ${QSR_SC_SCHEMA}.jai_equipment_health WHERE status = 'Failure' OR health_score < 40`,
+              product: 'sc_equipment_health',
+              ruleId: 'RR6',
+            },
+            labor_shortage: {
+              label: 'understaffed shifts in scope',
+              sql: `SELECT count(*) AS impact_count, count(distinct restaurant_id) AS restaurants FROM ${QSR_SC_SCHEMA}.jai_labor_shift WHERE staffing_ratio < 0.8${regionClause}`,
+              product: 'sc_labor_staffing',
+              ruleId: 'RR7',
+            },
+          };
+          const def = T[type];
+          let impact: Record<string, unknown> = {};
+          if (def) {
+            try {
+              impact = ((await runSql(def.sql))[0] ?? {}) as Record<string, unknown>;
+            } catch {
+              impact = {};
+            }
+          }
+          const meta = def?.product ? DEMO_PRODUCTS[def.product] : undefined;
+          const rule = def?.ruleId ? QSR_SC_REASONING_RULES.find((r) => r.id === def.ruleId) : undefined;
+          res.json({
+            scenario: sc,
+            impact_label: def?.label ?? 'related exceptions',
+            impact,
+            product: meta ? { product_name: meta.product_name, display_name: meta.display_name } : null,
+            playbook: meta?.playbook ?? [],
+            rule: rule
+              ? { id: rule.id, name: rule.name, if_conditions: rule.if_conditions, then_conclusion: rule.then_conclusion }
+              : null,
+          });
+        } catch (err) {
+          res.json({ error: humanizeSqlError(err) });
+        }
+      });
+
+      // Entity picker for the impact explorer (suppliers / DCs / ingredients).
+      app.get('/api/impact-entities', async (req, res) => {
+        const type = String(req.query.type ?? 'supplier');
+        const q =
+          type === 'dc'
+            ? `SELECT dc_id AS id, dc_name AS name FROM ${QSR_SC_SCHEMA}.jai_dim_distribution_center ORDER BY dc_name`
+            : type === 'ingredient'
+              ? `SELECT ingredient_id AS id, ingredient_name AS name FROM ${QSR_SC_SCHEMA}.jai_dim_ingredient ORDER BY ingredient_name LIMIT 200`
+              : `SELECT supplier_id AS id, supplier_name AS name FROM ${QSR_SC_SCHEMA}.jai_dim_supplier ORDER BY supplier_name`;
+        try {
+          res.json({ entities: await runSql(q) });
+        } catch (err) {
+          res.json({ entities: [], error: humanizeSqlError(err) });
+        }
+      });
+
+      // Blast-radius: downstream at-risk restaurants/items for a supplier/DC/ingredient.
+      app.post('/api/impact-trace', async (req, res) => {
+        const b = (req.body ?? {}) as { entity_type?: string; id?: string };
+        const type = String(b.entity_type ?? 'supplier');
+        const id = String(b.id ?? '').trim();
+        if (!id) {
+          res.status(400).json({ error: 'id required' });
+          return;
+        }
+        let q = '';
+        if (type === 'supplier') {
+          q =
+            `SELECT i.ingredient_name AS name, count(distinct e.restaurant_id) AS restaurants, ` +
+            `count(*) AS at_risk_positions FROM ${QSR_SC_SCHEMA}.jai_inventory_event e ` +
+            `JOIN ${QSR_SC_SCHEMA}.jai_dim_ingredient i ON e.ingredient_id = i.ingredient_id ` +
+            `WHERE i.primary_supplier_id = ${sqlStr(id)} AND e.stockout_risk = true ` +
+            `GROUP BY 1 ORDER BY restaurants DESC`;
+        } else if (type === 'dc') {
+          q =
+            `SELECT r.region AS name, count(distinct e.restaurant_id) AS restaurants, ` +
+            `count(*) AS at_risk_positions FROM ${QSR_SC_SCHEMA}.jai_inventory_event e ` +
+            `JOIN ${QSR_SC_SCHEMA}.jai_dim_restaurant r ON e.restaurant_id = r.restaurant_id ` +
+            `WHERE r.dc_id = ${sqlStr(id)} AND e.stockout_risk = true ` +
+            `GROUP BY 1 ORDER BY at_risk_positions DESC`;
+        } else {
+          q =
+            `SELECT r.region AS name, count(distinct e.restaurant_id) AS restaurants, ` +
+            `count(*) AS at_risk_positions FROM ${QSR_SC_SCHEMA}.jai_inventory_event e ` +
+            `JOIN ${QSR_SC_SCHEMA}.jai_dim_restaurant r ON e.restaurant_id = r.restaurant_id ` +
+            `WHERE e.ingredient_id = ${sqlStr(id)} AND e.stockout_risk = true ` +
+            `GROUP BY 1 ORDER BY at_risk_positions DESC`;
+        }
+        try {
+          const rows = await runSql(q);
+          const restaurants = rows.reduce((s, r) => s + (Number(r.restaurants) || 0), 0);
+          const positions = rows.reduce((s, r) => s + (Number(r.at_risk_positions) || 0), 0);
+          res.json({ rows, total_restaurants: restaurants, total_positions: positions });
+        } catch (err) {
+          res.json({ rows: [], error: humanizeSqlError(err) });
+        }
+      });
+
+      // ================= Ontology artifact (OWL/TTL + JSON-LD) =================
+      const artifactId = (schema: string, product: string) => `${schema}:${product}`;
+      // POST — client sends the assembled OntologyArtifact model; server serializes,
+      // mirrors to the UC Volume (best-effort), and upserts the canonical row.
+      app.post('/api/ontology-artifact', async (req, res) => {
+        const b = (req.body ?? {}) as { schema_label?: string; product?: string; model?: OntologyArtifact };
+        const schema = String(b.schema_label ?? '').trim();
+        const product = String(b.product ?? '').trim();
+        const model = b.model;
+        if (!schema || !product || !model) {
+          res.status(400).json({ ok: false, error: 'schema_label, product, model required' });
+          return;
+        }
+        let ttl = '';
+        let jsonld = '';
+        try {
+          ttl = serializeTtl(model);
+          jsonld = JSON.stringify(serializeJsonLd(model), null, 2);
+        } catch (e) {
+          res.json({ ok: false, error: `serialize failed: ${String(e)}` });
+          return;
+        }
+        const volPath = `${VOLUME_BASE}/${product}.ttl`;
+        let volumeWarning: string | undefined;
+        try {
+          await volumePut(volPath, ttl);
+          await volumePut(`${VOLUME_BASE}/${product}.jsonld`, jsonld);
+        } catch (e) {
+          volumeWarning = `volume mirror skipped: ${String(e).slice(0, 120)}`;
+        }
+        const counts = artifactCounts(model);
+        try {
+          const who = await whoami();
+          await lbQuery(
+            `INSERT INTO jai_ontology_artifact (artifact_id, schema_label, product, product_label, iri, ` +
+              `ttl, jsonld, graph_json, model_json, volume_path, class_count, objprop_count, generated_by, generated_at) ` +
+              `VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13, now()) ` +
+              `ON CONFLICT (artifact_id) DO UPDATE SET product_label=EXCLUDED.product_label, iri=EXCLUDED.iri, ` +
+              `ttl=EXCLUDED.ttl, jsonld=EXCLUDED.jsonld, graph_json=EXCLUDED.graph_json, model_json=EXCLUDED.model_json, ` +
+              `volume_path=EXCLUDED.volume_path, class_count=EXCLUDED.class_count, objprop_count=EXCLUDED.objprop_count, ` +
+              `generated_by=EXCLUDED.generated_by, generated_at=now()`,
+            [
+              artifactId(schema, product),
+              schema,
+              product,
+              String(model.productLabel ?? product),
+              String(model.iri ?? ''),
+              ttl,
+              jsonld,
+              JSON.stringify(model.graph ?? null),
+              JSON.stringify(model),
+              volPath,
+              counts.class_count,
+              counts.objprop_count,
+              who,
+            ]
+          );
+          res.json({ ok: true, artifact_id: artifactId(schema, product), volume_path: volPath, ttl_bytes: ttl.length, volume_warning: volumeWarning });
+        } catch (err) {
+          res.json({ ok: false, error: humanizeSqlError(err) });
+        }
+      });
+
+      // GET — the stored artifact (viewer + export read this)
+      app.get('/api/ontology-artifact', async (req, res) => {
+        const schema = String(req.query.schema ?? '').trim();
+        const product = String(req.query.product ?? '').trim();
+        if (!schema || !product) {
+          res.json({ artifact: null });
+          return;
+        }
+        try {
+          const rows = await lbQuery(
+            `SELECT artifact_id, schema_label, product, product_label, iri, graph_json, model_json, ` +
+              `volume_path, class_count, objprop_count, generated_by, ` +
+              `to_char(generated_at, 'YYYY-MM-DD HH24:MI:SS') AS generated_at ` +
+              `FROM jai_ontology_artifact WHERE artifact_id = $1 LIMIT 1`,
+            [artifactId(schema, product)]
+          );
+          res.json({ artifact: rows[0] ?? null });
+        } catch (err) {
+          res.json({ artifact: null, error: humanizeSqlError(err) });
+        }
+      });
+
+      // GET download — stream the stored TTL or JSON-LD as an attachment
+      app.get('/api/ontology-artifact/download', async (req, res) => {
+        const schema = String(req.query.schema ?? '').trim();
+        const product = String(req.query.product ?? '').trim();
+        const format = String(req.query.format ?? 'ttl') === 'jsonld' ? 'jsonld' : 'ttl';
+        try {
+          const rows = await lbQuery<{ ttl: string; jsonld: string }>(
+            `SELECT ttl, jsonld FROM jai_ontology_artifact WHERE artifact_id = $1 LIMIT 1`,
+            [artifactId(schema, product)]
+          );
+          if (rows.length === 0) {
+            res.status(404).json({ error: 'artifact not found — generate it first' });
+            return;
+          }
+          const body = format === 'jsonld' ? rows[0].jsonld : rows[0].ttl;
+          res.setHeader('Content-Type', format === 'jsonld' ? 'application/ld+json' : 'text/turtle');
+          res.setHeader('Content-Disposition', `attachment; filename="${product}.${format}"`);
+          res.send(body ?? '');
+        } catch (err) {
+          res.status(200).json({ error: humanizeSqlError(err) });
+        }
+      });
+
+      // ================= Domain Analysis (ROI use cases + data gaps) =========
+      // Generated per schema+domain: an LLM (grounded in the domain's products +
+      // DDL/KPIs) ranks use cases by ROI tier, maps products, names data gaps, and
+      // picks a flagship. Falls back to a deterministic skeleton when no LLM is
+      // configured. Persisted in jai_domain_analysis and loaded back from there.
+      type DomainAnalysisProduct = {
+        product_name: string;
+        display_name?: string;
+        business_outcome?: string;
+        kpis?: string[];
+        fact_tables?: string[];
+        dim_tables?: string[];
+        issue?: string;
+        action_hint?: string;
+      };
+      const analysisId = (schema: string, domain: string) => `${schema}:${domain}`;
+
+      // Deterministic fallback: rank by data readiness (more tables/KPIs → higher),
+      // map each use case to its product, and flag the usual missing-dimension gaps.
+      const heuristicAnalysis = (
+        domainName: string,
+        domainLabel: string,
+        products: DomainAnalysisProduct[]
+      ) => {
+        const scored = products.map((p) => {
+          const tables = [...(p.fact_tables ?? []), ...(p.dim_tables ?? [])];
+          const readiness = tables.length + (p.kpis?.length ?? 0);
+          return { p, tables, readiness };
+        });
+        scored.sort((a, b) => b.readiness - a.readiness);
+        const tier = (i: number, n: number): 'High' | 'Medium' | 'Low' =>
+          i < Math.ceil(n / 3) ? 'High' : i < Math.ceil((2 * n) / 3) ? 'Medium' : 'Low';
+        const use_cases = scored.map((s, i) => {
+          const roi_tier = tier(i, scored.length);
+          const effort = s.tables.length >= 3 ? 'Medium' : 'Low';
+          // composite 0-100: ROI tier dominates, boosted by data readiness, penalized by effort
+          const tierPts = roi_tier === 'High' ? 60 : roi_tier === 'Medium' ? 40 : 20;
+          const readinessPts = Math.min(30, s.readiness * 4);
+          const effortPts = effort === 'Low' ? 10 : effort === 'Medium' ? 5 : 0;
+          const opportunity_score = Math.max(0, Math.min(100, tierPts + readinessPts + effortPts));
+          // illustrative annual $K impact scaled by tier (benchmark, not from data)
+          const revenue_potential_k = roi_tier === 'High' ? 1500 : roi_tier === 'Medium' ? 600 : 200;
+          return {
+            title: s.p.display_name ?? s.p.product_name,
+            roi_tier,
+            opportunity_score,
+            revenue_potential_k,
+            value_driver: s.p.business_outcome ?? 'Operational efficiency and decision support.',
+            data_readiness:
+              s.tables.length >= 3 ? 'Strong — multiple backing tables' : s.tables.length > 0 ? 'Partial — limited backing tables' : 'Weak — no backing tables identified',
+            effort,
+            time_to_value: s.readiness >= 5 ? '2-4 weeks' : '4-8 weeks',
+            products: [s.p.product_name],
+            tables: s.tables,
+            description: s.p.issue ?? s.p.business_outcome ?? '',
+          };
+        });
+        // Deterministic fallback used when the model is unavailable. These must stay
+        // INDUSTRY-NEUTRAL and derived from the schema in front of us: the previous
+        // version hardcoded retail gaps ("weather signals", "loyalty identity"), which
+        // were asserted verbatim for a manufacturing or telco schema.
+        const gapProducts = use_cases.slice(0, 2).map((u) => u.title);
+        const data_gaps = [
+          {
+            gap: 'External / contextual signals not present in these tables',
+            why_it_matters:
+              'Outcomes are usually driven partly by factors outside the operational system; without them, analysis misattributes variance to internal levers.',
+            severity: 'Important' as const,
+            unblocks: gapProducts,
+          },
+          {
+            gap: 'A durable entity/party dimension to join on',
+            why_it_matters:
+              'Longitudinal analysis needs a stable identifier for the entity being measured, beyond identifiers that only exist on individual transactions.',
+            severity: 'Important' as const,
+            unblocks: [],
+          },
+          {
+            gap: 'Documented definitions and ownership for the measures above',
+            why_it_matters:
+              'These KPIs were derived from column names and types. Without an owner-confirmed definition they cannot be relied on for decisions.',
+            severity: 'Important' as const,
+            unblocks: [],
+          },
+        ];
+        return {
+          domain: domainName,
+          domain_label: domainLabel,
+          llm_used: false,
+          flagship: use_cases[0]
+            ? { use_case: use_cases[0].title, rationale: 'Highest data readiness in this domain — fastest path to value.' }
+            : { use_case: '', rationale: '' },
+          use_cases,
+          data_gaps,
+        };
+      };
+
+      // Permissive JSON extraction (fenced or bare object) for the analysis shape.
+      const parseAnalysisJson = (text: string): Record<string, unknown> | null => {
+        if (!text) return null;
+        const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/);
+        const body = fenced ? fenced[1] : text;
+        const start = body.indexOf('{');
+        const end = body.lastIndexOf('}');
+        if (start < 0 || end <= start) return null;
+        try {
+          const obj = JSON.parse(body.slice(start, end + 1)) as unknown;
+          return obj && typeof obj === 'object' && !Array.isArray(obj) ? (obj as Record<string, unknown>) : null;
+        } catch {
+          return null;
+        }
+      };
+
+      app.post('/api/domain-analysis', async (req, res) => {
+        const b = (req.body ?? {}) as {
+          schema_label?: string;
+          domain_name?: string;
+          domain_label?: string;
+          signature?: string;
+          products?: DomainAnalysisProduct[];
+          components_summary?: string;
+        };
+        const schema = String(b.schema_label ?? '').trim();
+        const domain = String(b.domain_name ?? '').trim();
+        const domainLabel = String(b.domain_label ?? domain).trim();
+        const products = Array.isArray(b.products) ? b.products : [];
+        if (!schema || !domain || products.length === 0) {
+          res.status(400).json({ ok: false, error: 'schema_label, domain_name and products required' });
+          return;
+        }
+
+        // Build the grounded prompt from the domain's product metadata.
+        const productLines = products
+          .map((p) => {
+            const tables = [...(p.fact_tables ?? []), ...(p.dim_tables ?? [])].join(', ');
+            return (
+              `- ${p.display_name ?? p.product_name} (${p.product_name}): ` +
+              `${p.business_outcome ?? ''} | KPIs: ${(p.kpis ?? []).join(', ') || 'n/a'} | ` +
+              `tables: ${tables || 'n/a'}${p.issue ? ` | issue: ${p.issue}` : ''}`
+            );
+          })
+          .join('\n');
+        const prompt =
+          `You are a data & analytics strategist with deep industry domain expertise. Analyze the ` +
+          `business domain "${domainLabel}" using ONLY the products, KPIs, and tables listed below — ` +
+          `do not invent tables or columns. Apply domain expertise from outside the data to identify ` +
+          `high-value use cases and real data gaps.\n\n` +
+          `DOMAIN PRODUCTS:\n${productLines}\n\n` +
+          (b.components_summary ? `SCHEMA DETAIL:\n${b.components_summary.slice(0, 6000)}\n\n` : '') +
+          `Return ONLY a JSON object (no prose) with this exact shape:\n` +
+          `{"flagship":{"use_case":"","rationale":""},` +
+          `"use_cases":[{"title":"","roi_tier":"High|Medium|Low","opportunity_score":0,"revenue_potential_k":0,"value_driver":"",` +
+          `"data_readiness":"","effort":"Low|Medium|High","time_to_value":"","products":[""],` +
+          `"tables":[""],"description":""}],` +
+          `"data_gaps":[{"gap":"","why_it_matters":"","severity":"Critical|Important|Nice-to-have","unblocks":[""]}]}\n` +
+          `opportunity_score is an integer 0-100 reflecting overall opportunity (value vs. data ` +
+          `readiness and effort); higher = better. revenue_potential_k is an illustrative annual ` +
+          `impact in THOUSANDS of USD ($K) based on industry benchmarks for this use-case type ` +
+          `(not derived from this data). Rank use_cases by opportunity_score (highest ` +
+          `first), consistent with roi_tier. Map each to the products/tables above. ` +
+          `Name data gaps a domain expert would flag as missing for these use cases.`;
+
+        let analysis: Record<string, unknown> | null = null;
+        let llmUsed = false;
+        const raw = await llmComplete(prompt, 4000, { label: 'domain-analysis' });
+        if (raw) {
+          const parsed = parseAnalysisJson(raw);
+          if (parsed && Array.isArray(parsed.use_cases)) {
+            // normalize opportunity_score (LLM may omit or return out-of-range);
+            // derive a fallback from roi_tier so the numeric column is always present.
+            const useCases = (parsed.use_cases as Record<string, unknown>[]).map((u) => {
+              const tierVal = String(u.roi_tier ?? 'Medium');
+              const rawScore = Number(u.opportunity_score);
+              const score = Number.isFinite(rawScore)
+                ? Math.max(0, Math.min(100, Math.round(rawScore)))
+                : tierVal === 'High'
+                  ? 75
+                  : tierVal === 'Low'
+                    ? 30
+                    : 50;
+              // revenue_potential_k: illustrative $K; fall back to a tier benchmark
+              const rawRev = Number(u.revenue_potential_k);
+              const revenue_potential_k =
+                Number.isFinite(rawRev) && rawRev > 0
+                  ? Math.round(rawRev)
+                  : tierVal === 'High'
+                    ? 1500
+                    : tierVal === 'Low'
+                      ? 200
+                      : 600;
+              return { ...u, opportunity_score: score, revenue_potential_k };
+            });
+            useCases.sort(
+              (a, b) => Number(b.opportunity_score ?? 0) - Number(a.opportunity_score ?? 0)
+            );
+            analysis = {
+              domain,
+              domain_label: domainLabel,
+              llm_used: true,
+              flagship: parsed.flagship ?? { use_case: '', rationale: '' },
+              use_cases: useCases,
+              data_gaps: Array.isArray(parsed.data_gaps) ? parsed.data_gaps : [],
+            };
+            llmUsed = true;
+          }
+        }
+        if (!analysis) {
+          analysis = heuristicAnalysis(domain, domainLabel, products);
+        }
+
+        try {
+          const who = await whoami();
+          await lbQuery(
+            `INSERT INTO jai_domain_analysis (analysis_id, schema_label, domain_name, domain_label, ` +
+              `signature, analysis_json, llm_used, generated_by, generated_at) ` +
+              `VALUES ($1,$2,$3,$4,$5,$6,$7,$8, now()) ` +
+              `ON CONFLICT (analysis_id) DO UPDATE SET domain_label=EXCLUDED.domain_label, ` +
+              `signature=EXCLUDED.signature, analysis_json=EXCLUDED.analysis_json, ` +
+              `llm_used=EXCLUDED.llm_used, generated_by=EXCLUDED.generated_by, generated_at=now()`,
+            [
+              analysisId(schema, domain),
+              schema,
+              domain,
+              domainLabel,
+              String(b.signature ?? ''),
+              JSON.stringify(analysis),
+              llmUsed,
+              who,
+            ]
+          );
+          res.json({ ok: true, analysis_id: analysisId(schema, domain), llm_used: llmUsed, analysis });
+        } catch (err) {
+          // persistence failed (e.g. no Lakebase locally) — still return the analysis
+          res.json({ ok: true, analysis_id: analysisId(schema, domain), llm_used: llmUsed, analysis, persist_warning: humanizeSqlError(err) });
+        }
+      });
+
+      app.get('/api/domain-analysis', async (req, res) => {
+        const schema = String(req.query.schema ?? '').trim();
+        const domain = String(req.query.domain ?? '').trim();
+        if (!schema || !domain) {
+          res.json({ analysis: null });
+          return;
+        }
+        try {
+          const rows = await lbQuery<{ analysis_json: string; signature: string; llm_used: boolean; generated_by: string; generated_at: string }>(
+            `SELECT analysis_json, signature, llm_used, generated_by, ` +
+              `to_char(generated_at, 'YYYY-MM-DD HH24:MI:SS') AS generated_at ` +
+              `FROM jai_domain_analysis WHERE analysis_id = $1 LIMIT 1`,
+            [analysisId(schema, domain)]
+          );
+          if (rows.length === 0) {
+            res.json({ analysis: null });
+            return;
+          }
+          const r = rows[0];
+          let parsed: unknown = null;
+          try {
+            parsed = JSON.parse(r.analysis_json);
+          } catch {
+            /* corrupt row */
+          }
+          res.json({
+            analysis: parsed,
+            signature: r.signature,
+            llm_used: r.llm_used,
+            generated_by: r.generated_by,
+            generated_at: r.generated_at,
+          });
+        } catch (err) {
+          res.json({ analysis: null, error: humanizeSqlError(err) });
+        }
+      });
+
+      // ============ Use-case data-product drafts (staging → completed) =======
+      // Describe a Domain Analysis use case as a data product (KPIs, tables,
+      // proposed Genie spaces + metric views). Drafts stage here; only 'completed'
+      // ones surface in Data Products. LLM-authored with a deterministic fallback.
+      type DraftContract = {
+        serving_object: string;
+        grain: string;
+        schema: { name: string; type: string; nullable: boolean; key: boolean }[];
+        quality_checks: { id: string; rule: string }[];
+        freshness: { sla: string; basis: string };
+        scope: { included: string; excluded: string };
+        assumptions: string[];
+        lineage: { sources: string[]; serving: string };
+      };
+      type UseCaseProductSpec = {
+        title: string;
+        summary: string;
+        kpis: { name: string; definition: string }[];
+        tables: string[];
+        genie_spaces: { name: string; purpose: string }[];
+        metric_views: { name: string; dimensions: string[]; measures: string[] }[];
+        products: string[];
+        contract?: DraftContract;
+        data_gaps?: { gap: string; why_it_matters: string; severity: string }[];
+      };
+      const slugify = (s: string) =>
+        s.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 40) || 'use_case';
+
+      // Build a deterministic data contract from a spec (serving view over the
+      // draft's tables/KPIs). Used as the fallback and to backfill an LLM omission.
+      const buildDraftContract = (slug: string, tables: string[], kpiNames: string[]): DraftContract => {
+        const serving = `jai_ontos.demo_schema.jai_${slug}_serving`;
+        const schema = [
+          { name: 'entity_key', type: 'string', nullable: false, key: true },
+          { name: 'business_date', type: 'date', nullable: false, key: true },
+          ...kpiNames.map((k) => ({
+            name: k.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '') || 'measure',
+            type: 'decimal(18,4)',
+            nullable: true,
+            key: false,
+          })),
+        ];
+        const quality_checks = [
+          { id: 'unique_grain', rule: 'count(*) = count(distinct entity_key, business_date)' },
+          ...kpiNames.slice(0, 4).map((k) => ({
+            id: `non_negative_${k.toLowerCase().replace(/[^a-z0-9]+/g, '_')}`,
+            rule: `min(${k.toLowerCase().replace(/[^a-z0-9]+/g, '_') || 'measure'}) >= 0`,
+          })),
+        ];
+        return {
+          serving_object: serving,
+          grain: 'one row per (entity_key, business_date)',
+          schema,
+          quality_checks: quality_checks.length ? quality_checks : [{ id: 'row_count_positive', rule: 'count(*) > 0' }],
+          freshness: { sla: 'data available by 06:00 local for prior business_date', basis: 'business_date' },
+          scope: {
+            included: `Records derived from ${tables.join(', ') || 'the source tables'} for this data product.`,
+            // do not claim PII handling the app has not checked
+            excluded: 'Rows outside the product grain. Personal-data handling is not assessed here — confirm with the data owner.',
+          },
+          assumptions: [
+            'Serving object is proposed (not yet materialized).',
+            'Column types are indicative; confirm against the physical schema.',
+            'Grain is proposed, not verified against the data.',
+          ],
+          lineage: { sources: tables, serving },
+        };
+      };
+
+      const heuristicSpec = (
+        title: string,
+        useCase: { value_driver?: string; description?: string; kpis?: string[]; tables?: string[]; products?: string[] }
+      ): UseCaseProductSpec => {
+        const slug = slugify(title);
+        const tables = useCase.tables ?? [];
+        const kpiNames = useCase.kpis ?? [];
+        return {
+          title,
+          summary: useCase.description || useCase.value_driver || `Data product for "${title}".`,
+          kpis: kpiNames.map((k) => ({ name: k, definition: '' })),
+          tables,
+          genie_spaces: [
+            { name: `${slug}_genie`, purpose: `Natural-language Q&A over the ${title} data product.` },
+          ],
+          metric_views: [
+            {
+              // Dimensions were hardcoded to ['date','store','product'] — retail
+              // concepts that don't exist in most schemas. Derive them from the
+              // product's own dimension tables instead, and propose none rather
+              // than inventing names when there are no dimensions to name.
+              name: `jai_${slug}_metrics`,
+              dimensions: tables
+                .filter((t) => /(^|\.)(dim_|d_)/i.test(t))
+                .map((t) => (t.split('.').pop() ?? t).replace(/^(dim_|d_)/i, ''))
+                .slice(0, 4),
+              measures: kpiNames,
+            },
+          ],
+          products: useCase.products ?? [],
+          contract: buildDraftContract(slug, tables, kpiNames),
+        };
+      };
+
+      app.post('/api/use-case-product/describe', async (req, res) => {
+        const b = (req.body ?? {}) as {
+          schema_label?: string;
+          domain_name?: string;
+          use_case?: {
+            title?: string;
+            value_driver?: string;
+            description?: string;
+            kpis?: string[];
+            tables?: string[];
+            products?: string[];
+          };
+          data_gaps?: { gap?: string; why_it_matters?: string; severity?: string }[];
+        };
+        const schema = String(b.schema_label ?? '').trim();
+        const domain = String(b.domain_name ?? '').trim();
+        const uc = b.use_case ?? {};
+        const title = String(uc.title ?? '').trim();
+        const dataGaps = (Array.isArray(b.data_gaps) ? b.data_gaps : [])
+          .filter((g) => g && g.gap)
+          .map((g) => ({
+            gap: String(g.gap),
+            why_it_matters: String(g.why_it_matters ?? ''),
+            severity: String(g.severity ?? 'Important'),
+          }));
+        if (!schema || !domain || !title) {
+          res.status(400).json({ ok: false, error: 'schema_label, domain_name and use_case.title required' });
+          return;
+        }
+
+        const prompt =
+          `You are a data product manager. Describe the analytics use case "${title}" as a concrete ` +
+          `DATA PRODUCT, using ONLY the inputs below — do not invent tables. Propose Genie space(s) ` +
+          `and metric view(s) by NAME and definition (they will be created later; do not assume they ` +
+          `exist).\n\n` +
+          `USE CASE: ${title}\n` +
+          `VALUE DRIVER: ${uc.value_driver ?? ''}\n` +
+          `DESCRIPTION: ${uc.description ?? ''}\n` +
+          `KPIs: ${(uc.kpis ?? []).join(', ') || 'n/a'}\n` +
+          `TABLES: ${(uc.tables ?? []).join(', ') || 'n/a'}\n` +
+          `SOURCE PRODUCTS: ${(uc.products ?? []).join(', ') || 'n/a'}\n\n` +
+          `Also produce a DATA CONTRACT for the serving object (a governed view over the tables): ` +
+          `grain, schema columns (name/type/nullable/key), quality checks, freshness SLA, scope, ` +
+          `assumptions, and lineage (source tables → serving object).\n` +
+          `Return ONLY JSON with this exact shape:\n` +
+          `{"title":"","summary":"","kpis":[{"name":"","definition":""}],"tables":[""],` +
+          `"genie_spaces":[{"name":"","purpose":""}],` +
+          `"metric_views":[{"name":"","dimensions":[""],"measures":[""]}],"products":[""],` +
+          `"contract":{"serving_object":"","grain":"","schema":[{"name":"","type":"","nullable":true,"key":false}],` +
+          `"quality_checks":[{"id":"","rule":""}],"freshness":{"sla":"","basis":""},` +
+          `"scope":{"included":"","excluded":""},"assumptions":[""],` +
+          `"lineage":{"sources":[""],"serving":""}}}`;
+
+        let spec: UseCaseProductSpec | null = null;
+        let llmUsed = false;
+        const raw = await llmComplete(prompt, 2500, { label: 'use-case-product' });
+        if (raw) {
+          const parsed = parseAnalysisJson(raw) as UseCaseProductSpec | null;
+          if (parsed && Array.isArray(parsed.kpis)) {
+            spec = { ...parsed, title };
+            // backfill the contract if the LLM omitted it or returned an empty one
+            if (!spec.contract || !Array.isArray(spec.contract.schema) || spec.contract.schema.length === 0) {
+              spec.contract = buildDraftContract(
+                slugify(title),
+                spec.tables ?? [],
+                (spec.kpis ?? []).map((k) => k.name)
+              );
+            }
+            llmUsed = true;
+          }
+        }
+        if (!spec) spec = heuristicSpec(title, uc);
+        // attach the domain data gaps relevant to this use case (from the request)
+        spec.data_gaps = dataGaps;
+
+        const draftId = `ucp_${createHash('sha256').update(`${schema}|${domain}|${title}`).digest('hex').slice(0, 40)}`;
+        try {
+          const who = await whoami();
+          await lbQuery(
+            `INSERT INTO jai_use_case_product (draft_id, schema_label, domain_name, use_case_title, ` +
+              `spec_json, llm_used, status, created_by, created_at, updated_at) ` +
+              `VALUES ($1,$2,$3,$4,$5,$6,'draft',$7, now(), now()) ` +
+              `ON CONFLICT (draft_id) DO UPDATE SET spec_json=EXCLUDED.spec_json, ` +
+              `llm_used=EXCLUDED.llm_used, updated_at=now()`,
+            [draftId, schema, domain, title, JSON.stringify(spec), llmUsed, who]
+          );
+          res.json({ ok: true, draft_id: draftId, llm_used: llmUsed, spec });
+        } catch (err) {
+          res.json({ ok: true, draft_id: draftId, llm_used: llmUsed, spec, persist_warning: humanizeSqlError(err) });
+        }
+      });
+
+      app.get('/api/use-case-products', async (req, res) => {
+        const schema = String(req.query.schema ?? '').trim();
+        const domain = String(req.query.domain ?? '').trim();
+        if (!schema) {
+          res.json({ drafts: [] });
+          return;
+        }
+        const params: unknown[] = [schema];
+        let clause = `schema_label = $1`;
+        if (domain) {
+          params.push(domain);
+          clause += ` AND domain_name = $2`;
+        }
+        try {
+          const rows = await lbQuery(
+            `SELECT draft_id, schema_label, domain_name, use_case_title, spec_json, llm_used, status, ` +
+              `created_by, to_char(updated_at, 'YYYY-MM-DD HH24:MI:SS') AS updated_at ` +
+              `FROM jai_use_case_product WHERE ${clause} ORDER BY updated_at DESC LIMIT 500`,
+            params
+          );
+          res.json({ drafts: rows });
+        } catch (err) {
+          res.json({ drafts: [], error: humanizeSqlError(err) });
+        }
+      });
+
+      app.post('/api/use-case-product/status', async (req, res) => {
+        const b = (req.body ?? {}) as { draft_id?: string; status?: string };
+        const draftId = String(b.draft_id ?? '').trim();
+        const status = String(b.status ?? '').trim();
+        if (!draftId || !['draft', 'completed'].includes(status)) {
+          res.status(400).json({ ok: false, error: "draft_id and status ('draft'|'completed') required" });
+          return;
+        }
+        try {
+          await lbQuery(`UPDATE jai_use_case_product SET status = $1, updated_at = now() WHERE draft_id = $2`, [
+            status,
+            draftId,
+          ]);
+          res.json({ ok: true });
+        } catch (err) {
+          res.json({ ok: false, error: humanizeSqlError(err) });
+        }
+      });
+
+      // Update a draft's editable spec (title/summary/KPIs/tables/genie/metric-views).
+      app.post('/api/use-case-product/update', async (req, res) => {
+        const b = (req.body ?? {}) as { draft_id?: string; spec?: UseCaseProductSpec };
+        const draftId = String(b.draft_id ?? '').trim();
+        const spec = b.spec;
+        if (!draftId || !spec || typeof spec !== 'object') {
+          res.status(400).json({ ok: false, error: 'draft_id and spec required' });
+          return;
+        }
+        try {
+          const rows = await lbQuery<{ n: string }>(
+            `SELECT count(*)::text AS n FROM jai_use_case_product WHERE draft_id = $1`,
+            [draftId]
+          );
+          if (rows[0]?.n === '0') {
+            res.json({ ok: false, error: 'draft not found' });
+            return;
+          }
+          await lbQuery(
+            `UPDATE jai_use_case_product SET spec_json = $1, use_case_title = $2, updated_at = now() WHERE draft_id = $3`,
+            [JSON.stringify(spec), String(spec.title ?? ''), draftId]
+          );
+          res.json({ ok: true });
+        } catch (err) {
+          res.json({ ok: false, error: humanizeSqlError(err) });
+        }
+      });
+
+      app.post('/api/use-case-product/delete', async (req, res) => {
+        const draftId = String((req.body as { draft_id?: string })?.draft_id ?? '').trim();
+        if (!draftId) {
+          res.status(400).json({ ok: false, error: 'draft_id required' });
+          return;
+        }
+        try {
+          await lbQuery(`DELETE FROM jai_use_case_product WHERE draft_id = $1`, [draftId]);
+          res.json({ ok: true });
+        } catch (err) {
+          res.json({ ok: false, error: humanizeSqlError(err) });
+        }
+      });
+
+      // ================= Governed serving-view live check =================
+      app.get('/api/serving-view-check', async (req, res) => {
+        const object = String(req.query.object ?? '').trim();
+        const m = object.match(/^([A-Za-z0-9_]+)\.([A-Za-z0-9_]+)\.([A-Za-z0-9_]+)$/);
+        if (!m) {
+          res.json({ present: false, error: 'need a 3-part catalog.schema.view name' });
+          return;
+        }
+        const [, cat, sch, view] = m;
+        try {
+          const rows = await runSql(
+            `SELECT count(*) AS n FROM ${cat}.information_schema.tables WHERE table_schema='${sch}' AND table_name='${view}'`
+          );
+          const n = Number(rows[0]?.n ?? rows[0]?.N ?? 0) || 0;
+          res.json({ present: n > 0, object });
+        } catch (e) {
+          // permission/other error → "cannot verify", not "absent"
+          res.json({ present: false, object, error: humanizeSqlError(e) });
+        }
+      });
+
+      // ================= Business / reasoning rules =================
+      app.get('/api/business-rules', async (req, res) => {
+        const domain = String(req.query.domain ?? '').trim();
+        if (!domain) {
+          res.json({ rules: [] });
+          return;
+        }
+        try {
+          const rows = await lbQuery(
+            `SELECT rule_id, domain, name, if_conditions, then_conclusion, concepts, evidence, eval_sql, eval_table, enabled, origin ` +
+              `FROM jai_business_rules WHERE domain = $1 ORDER BY rule_id`,
+            [domain]
+          );
+          res.json({ rules: rows });
+        } catch (err) {
+          res.json({ rules: [], error: humanizeSqlError(err) });
+        }
+      });
+      app.post('/api/business-rule', async (req, res) => {
+        const b = (req.body ?? {}) as {
+          rule_id?: string; domain?: string; name?: string; if_conditions?: unknown;
+          then_conclusion?: string; concepts?: unknown; evidence?: string; eval_sql?: string; eval_table?: string; enabled?: boolean;
+        };
+        const domain = String(b.domain ?? '').trim();
+        if (!domain || !b.name) {
+          res.status(400).json({ ok: false, error: 'domain and name required' });
+          return;
+        }
+        const ruleId = String(b.rule_id ?? '').trim() || `rr_${Date.now().toString(36)}_${randomUUID().slice(0, 8)}`;
+        const asJson = (v: unknown) => (typeof v === 'string' ? v : JSON.stringify(v ?? []));
+        try {
+          const who = await whoami();
+          await lbQuery(
+            `INSERT INTO jai_business_rules (rule_id, domain, name, if_conditions, then_conclusion, concepts, evidence, ` +
+              `eval_sql, eval_table, enabled, origin, created_by, created_at, updated_at) ` +
+              `VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'user',$11, now(), now()) ` +
+              `ON CONFLICT (rule_id) DO UPDATE SET name=EXCLUDED.name, if_conditions=EXCLUDED.if_conditions, ` +
+              `then_conclusion=EXCLUDED.then_conclusion, concepts=EXCLUDED.concepts, evidence=EXCLUDED.evidence, ` +
+              `eval_sql=EXCLUDED.eval_sql, eval_table=EXCLUDED.eval_table, enabled=EXCLUDED.enabled, updated_at=now()`,
+            [ruleId, domain, String(b.name), asJson(b.if_conditions), String(b.then_conclusion ?? ''),
+             asJson(b.concepts), String(b.evidence ?? ''), b.eval_sql ? String(b.eval_sql) : null,
+             b.eval_table ? String(b.eval_table) : null, b.enabled === false ? false : true, who]
+          );
+          res.json({ ok: true, rule_id: ruleId });
+        } catch (err) {
+          res.json({ ok: false, error: humanizeSqlError(err) });
+        }
+      });
+      app.post('/api/delete-business-rule', async (req, res) => {
+        const id = String((req.body as { rule_id?: string })?.rule_id ?? '').trim();
+        if (!id) {
+          res.status(400).json({ ok: false, error: 'rule_id required' });
+          return;
+        }
+        try {
+          await lbQuery(`DELETE FROM jai_business_rules WHERE rule_id = $1`, [id]);
+          res.json({ ok: true });
+        } catch (err) {
+          res.json({ ok: false, error: humanizeSqlError(err) });
+        }
+      });
+      // Evaluate a rule's IF-condition against its backing table (prescriptive tie-in)
+      app.post('/api/evaluate-business-rule', async (req, res) => {
+        const b = (req.body ?? {}) as { eval_table?: string; eval_sql?: string };
+        const table = String(b.eval_table ?? '').trim();
+        const where = String(b.eval_sql ?? '').trim();
+        if (!/^[A-Za-z0-9_]+(\.[A-Za-z0-9_]+){1,2}$/.test(table) || !where) {
+          res.json({ ok: false, error: 'need eval_table (qualified) and eval_sql (WHERE predicate)' });
+          return;
+        }
+        // reject mutating / multi-statement predicates
+        if (/;|\b(insert|update|delete|drop|create|alter|merge|grant|truncate)\b/i.test(where)) {
+          res.json({ ok: false, error: 'eval_sql must be a read-only WHERE predicate' });
+          return;
+        }
+        try {
+          const rows = await runSql(`SELECT count(*) AS matches FROM ${table} WHERE ${where}`);
+          res.json({ ok: true, matches: Number(rows[0]?.matches ?? 0) || 0 });
+        } catch (e) {
+          res.json({ ok: false, error: humanizeSqlError(e) });
+        }
+      });
+
+      // ================= Action Center: full exception rows (drill-through) =====
+      app.post('/api/exception-rows', async (req, res) => {
+        const b = (req.body ?? {}) as { product?: string; limit?: number };
+        const product = String(b.product ?? '').trim();
+        const limit = Math.min(Math.max(Number(b.limit ?? 200) || 200, 1), 1000);
+        const sql = demoExceptionSql(product, limit);
+        const aggregate = demoAggregateSql(product);
+        if (!sql) {
+          res.status(400).json({ rows: [], error: 'not a data-backed product' });
+          return;
+        }
+        try {
+          const rows = await runSql(sql);
+          res.json({ rows, sql, aggregate_sql: aggregate, count: rows.length });
+        } catch (e) {
+          res.json({ rows: [], sql, error: humanizeSqlError(e) });
+        }
+      });
     });
   },
 }).catch(console.error);
@@ -991,6 +3381,13 @@ function humanizeSqlError(err: unknown): string {
   const msg = String((err as { message?: string })?.message ?? err);
   if (/permission|access|denied|not authorized|PERMISSION_DENIED|forbidden/i.test(msg)) {
     return 'No access — the app service principal lacks permission on this catalog/schema.';
+  }
+  // Spark leaves unresolved tables as `'UnresolvedRelation [schema, table]` in the
+  // (parsed) plan — surface the missing table + why, instead of the raw plan tree.
+  const unresolved = msg.match(/UnresolvedRelation\s*\[([^\]]+)\]/i);
+  if (unresolved) {
+    const table = unresolved[1].split(',').map((s) => s.trim()).filter(Boolean).join('.');
+    return `Table \`${table}\` not found in the connected warehouse. Its catalog isn't qualified (or the schema isn't physically present here), so the view can't be verified against live data.`;
   }
   if (/does not exist|not found|cannot be found|TABLE_OR_VIEW_NOT_FOUND|SCHEMA_NOT_FOUND/i.test(msg)) {
     return 'Not found — no matching catalog/schema/tables (or no access).';

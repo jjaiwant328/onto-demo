@@ -12,15 +12,18 @@ import type { ReactNode } from 'react';
 import catalogJson from '../data/catalog.json';
 import schemaJson from '../data/schema.json';
 import schemaQsrJson from '../data/schema.qsr.json';
+import schemaQsrScJson from '../data/schema.qsr_sc.json';
 import {
   deriveProduct,
   buildEnterpriseGraph,
+  isCuratedMeasure,
   type Catalog,
   type CatalogDomain,
   type CatalogProduct,
   type DerivedComponents,
   type EnterpriseGraph,
   type GraphProductLink,
+  type Origin,
   type Schema,
 } from './deriveComponents';
 import { fetchProductLinks } from './productLinks';
@@ -32,12 +35,41 @@ import {
   type OntologyOverride,
 } from './ontologyOverrides';
 import { buildCatalog } from './catalogGen';
-import { DEMO_DOMAINS } from '../../../shared/demoDomains';
+import { DEMO_DOMAINS, DEMO_SCHEMA, QSR_SC_DOMAINS } from '../../../shared/demoDomains';
+import {
+  assembleArtifactInput,
+  artifactSignature,
+  generateArtifact,
+  fetchArtifact,
+  type StoredArtifact,
+  type ArtifactRuleInput,
+} from './ontologyArtifact';
 import { combineSchemas, type SchemaEntry, type ConformanceInfo } from './combineSchemas';
+import {
+  analysisSignature,
+  generateDomainAnalysis,
+  fetchDomainAnalysis,
+  toAnalysisProduct,
+  type DomainAnalysis,
+  type DomainAnalysisResult,
+  type UseCase,
+} from './domainAnalysis';
+import {
+  describeUseCaseProduct,
+  fetchUseCaseProducts,
+  setUseCaseProductStatus,
+  updateUseCaseProduct,
+  deleteUseCaseProduct,
+  type UseCaseProductDraft,
+  type UseCaseProductSpec,
+  type DescribeResult,
+  type DraftStatus,
+} from './useCaseProduct';
 
 const DEFAULT_CATALOG = catalogJson as unknown as Catalog;
 const DEFAULT_SCHEMA = schemaJson as unknown as Schema;
 const QSR_SCHEMA = schemaQsrJson as unknown as Schema;
+const QSR_SC_SCHEMA_JSON = schemaQsrScJson as unknown as Schema;
 
 const CURATED_SCHEMA_ID = 'fc_entdata_gold';
 // scope sentinel: "All domains" / "All products" (the default, broadest scope)
@@ -113,6 +145,12 @@ export type ProductContextValue = {
   saveSchema: (
     args: { customer: string; schemaName: string; source: string; catalogRef?: string; schema: Schema }
   ) => Promise<{ ok: boolean; error?: string }>;
+  // persist an already-loaded (ephemeral) registry entry to the durable store,
+  // converting it in place (keeps its loaded content; no duplicate entry).
+  storeSchema: (
+    entryId: string,
+    opts?: { customer?: string }
+  ) => Promise<{ ok: boolean; error?: string }>;
   deleteSavedSchema: (schemaId: string) => Promise<void>;
   schema: Schema;
   catalog: Catalog;
@@ -143,6 +181,28 @@ export type ProductContextValue = {
   // enterprise map + highlight
   enterpriseGraph: EnterpriseGraph;
   enterpriseHighlight: Set<string>;
+  // re-fetch product links (Genie/dashboard) overlaid on the enterprise graph.
+  // Call after attaching/detaching a link so the graph reflects it without a reload.
+  refreshGraphLinks: () => Promise<void>;
+  // attached Genie/dashboard links for the SELECTED product (live from Lakebase);
+  // overlaid onto the ontology+lineage graph so they appear/update without a reload.
+  productLinks: GraphProductLink[];
+  // generated ontology artifact (OWL/TTL + JSON-LD + graph) for the selected product
+  artifact: StoredArtifact | null;
+  artifactStale: boolean;
+  regenerateArtifact: (opts?: { rules?: ArtifactRuleInput[]; servingViewPresent?: boolean }) => Promise<void>;
+  // domain analysis (ROI-ranked use cases + data gaps) for the selected domain
+  domainAnalysis: DomainAnalysis | null;
+  domainAnalysisStale: boolean;
+  domainAnalyzing: boolean;
+  domainAnalysisLabel: string;
+  regenerateDomainAnalysis: () => Promise<DomainAnalysisResult>;
+  // use-case data-product drafts (staging; completed ones surface in Data Products)
+  useCaseDrafts: UseCaseProductDraft[];
+  describeUseCaseAsProduct: (useCase: UseCase) => Promise<DescribeResult>;
+  setUseCaseDraftStatus: (draftId: string, status: DraftStatus) => Promise<boolean>;
+  removeUseCaseDraft: (draftId: string) => Promise<boolean>;
+  updateUseCaseDraft: (draftId: string, spec: UseCaseProductSpec) => Promise<boolean>;
   // token that changes whenever the active schema selection changes; session-
   // scoped panels (Action queue, Copilot conversation) reset on it so no
   // schema's state leaks into another.
@@ -158,6 +218,12 @@ export type ProductContextValue = {
   setShowActionCenter: (v: boolean) => void;
   showBusinessView: boolean;
   setShowBusinessView: (v: boolean) => void;
+  // Control Tower demo nav group (Home / Action Inbox / Scenario & Impact /
+  // Action Center) — the supply-chain control-tower decision surfaces built for
+  // the flagship demo. Default ON; toggle OFF to show only the generic ontology
+  // tooling. Persisted to localStorage.
+  showControlTower: boolean;
+  setShowControlTower: (v: boolean) => void;
   // leading catalog/namespace segment of the active schema's tables (for
   // schema-accurate data contracts); null when it can't be determined.
   activeSourceCatalog: string | null;
@@ -196,6 +262,7 @@ function builtinSchemas(): RegistrySchema[] {
       curated: true,
     },
     { id: 'qsr_scd', label: 'QSR Supply Chain', schema: QSR_SCHEMA, bundled: true },
+    { id: 'qsr_sc', label: 'QSR Supply Chain Control Tower', schema: QSR_SC_SCHEMA_JSON, bundled: true },
   ];
 }
 
@@ -258,20 +325,50 @@ function applyDomainEdits(catalog: Catalog, edits: DomainEditOp[]): Catalog {
   return { domains: domains.length ? domains : catalog.domains };
 }
 
-// keep only domains/products that reference tables present in the schema
-function sanitizeCatalog(catalog: Catalog, schema: Schema): Catalog {
+// keep only domains/products that reference tables present in the schema.
+//
+// `origin` records who authored these labels/KPIs — pass 'llm' for a catalog that
+// came back from /api/generate-catalog (or was cached from one) so the UI can badge
+// them AI-proposed. This function is the guard on model output: it already drops
+// tables that don't exist, and now also separates KPI names that resolve to a real
+// column from ones that don't.
+export function sanitizeCatalog(catalog: Catalog, schema: Schema, origin?: Origin): Catalog {
   const has = (t: string) => Object.prototype.hasOwnProperty.call(schema, t);
   const domains = catalog.domains
     .map((d) => ({
       ...d,
+      ...(origin ? { labelOrigin: origin } : {}),
       products: d.products
-        .map((p) => ({
-          ...p,
-          fact_tables: (p.fact_tables ?? []).filter(has),
-          dim_tables: (p.dim_tables ?? []).filter(has),
-          kpis: Array.isArray(p.kpis) && p.kpis.length ? p.kpis : ['record_count'],
-          maturity: p.maturity ?? 'incubating',
-        }))
+        .map((p) => {
+          const fact_tables = (p.fact_tables ?? []).filter(has);
+          const kpis = Array.isArray(p.kpis) && p.kpis.length ? p.kpis : ['record_count'];
+          // Columns actually available on this product's surviving fact tables.
+          const factCols = new Set(
+            fact_tables.flatMap((t) => (schema[t] ?? []).map((c) => c.name.toLowerCase()))
+          );
+          // Keep every KPI — a non-column name may be a legitimate composite (a
+          // ratio or rate) rather than a hallucination — but record which ones are
+          // neither column-backed nor curated, so they are never shown as additive
+          // measures. A curated KPI has a real formula in semantic_measures.yaml.
+          const unverifiedKpis = kpis.filter(
+            (k) => !factCols.has(String(k).toLowerCase()) && !isCuratedMeasure(String(k), schema)
+          );
+          // Verified KPIs first: the leading KPI is rendered as the product's
+          // headline, so it should be one we can actually compute.
+          const ordered = [
+            ...kpis.filter((k) => !unverifiedKpis.includes(k)),
+            ...unverifiedKpis,
+          ];
+          return {
+            ...p,
+            fact_tables,
+            dim_tables: (p.dim_tables ?? []).filter(has),
+            kpis: ordered,
+            maturity: p.maturity ?? 'incubating',
+            ...(origin ? { labelOrigin: origin } : {}),
+            ...(unverifiedKpis.length ? { unverifiedKpis } : {}),
+          };
+        })
         .filter((p) => p.fact_tables.length > 0)
         .slice(0, 4),
     }))
@@ -282,6 +379,7 @@ function sanitizeCatalog(catalog: Catalog, schema: Schema): Catalog {
 const SYNC_KEY = 'rt_onto_sync_scope';
 const SHOW_AC_KEY = 'rt_onto_show_action_center'; // nav toggle (default OFF)
 const SHOW_BV_KEY = 'rt_onto_show_business_view'; // nav toggle (default OFF)
+const SHOW_CT_KEY = 'rt_onto_show_control_tower'; // Control Tower demo nav group (default ON)
 // ids of built-in schemas the user has deleted (hidden). Built-ins aren't in
 // Lakebase, so we hide them via localStorage rather than DB-delete.
 const HIDDEN_KEY = 'rt_onto_hidden_builtins';
@@ -364,6 +462,22 @@ export function ProductProvider({ children }: { children: ReactNode }) {
       /* ignore */
     }
   }, []);
+  // Control Tower demo group defaults ON (unset or '1' → shown; explicit '0' hides).
+  const [showControlTower, setShowControlTowerState] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem(SHOW_CT_KEY) !== '0';
+    } catch {
+      return true;
+    }
+  });
+  const setShowControlTower = useCallback((v: boolean) => {
+    setShowControlTowerState(v);
+    try {
+      localStorage.setItem(SHOW_CT_KEY, v ? '1' : '0');
+    } catch {
+      /* ignore */
+    }
+  }, []);
 
   // llm refinement result overlay (applied async, keyed by a signature)
   const [llmCatalog, setLlmCatalog] = useState<{ sig: string; catalog: Catalog } | null>(null);
@@ -380,6 +494,9 @@ export function ProductProvider({ children }: { children: ReactNode }) {
   // the restore effect has run (both fire on mount; the [sig] persist effect
   // would otherwise clobber the saved selection with the initial default).
   const restoredRef = useRef(false);
+  // saved:* ids persisted in the last selection but not yet in the registry
+  // (their content lazy-loads via refreshSavedSchemas); re-selected once merged.
+  const pendingSavedSelRef = useRef<string[]>([]);
 
   const schemaEntries = schemasReg;
   const selected = useMemo(
@@ -390,13 +507,23 @@ export function ProductProvider({ children }: { children: ReactNode }) {
 
   // ---- active schema (single or combined+conformed) ----
   const { schema, conformance } = useMemo(() => {
-    if (selected.length === 0) {
-      return { schema: schemaEntries[0]?.schema ?? {}, conformance: null };
+    let base: Schema;
+    let conf: ConformanceInfo | null = null;
+    if (selected.length === 0) base = schemaEntries[0]?.schema ?? {};
+    else if (selected.length === 1) base = selected[0].schema;
+    else {
+      const r = combineSchemas(selected);
+      base = r.schema;
+      conf = r.info;
     }
-    if (selected.length === 1) return { schema: selected[0].schema, conformance: null };
-    const r = combineSchemas(selected);
-    return { schema: r.schema, conformance: r.info };
-  }, [selected, schemaEntries]);
+    // When the QSR schema is active, merge the data-backed demo tables' real
+    // column shapes so the demo products are genuinely multi-table (Suggest /
+    // Validate / Generate-serving-view operate on real columns).
+    if (selectedSchemaIds.includes('qsr_scd')) {
+      base = { ...base, ...(DEMO_SCHEMA as Schema) };
+    }
+    return { schema: base, conformance: conf };
+  }, [selected, schemaEntries, selectedSchemaIds]);
 
   // ---- active catalog: curated (single curated schema) else generated ----
   const isCuratedSingle =
@@ -428,13 +555,17 @@ export function ProductProvider({ children }: { children: ReactNode }) {
       ? llmCatalog.catalog
       : heuristicCatalog;
 
-  // Overlay the two DATA-BACKED demo domains when the QSR schema is active. These
+  // Overlay the DATA-BACKED demo domains when a backing schema is active. These
   // are real, query-backed domains (badged "Data Avlbl") prepended ahead of the
-  // generated QSR domains, which are left as-is. Config lives in shared/demoDomains.
+  // generated domains, which are left as-is. Config lives in shared/demoDomains:
+  //  • qsr_scd  → the qsr_demo demo domains (DQ / Demand)
+  //  • qsr_sc   → the QSR Supply Chain Control Tower domains (3 ontology layers)
   const qsrActive = selectedSchemaIds.includes('qsr_scd');
+  const qsrScActive = selectedSchemaIds.includes('qsr_sc');
   const baseCatalog = useMemo(() => {
-    if (!qsrActive) return generatedCatalog;
-    const demoDomains: CatalogDomain[] = DEMO_DOMAINS.map((d) => ({
+    const source = qsrActive ? DEMO_DOMAINS : qsrScActive ? QSR_SC_DOMAINS : null;
+    if (!source) return generatedCatalog;
+    const demoDomains: CatalogDomain[] = source.map((d) => ({
       name: d.name,
       label: d.label,
       description: d.description,
@@ -444,7 +575,7 @@ export function ProductProvider({ children }: { children: ReactNode }) {
         display_name: p.display_name,
         business_outcome: p.business_outcome,
         fact_tables: p.fact_tables,
-        dim_tables: [],
+        dim_tables: p.dim_tables ?? [],
         kpis: p.kpis,
         maturity: 'ga',
         dataAvailable: true,
@@ -454,7 +585,7 @@ export function ProductProvider({ children }: { children: ReactNode }) {
     const existing = new Set(demoDomains.map((d) => d.name));
     const rest = generatedCatalog.domains.filter((d) => !existing.has(d.name));
     return { domains: [...demoDomains, ...rest] };
-  }, [qsrActive, generatedCatalog]);
+  }, [qsrActive, qsrScActive, generatedCatalog]);
 
   // ---- session domain edits (delete / combine / unmerge) on top of baseCatalog ----
   // Stored as an ordered list of operations, scoped to the current dataset `sig`
@@ -622,6 +753,24 @@ export function ProductProvider({ children }: { children: ReactNode }) {
     setLlmRefining(true);
     (async () => {
       try {
+        // 1) scope-sig cache (Lakebase) — covers combined + built-in scopes, so
+        // the LLM polish runs ONCE per scope and later reloads are instant.
+        try {
+          const cacheResp = await fetch(`/api/catalog-cache?sig=${encodeURIComponent(sig)}`);
+          const cached = await cacheResp.json();
+          if (!cancelled && cached?.catalog?.domains?.length) {
+            // cached from a previous LLM polish → still AI-authored labels
+            setLlmCatalog({
+              sig,
+              catalog: sanitizeCatalog(cached.catalog as Catalog, schema, 'llm'),
+            });
+            return; // cache hit → skip the LLM entirely
+          }
+        } catch {
+          /* cache unavailable → fall through to the LLM */
+        }
+        if (cancelled) return;
+
         const summary = Object.entries(schema)
           .map(([t, cols]) => `${t}: ${cols.slice(0, 8).map((c) => c.name).join(', ')}`)
           .join('\n')
@@ -633,10 +782,17 @@ export function ProductProvider({ children }: { children: ReactNode }) {
         });
         const data = await resp.json();
         if (!cancelled && data?.llm && data?.catalog?.domains?.length) {
-          const refined = sanitizeCatalog(data.catalog as Catalog, schema);
+          const refined = sanitizeCatalog(data.catalog as Catalog, schema, 'llm');
           setLlmCatalog({ sig, catalog: refined });
-          // persist the refined catalog with the saved schema so the next select
-          // skips the LLM entirely; also cache it on the registry entry in-session.
+          // 2) persist to the scope-sig cache so ANY later reload of this scope
+          // (combined or not) skips the LLM.
+          void fetch('/api/catalog-cache', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ sig, catalog_json: JSON.stringify(refined) }),
+          }).catch(() => {});
+          // also persist against the saved schema + in-session registry entry
+          // (kept for the single-saved-schema fast path in getCuratedCatalogId).
           if (soleSaved) {
             setSchemasReg((prev) =>
               prev.map((s) => (s.savedId === soleSaved ? { ...s, cachedCatalog: refined } : s))
@@ -825,6 +981,42 @@ export function ProductProvider({ children }: { children: ReactNode }) {
     [refreshSavedSchemas]
   );
 
+  // Persist an ephemeral (loaded-but-unsaved) entry to the durable store and convert
+  // it in place: give it the returned saved id so it becomes the durable entry
+  // (keeps its already-loaded content, and mergeSaved won't add a duplicate).
+  const storeSchema = useCallback(
+    async (
+      entryId: string,
+      opts?: { customer?: string }
+    ): Promise<{ ok: boolean; error?: string }> => {
+      const entry = schemasReg.find((s) => s.id === entryId);
+      if (!entry) return { ok: false, error: 'not found' };
+      if (entry.bundled || entry.savedId) return { ok: false, error: 'already persistent' };
+      try {
+        const resp = await fetch('/api/save-schema', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            customer: opts?.customer?.trim() || entry.label,
+            schemaName: entry.label,
+            source: 'stored',
+            schema: entry.schema,
+          }),
+        });
+        const data = await resp.json();
+        if (!data?.ok || !data.schema_id) return { ok: false, error: data?.error ?? 'save failed' };
+        const newId = `saved:${data.schema_id}`;
+        setSchemasReg((prev) => prev.map((s) => (s.id === entryId ? { ...s, id: newId, savedId: data.schema_id } : s)));
+        setSelectedSchemaIds((prev) => prev.map((id) => (id === entryId ? newId : id)));
+        await refreshSavedSchemas();
+        return { ok: true };
+      } catch (err) {
+        return { ok: false, error: err instanceof Error ? err.message : String(err) };
+      }
+    },
+    [schemasReg, refreshSavedSchemas]
+  );
+
   const deleteSavedSchema = useCallback(async (schemaId: string) => {
     try {
       await fetch('/api/delete-saved-schema', {
@@ -885,17 +1077,21 @@ export function ProductProvider({ children }: { children: ReactNode }) {
   }, []);
 
   // restore persisted selection on first load (default = curated schema).
-  // Only restores built-in schema ids (saved/uploaded ids are session/store-driven
-  // and re-appear via the saved-schemas fetch); guards against stale ids.
+  // Restores VISIBLE built-in ids immediately; saved:* ids are stashed as pending
+  // and re-selected once refreshSavedSchemas merges their (lazy) registry entries,
+  // so a stored schema stays ACTIVE across reloads instead of reverting to default.
   useEffect(() => {
     try {
       const raw = localStorage.getItem(LS_KEY);
       if (raw) {
         const p = JSON.parse(raw) as { selectedSchemaIds?: string[] };
-        // only restore VISIBLE built-in ids (skip ones the user has hidden/deleted)
+        const persisted = p.selectedSchemaIds ?? [];
         const visibleIds = new Set(visibleBuiltinSchemas().map((s) => s.id));
-        const valid = (p.selectedSchemaIds ?? []).filter((id) => visibleIds.has(id));
-        if (valid.length) setSelectedSchemaIds(valid);
+        const builtinSel = persisted.filter((id) => visibleIds.has(id));
+        const savedSel = persisted.filter((id) => id.startsWith('saved:'));
+        if (builtinSel.length) setSelectedSchemaIds(builtinSel);
+        // defer saved-schema re-selection until their entries exist in the registry
+        pendingSavedSelRef.current = savedSel;
       }
     } catch {
       /* ignore */
@@ -905,6 +1101,18 @@ export function ProductProvider({ children }: { children: ReactNode }) {
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // once saved schemas are merged into the registry, re-select any that the
+  // persisted selection referenced (fixes "saved schema loses selection on reload").
+  useEffect(() => {
+    const pending = pendingSavedSelRef.current;
+    if (!pending.length) return;
+    const ready = pending.filter((id) => schemasReg.some((s) => s.id === id));
+    if (ready.length) {
+      setSelectedSchemaIds(ready);
+      pendingSavedSelRef.current = [];
+    }
+  }, [schemasReg]);
 
   // leading catalog/namespace of the active schema's tables (for contracts)
   const activeSourceCatalog = useMemo(() => {
@@ -988,14 +1196,15 @@ export function ProductProvider({ children }: { children: ReactNode }) {
   // product links (Genie / dashboard) overlaid onto the enterprise graph. Loaded
   // once on startup from Lakebase; refreshed when links are attached/detached.
   const [graphLinks, setGraphLinks] = useState<GraphProductLink[]>([]);
-  useEffect(() => {
-    void (async () => {
-      const all = await fetchProductLinks();
-      setGraphLinks(
-        all.map((l) => ({ product: l.product ?? '', link_type: l.link_type, url: l.url, label: l.label }))
-      );
-    })();
+  const refreshGraphLinks = useCallback(async () => {
+    const all = await fetchProductLinks();
+    setGraphLinks(
+      all.map((l) => ({ product: l.product ?? '', link_type: l.link_type, url: l.url, label: l.label }))
+    );
   }, []);
+  useEffect(() => {
+    void refreshGraphLinks();
+  }, [refreshGraphLinks]);
 
   // ---- derived artifacts ----
   // effective components = heuristic/LLM derivation with user overrides layered on
@@ -1003,6 +1212,181 @@ export function ProductProvider({ children }: { children: ReactNode }) {
     () => applyOntologyOverrides(deriveProduct(selectedProduct, schema), ontologyOverrides),
     [selectedProduct, schema, ontologyOverrides]
   );
+
+  // ---- ontology artifact (OWL/TTL + JSON-LD + graph) per selected product ----
+  const [artifact, setArtifact] = useState<StoredArtifact | null>(null);
+  // extras supplied by Ontology Studio (rules, live serving-view presence)
+  const [artifactExtras, setArtifactExtras] = useState<{
+    rules?: ArtifactRuleInput[];
+    servingViewPresent?: boolean;
+  }>({});
+  const servingObject = `jai_ontos.demo_schema.jai_${selectedProduct.product_name}_serving`;
+  const productLinksForArtifact = useMemo(
+    () => graphLinks.filter((l) => l.product === selectedProduct.display_name),
+    [graphLinks, selectedProduct]
+  );
+  const currentArtifactModel = useMemo(
+    () =>
+      assembleArtifactInput({
+        components,
+        links: productLinksForArtifact,
+        rules: artifactExtras.rules,
+        servingObject,
+        servingViewPresent: artifactExtras.servingViewPresent,
+      }),
+    [components, productLinksForArtifact, artifactExtras, servingObject]
+  );
+  const artifactStale = useMemo(() => {
+    if (!artifact?.model_json) return true;
+    try {
+      return artifactSignature(currentArtifactModel) !== artifactSignature(JSON.parse(artifact.model_json));
+    } catch {
+      return true;
+    }
+  }, [artifact, currentArtifactModel]);
+  useEffect(() => {
+    let cancelled = false;
+    void fetchArtifact(activeSchemaLabel, selectedProduct.product_name).then((a) => {
+      if (!cancelled) setArtifact(a);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [activeSchemaLabel, selectedProduct.product_name]);
+  const regenerateArtifact = useCallback(
+    async (opts?: { rules?: ArtifactRuleInput[]; servingViewPresent?: boolean }) => {
+      if (opts) setArtifactExtras((prev) => ({ ...prev, ...opts }));
+      const model = assembleArtifactInput({
+        components,
+        links: productLinksForArtifact,
+        rules: opts?.rules ?? artifactExtras.rules,
+        servingObject,
+        servingViewPresent: opts?.servingViewPresent ?? artifactExtras.servingViewPresent,
+      });
+      await generateArtifact(activeSchemaLabel, selectedProduct.product_name, model);
+      setArtifact(await fetchArtifact(activeSchemaLabel, selectedProduct.product_name));
+    },
+    [components, productLinksForArtifact, artifactExtras, servingObject, activeSchemaLabel, selectedProduct.product_name]
+  );
+  // auto-refresh: if an artifact already exists and drifts stale (curation / link /
+  // dashboard / rule change), regenerate it after a short debounce.
+  useEffect(() => {
+    if (!artifact || !artifactStale) return;
+    const t = setTimeout(() => void regenerateArtifact(), 1000);
+    return () => clearTimeout(t);
+  }, [artifact, artifactStale, regenerateArtifact]);
+
+  // ---- domain analysis (ROI-ranked use cases + data-gap analysis) per domain ----
+  // Scoped to the selected domain (all its products). Persisted in Lakebase and
+  // loaded back; regenerable, with a signature-based staleness indicator.
+  const [domainAnalysis, setDomainAnalysisState] = useState<DomainAnalysis | null>(null);
+  const [domainAnalysisSig, setDomainAnalysisSig] = useState<string | null>(null);
+  const [domainAnalyzing, setDomainAnalyzing] = useState(false);
+  // the domain key + label the analysis is scoped to (ALL_SCOPE → all domains)
+  const analysisDomainName = domainScopeAll ? ALL_SCOPE : selectedDomain?.name ?? ALL_SCOPE;
+  const analysisDomainLabel = domainScopeAll ? 'All domains' : selectedDomain?.label ?? 'All domains';
+  const analysisProducts = useMemo(
+    () => productsInDomain.map(toAnalysisProduct),
+    [productsInDomain]
+  );
+  const currentAnalysisSig = useMemo(
+    () => analysisSignature(analysisProducts),
+    [analysisProducts]
+  );
+  const domainAnalysisStale = useMemo(() => {
+    if (!domainAnalysis) return true;
+    return domainAnalysisSig !== currentAnalysisSig;
+  }, [domainAnalysis, domainAnalysisSig, currentAnalysisSig]);
+  useEffect(() => {
+    let cancelled = false;
+    void fetchDomainAnalysis(activeSchemaLabel, analysisDomainName).then((r) => {
+      if (cancelled) return;
+      setDomainAnalysisState(r.analysis);
+      setDomainAnalysisSig(r.signature ?? null);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [activeSchemaLabel, analysisDomainName]);
+  const regenerateDomainAnalysis = useCallback(async () => {
+    setDomainAnalyzing(true);
+    try {
+      const r = await generateDomainAnalysis({
+        schema_label: activeSchemaLabel,
+        domain_name: analysisDomainName,
+        domain_label: analysisDomainLabel,
+        signature: currentAnalysisSig,
+        products: analysisProducts,
+      });
+      if (r.ok && r.analysis) {
+        setDomainAnalysisState(r.analysis);
+        setDomainAnalysisSig(currentAnalysisSig);
+      }
+      return r;
+    } finally {
+      setDomainAnalyzing(false);
+    }
+  }, [activeSchemaLabel, analysisDomainName, analysisDomainLabel, currentAnalysisSig, analysisProducts]);
+
+  // ---- use-case data-product drafts (staging → completed) ----
+  const [useCaseDrafts, setUseCaseDrafts] = useState<UseCaseProductDraft[]>([]);
+  const refreshUseCaseDrafts = useCallback(async () => {
+    if (!activeSchemaLabel) {
+      setUseCaseDrafts([]);
+      return;
+    }
+    setUseCaseDrafts(await fetchUseCaseProducts(activeSchemaLabel));
+  }, [activeSchemaLabel]);
+  useEffect(() => {
+    void refreshUseCaseDrafts();
+  }, [refreshUseCaseDrafts]);
+  const describeUseCaseAsProduct = useCallback(
+    async (useCase: UseCase): Promise<DescribeResult> => {
+      // surface the domain data gaps that unblock THIS use case (or, if none are
+      // explicitly linked, all domain gaps) so the draft can call them out.
+      const allGaps = domainAnalysis?.data_gaps ?? [];
+      const linked = allGaps.filter((g) => (g.unblocks ?? []).includes(useCase.title));
+      const gaps = (linked.length ? linked : allGaps).map((g) => ({
+        gap: g.gap,
+        why_it_matters: g.why_it_matters,
+        severity: g.severity,
+      }));
+      const r = await describeUseCaseProduct({
+        schema_label: activeSchemaLabel,
+        domain_name: analysisDomainName,
+        use_case: useCase,
+        data_gaps: gaps,
+      });
+      if (r.ok) await refreshUseCaseDrafts();
+      return r;
+    },
+    [activeSchemaLabel, analysisDomainName, refreshUseCaseDrafts, domainAnalysis]
+  );
+  const setUseCaseDraftStatus = useCallback(
+    async (draftId: string, status: DraftStatus) => {
+      const ok = await setUseCaseProductStatus(draftId, status);
+      if (ok) await refreshUseCaseDrafts();
+      return ok;
+    },
+    [refreshUseCaseDrafts]
+  );
+  const removeUseCaseDraft = useCallback(
+    async (draftId: string) => {
+      const ok = await deleteUseCaseProduct(draftId);
+      if (ok) await refreshUseCaseDrafts();
+      return ok;
+    },
+    [refreshUseCaseDrafts]
+  );
+  const updateUseCaseDraft = useCallback(
+    async (draftId: string, spec: UseCaseProductSpec) => {
+      const ok = await updateUseCaseProduct(draftId, spec);
+      if (ok) await refreshUseCaseDrafts();
+      return ok;
+    },
+    [refreshUseCaseDrafts]
+  );
+
   const enterpriseGraph = useMemo(
     () => buildEnterpriseGraph(catalog, schema, conformance?.conformedTables, graphLinks),
     [catalog, schema, conformance, graphLinks]
@@ -1052,6 +1436,7 @@ export function ProductProvider({ children }: { children: ReactNode }) {
     savedSchemas,
     refreshSavedSchemas,
     saveSchema,
+    storeSchema,
     deleteSavedSchema,
     schema,
     catalog,
@@ -1075,6 +1460,21 @@ export function ProductProvider({ children }: { children: ReactNode }) {
     unmergeDomain,
     enterpriseGraph,
     enterpriseHighlight,
+    refreshGraphLinks,
+    productLinks: productLinksForArtifact,
+    artifact,
+    artifactStale,
+    regenerateArtifact,
+    domainAnalysis,
+    domainAnalysisStale,
+    domainAnalyzing,
+    domainAnalysisLabel: analysisDomainLabel,
+    regenerateDomainAnalysis,
+    useCaseDrafts,
+    describeUseCaseAsProduct,
+    setUseCaseDraftStatus,
+    removeUseCaseDraft,
+    updateUseCaseDraft,
     isolationKey: sig,
     syncScopeFromSections,
     setSyncScopeFromSections,
@@ -1082,6 +1482,8 @@ export function ProductProvider({ children }: { children: ReactNode }) {
     setShowActionCenter,
     showBusinessView,
     setShowBusinessView,
+    showControlTower,
+    setShowControlTower,
     activeSourceCatalog,
     activeSchemaLabel,
     ontologyOverrides,

@@ -12,6 +12,7 @@ import type {
   UnifiedEdge,
 } from './graphData';
 import { UNIFIED_KIND_COLOR, UNIFIED_KIND_LABEL, ONTO_KIND_COLOR } from './graphData';
+import ontologyJson from '../data/ontology.json';
 
 // ---------- catalog / schema types ------------------------------------------
 export type CatalogProduct = {
@@ -26,6 +27,13 @@ export type CatalogProduct = {
   // data-backed demo product: real backing table + exception data in the serving
   // schema. Surfaced as a "Data Avlbl" badge and enables the "Use Data Avlbl" path.
   dataAvailable?: boolean;
+  // provenance: set when the LLM polish pass authored this product's labels /
+  // business_outcome / kpis (see /api/generate-catalog). Absent = heuristic only.
+  labelOrigin?: Origin;
+  // KPI names that do NOT correspond to a real column on the product's fact
+  // tables. Kept (they may be legitimate composites) but never presented as
+  // column-backed measures. Populated by sanitizeCatalog.
+  unverifiedKpis?: string[];
 };
 export type CatalogDomain = {
   name: string;
@@ -37,6 +45,16 @@ export type CatalogDomain = {
   mergedFrom?: string[];
   // true for the injected data-backed demo domains
   dataAvailable?: boolean;
+  // provenance: 'llm' when the label/description came from the polish pass.
+  labelOrigin?: Origin;
+  // How confidently this grouping was made (see matchDomain in catalogGen):
+  //   strong — several domain keywords matched the table names
+  //   weak   — a single, possibly incidental, keyword hit
+  //   none   — nothing matched; grouped by source schema and shown as unclassified
+  matchStrength?: 'strong' | 'weak' | 'none';
+  matchEvidence?: string;
+  // labels of other domains whose keywords also matched — one-click corrections
+  alternateDomains?: string[];
 };
 export type Catalog = { domains: CatalogDomain[] };
 
@@ -46,6 +64,25 @@ export type Schema = Record<string, SchemaColumn[]>;
 // ---------- derived component shapes (consumed by every section) -------------
 export type ColRole = 'key' | 'measure' | 'attribute';
 
+// ---------- provenance ------------------------------------------------------
+// One vocabulary for "how do we know this?", shared by every component and
+// rendered by <ProvenanceBadge>. `origin` says who asserted it; `evidence` says
+// why, in one human-readable line shown on hover.
+//
+//   observed       read straight from the schema (table/column/type/comment)
+//   heuristic      inferred by a name/type rule — a guess, not a fact
+//   llm            authored by the language model
+//   llm-suggested  proposed by the model, awaiting a human decision
+//   validated      measured against the warehouse (row counts / join hit-rate)
+//   user           a human asserted or confirmed it
+export type Origin =
+  | 'observed'
+  | 'heuristic'
+  | 'llm'
+  | 'user'
+  | 'llm-suggested'
+  | 'validated';
+
 export type DerivedClass = {
   class: string; // id-ish (humanized table)
   label: string;
@@ -54,9 +91,15 @@ export type DerivedClass = {
   derived: boolean;
   role: 'fact' | 'dim' | 'product' | 'view';
   comment: string;
+  // business glossary (user-curated override)
+  definition?: string;
+  synonyms?: string[];
+  origin?: Origin;
+  evidence?: string;
+  // when an entity-rename override is applied, the name it was derived as (so a
+  // curated name is distinguishable from a derived one).
+  renamedFrom?: string;
 };
-// provenance of an inferred component
-export type Origin = 'heuristic' | 'llm' | 'user';
 export type DerivedMapping = {
   class: string;
   property: string;
@@ -66,15 +109,25 @@ export type DerivedMapping = {
   type: string;
   pii?: boolean; // user-flagged PII
   origin?: Origin; // 'user' once a role/pii override is applied
+  evidence?: string; // which rule assigned the role (shown on hover)
+  // set when the PII flag came from a user override (vs. an inferred proposal),
+  // so the most governance-sensitive edit is visibly marked.
+  piiOrigin?: Origin;
 };
 export type DerivedRelationship = {
   predicate: string;
   label: string;
   from: string[];
   to: string;
-  origin?: Origin; // heuristic | llm | user
+  // join columns; when absent the join uses `predicate` on both sides (matches
+  // the heuristic FK case). Differently-named keys (from an accepted LLM
+  // suggestion) carry both so validation can join them.
+  fromColumn?: string;
+  toColumn?: string;
+  origin?: Origin; // heuristic | llm | user | validated
   confidence?: number; // 0..1
   status?: 'confirmed' | 'rejected'; // user confirm/reject (edge_status override)
+  evidence?: string; // why we believe it (matched rule, or measured hit-rate)
 };
 export type DerivedMeasure = {
   measure: string;
@@ -82,6 +135,14 @@ export type DerivedMeasure = {
   unit: string;
   formula: string;
   description: string;
+  // business glossary (user-curated override)
+  definition?: string;
+  synonyms?: string[];
+  origin?: Origin;
+  evidence?: string;
+  // true when the measure name does not resolve to a real source column, so it
+  // must never be presented as an additive column-backed measure.
+  unverified?: boolean;
   // Feature 3 — graph "drivers" overlay (deterministic, no new data):
   drivers?: string[]; // base measures/columns + joined dims this measure depends on
   related?: string[]; // other measures sharing an input with this one
@@ -106,6 +167,69 @@ export type DerivedComponents = {
   unified: UnifiedGraph; // Explore (travel)
   ontologyGraph: GraphData; // Ontology + lineage tab
 };
+
+// Curated KPI definitions from ontology/semantic_measures.yaml (built into
+// ontology.json). A KPI listed here HAS a real, human-authored formula — so it must
+// not be reported as "definition required" just because no single column carries
+// its name. Keyed by measure name.
+// Name-matching alone is unsafe: an uploaded schema from another industry could
+// easily contain a column called `total_customers`, and blindly attaching the
+// retail labor-cost formula to it would badge fabricated logic as "Confirmed" —
+// the strongest trust signal in the app — while referencing columns that schema
+// does not have. So a curated definition applies only when every column its
+// formula references actually exists in the active schema.
+const CURATED_MEASURES = new Map<string, { formula: string; unit: string; description: string }>(
+  (ontologyJson.measures ?? []).map((m) => [
+    m.measure,
+    { formula: m.formula, unit: m.unit, description: m.description },
+  ])
+);
+
+// SQL identifiers in a formula that are functions/keywords rather than columns.
+const SQL_NOISE = new Set([
+  'sum', 'count', 'distinct', 'nullif', 'coalesce', 'case', 'when', 'then', 'else',
+  'end', 'avg', 'min', 'max', 'and', 'or', 'null', 'as', 'cast', 'double', 'int',
+  'decimal', 'then',
+]);
+
+// The columns a curated formula depends on.
+function formulaColumns(formula: string): string[] {
+  return (formula.toLowerCase().match(/[a-z_][a-z0-9_]*/g) ?? []).filter((t) => !SQL_NOISE.has(t));
+}
+
+// A curated definition, but only when it is SAFE to apply to this schema: every
+// column its formula references must exist here. This is what stops a bundled
+// retail formula leaking onto a look-alike column in someone else's data.
+export function curatedMeasureFor(
+  name: string,
+  schema: Schema
+): { formula: string; unit: string; description: string } | null {
+  const curated = CURATED_MEASURES.get(name);
+  if (!curated) return null;
+  const available = new Set(
+    Object.values(schema).flatMap((cols) => cols.map((c) => c.name.toLowerCase()))
+  );
+  // A curated measure may be defined in terms of OTHER curated measures, so resolve
+  // transitively — but every branch must bottom out in a column that really exists
+  // here. Accepting "it's a known measure name" would defeat the whole check, since
+  // the intermediate names are themselves curated retail measures.
+  const resolves = (tok: string, seen: Set<string>): boolean => {
+    if (available.has(tok)) return true;
+    const inner = CURATED_MEASURES.get(tok);
+    if (!inner || seen.has(tok)) return false; // unknown, or a definition cycle
+    const next = new Set(seen).add(tok);
+    return formulaColumns(inner.formula).every((t) => resolves(t, next));
+  };
+  return formulaColumns(curated.formula).every((t) => resolves(t, new Set([name])))
+    ? curated
+    : null;
+}
+
+// Whether a KPI has a curated definition applicable to THIS schema. Used by both
+// deriveProduct and sanitizeCatalog so "unverified" means the same thing in both.
+export function isCuratedMeasure(name: string, schema: Schema): boolean {
+  return curatedMeasureFor(name, schema) !== null;
+}
 
 // ---------- helpers ----------------------------------------------------------
 const NUMERIC = /^(int|integer|bigint|smallint|tinyint|long|decimal|numeric|double|float|real)/i;
@@ -143,6 +267,17 @@ function colRole(name: string, type: string, isFact: boolean): ColRole {
   if (isFact && isNumeric(type)) return 'measure';
   return 'attribute';
 }
+// The rule that produced colRole()'s answer, phrased for a hover tooltip. Keep in
+// lockstep with colRole above — this is what makes an inference auditable.
+function colRoleEvidence(name: string, type: string, isFact: boolean): string {
+  const lower = name.toLowerCase();
+  if (WELL_KNOWN_KEYS.has(lower)) return `"${name}" is a well-known key name`;
+  if (KEYISH.test(lower)) return `name matches key pattern (_key/_id/_number/_num/_code)`;
+  if (isFact && isNumeric(type)) return `numeric column (${type}) on a fact table`;
+  return isNumeric(type)
+    ? `numeric column on a dimension table — not treated as a measure`
+    : `non-numeric, non-key column (${type})`;
+}
 
 // FK heuristic: a (key) column on table A whose name is also a key column on a dim
 // table B implies A -> B. Plus a few normalized aliases (store_num -> store_number).
@@ -179,6 +314,8 @@ export function deriveProduct(product: CatalogProduct, schema: Schema): DerivedC
   });
 
   // ----- classes (one per table) -----
+  // A class corresponds 1:1 to a real table in the schema, so the class itself is
+  // OBSERVED; only its fact/dim role is inferred (see `evidence`).
   const classes: DerivedClass[] = allTables.map((t) => {
     const isFact = factTables.includes(t);
     return {
@@ -189,10 +326,16 @@ export function deriveProduct(product: CatalogProduct, schema: Schema): DerivedC
       derived: false,
       role: isFact ? 'fact' : 'dim',
       comment: isFact ? 'Fact / measure source' : 'Conformed dimension',
+      origin: 'observed',
+      evidence: `table ${t} exists in the loaded schema; classified as ${
+        isFact ? 'a fact' : 'a dimension'
+      } by name/shape`,
     };
   });
 
   // ----- mappings (columns) -----
+  // The column, its name and its type are OBSERVED; the assigned role is a
+  // heuristic, so `evidence` records which rule fired.
   const mappings: DerivedMapping[] = [];
   for (const t of allTables) {
     const isFact = factTables.includes(t);
@@ -205,6 +348,7 @@ export function deriveProduct(product: CatalogProduct, schema: Schema): DerivedC
         column: c.name,
         type: c.type,
         origin: 'heuristic',
+        evidence: colRoleEvidence(c.name, c.type, isFact),
       });
     }
   }
@@ -248,6 +392,9 @@ export function deriveProduct(product: CatalogProduct, schema: Schema): DerivedC
           to: dim,
           origin: 'heuristic',
           confidence: exactName ? 0.9 : 0.6, // exact key-name match = high; normalized-only = medium
+          evidence: exactName
+            ? `both tables have a key column named "${c.name}" — inferred, not a declared constraint`
+            : `key names match only after normalising "${c.name}" → "${k}" — inferred, not a declared constraint`,
         });
         fkEdges.push({ from: shortName(t), to: dim, label: `${c.name} (FK)` });
       }
@@ -269,18 +416,52 @@ export function deriveProduct(product: CatalogProduct, schema: Schema): DerivedC
         unit: c.type,
         formula: `sum(${c.name})`,
         description: `Additive measure from ${shortName(t)}`,
+        origin: 'observed',
+        evidence: `numeric column "${c.name}" (${c.type}) on fact table ${shortName(t)}`,
       });
     }
   }
+  // Headline KPIs that did not resolve to a measure column above. These are NOT
+  // column-backed: either a legitimate composite (a ratio, a rate) whose formula
+  // still has to be defined, or a name the LLM polish proposed that does not
+  // exist in the schema. Either way we must not render them beside real additive
+  // measures with a confident-sounding formula — mark them unverified and say so.
+  const allColNames = new Set(
+    Object.values(schema).flatMap((cols) => cols.map((c) => c.name.toLowerCase()))
+  );
   for (const k of product.kpis) {
     if (seenMeasure.has(k)) continue;
     seenMeasure.add(k);
+    // A curated KPI has a human-authored formula in semantic_measures.yaml, so it
+    // is genuinely defined even though no single column carries its name — but only
+    // if that formula's inputs exist in THIS schema (see curatedMeasureFor).
+    const curated = curatedMeasureFor(k, schema);
+    if (curated) {
+      measures.push({
+        measure: k,
+        type: 'derived',
+        unit: curated.unit,
+        formula: curated.formula,
+        description: curated.description,
+        origin: 'user',
+        evidence: 'definition curated in semantic_measures.yaml',
+      });
+      continue;
+    }
+    const inSchema = allColNames.has(k.toLowerCase());
     measures.push({
       measure: k,
       type: 'derived',
-      unit: 'kpi',
-      formula: 'headline KPI (definition curated in the product contract)',
-      description: 'Headline KPI for this product',
+      unit: inSchema ? 'kpi' : 'unverified',
+      formula: 'not derived from a source column — definition required',
+      description: inSchema
+        ? 'Headline KPI for this product — needs a definition to be computable'
+        : 'Headline KPI with no matching column in the loaded schema',
+      origin: product.labelOrigin === 'llm' ? 'llm' : 'heuristic',
+      unverified: true,
+      evidence: inSchema
+        ? `"${k}" appears in the schema but not as a measure column on this product's fact tables`
+        : `no column named "${k}" exists in the loaded schema`,
     });
   }
 
@@ -531,11 +712,16 @@ export type EnterpriseGraph = UnifiedGraph & {
   sharedDimensions: SharedDimension[];
 };
 
+// Governed views that really exist for the BUNDLED flagship product. These are
+// specific object names in this demo's catalog, not general knowledge, so they are
+// keyed to the one product they belong to (see FLAGSHIP_PRODUCT_WITH_LIVE_VIEWS).
 const SERVING_VIEWS_LIVE = [
   'jai_store_day_traffic_labor',
   'jai_store_efficiency_summary',
   'jai_store_efficiency_opportunities',
 ];
+// The only product entitled to claim the views above.
+const FLAGSHIP_PRODUCT_WITH_LIVE_VIEWS = new Set(['jai_store_traffic_labor_efficiency']);
 
 export function buildEnterpriseGraph(
   catalog: Catalog,
@@ -716,7 +902,10 @@ export function buildEnterpriseGraph(
       }
 
       // 5. metric views
-      if (p.live) {
+      // The named live views belong to the bundled flagship product only. Any other
+      // product flagged live (including one from an uploaded schema) must not claim
+      // them — it would draw graph nodes for views that do not exist in that estate.
+      if (p.live && FLAGSHIP_PRODUCT_WITH_LIVE_VIEWS.has(p.product_name)) {
         for (const v of SERVING_VIEWS_LIVE) {
           const mid = `mv:${v}`;
           if (!nodes[mid]) {
@@ -726,7 +915,7 @@ export function buildEnterpriseGraph(
               kind: 'metric_view',
               kindLabel: ENTERPRISE_KIND_LABEL.metric_view,
               color: ENTERPRISE_KIND_COLOR.metric_view,
-              detail: 'Governed serving view (jai_ontos.demo_schema) — live',
+              detail: 'Governed serving view — live',
               openIn: 'business-view',
             };
           }
@@ -734,18 +923,22 @@ export function buildEnterpriseGraph(
           addEdge(pid, mid, 'serves');
         }
       } else {
+        // A live product whose serving objects we don't know by name still has a
+        // serving layer — don't mislabel it "planned"; just don't invent view names.
         const mid = `mv:${p.product_name}`;
         nodes[mid] = {
           id: mid,
-          label: `${p.product_name} (planned)`,
+          label: p.live ? p.product_name : `${p.product_name} (planned)`,
           kind: 'metric_view',
           kindLabel: ENTERPRISE_KIND_LABEL.metric_view,
           color: ENTERPRISE_KIND_COLOR.metric_view,
-          detail: 'Planned metric view — not yet materialized (no live serving layer)',
+          detail: p.live
+            ? 'Serving layer exists for this product; specific view names are not known here'
+            : 'Planned metric view — not yet materialized (no live serving layer)',
           openIn: 'business-view',
         };
         tag(mid, p.product_name, d.name);
-        addEdge(pid, mid, 'planned');
+        addEdge(pid, mid, p.live ? 'serves' : 'planned');
       }
     }
   }

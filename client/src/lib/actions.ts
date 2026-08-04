@@ -19,6 +19,11 @@ export type ActionItem = {
   opportunity_usd?: number;
   lcpc_gap?: number;
   status: ActionStatus;
+  // provenance of the RECOMMENDATION (root cause + recommended action):
+  //   true  → LLM-generated guidance
+  //   false → deterministic/heuristic (no model)
+  // The issue, priority and $ opportunity are always data-derived.
+  llm?: boolean;
   // simulated execution trail shown after approval
   trail?: string[];
 };
@@ -71,6 +76,7 @@ export function buildExceptionActions(rows: OpportunityRow[]): ActionItem[] {
         store,
         opportunity_usd: usd,
         lcpc_gap: num(r.lcpc_gap),
+        llm: false, // heuristic base; flipped to true once the LLM enriches it
         status: 'pending' as const,
       };
     })
@@ -87,6 +93,7 @@ export function mergeLlmActions(base: ActionItem[], llm: Partial<ActionItem>[]):
     if (!e) return b;
     return {
       ...b,
+      llm: true, // this item's root cause / recommended action came from the model
       priority: (e.priority as ActionPriority) ?? b.priority,
       issue: e.issue ?? b.issue,
       root_cause: e.root_cause ?? b.root_cause,
@@ -98,13 +105,23 @@ export function mergeLlmActions(base: ActionItem[], llm: Partial<ActionItem>[]):
 
 // Simulated, in-session execution trail (no external writes).
 export function simulatedTrail(a: ActionItem): string[] {
-  if (a.source === 'exception') {
-    return [`✓ labor target updated for store ${a.store}`, `✓ store ${a.store} notified`, '✓ tracking ticket opened (simulated)'];
-  }
   if (a.source === 'scenario') {
     return ['✓ staffing plan adjusted for scenario', '✓ ops dashboard flag set', '✓ notification queued (simulated)'];
   }
-  return ['✓ action recorded', '✓ owner notified (simulated)'];
+  if (a.source === 'copilot') {
+    return ['✓ action recorded', '✓ owner notified (simulated)'];
+  }
+  // exception / data-backed. Store-specific for the retail flagship; generic for
+  // aggregate (store-less) exceptions so we never render "store undefined".
+  const hasStore = a.store != null && a.store !== '?' && a.store !== '';
+  if (hasStore) {
+    return [`✓ labor target updated for store ${a.store}`, `✓ store ${a.store} notified`, '✓ tracking ticket opened (simulated)'];
+  }
+  return [
+    '✓ recommendation approved and routed to the data owner',
+    '✓ tracking ticket opened (simulated)',
+    '✓ decision logged to the action log',
+  ];
 }
 
 // ---- in-session queue context (Copilot can push into it too) ----

@@ -17,9 +17,10 @@ import {
   TableHeader,
   TableRow,
 } from '@databricks/appkit-ui/react';
-import { FileDown, CheckCircle2, KeyRound } from 'lucide-react';
+import { FileDown, CheckCircle2, KeyRound, Info, ShieldAlert } from 'lucide-react';
 import { useProduct } from '../lib/product';
-import { deriveContract } from '../lib/contract';
+import { deriveContract, piiCandidatesForProduct } from '../lib/contract';
+import { ProvenanceBadge } from '../components/ProvenanceBadge';
 
 export function DataContract() {
   const navigate = useNavigate();
@@ -28,6 +29,9 @@ export function DataContract() {
     () => deriveContract(selectedProduct, components, { sourceCatalog: activeSourceCatalog ?? undefined }),
     [selectedProduct, components, activeSourceCatalog]
   );
+  // name-based candidates across all the product's tables (incl. joined dims) —
+  // surfaced for confirmation, never presented as a finding
+  const pii = useMemo(() => piiCandidatesForProduct(components), [components]);
 
   return (
     <div className="space-y-6 max-w-5xl">
@@ -46,6 +50,18 @@ export function DataContract() {
         </Button>
       </div>
 
+      <div className="flex items-start gap-2 rounded-md bg-muted/50 p-3 text-sm">
+        <Info className="h-4 w-4 mt-0.5 text-muted-foreground shrink-0" />
+        <span className="text-muted-foreground">
+          A <span className="font-medium">data contract</span> is the governance handshake for this product:
+          the governed <span className="font-medium">serving object</span>, its <span className="font-medium">grain</span>,
+          schema (keys + types), <span className="font-medium">quality checks</span>, freshness SLA, scope, and lineage.
+          It's <span className="font-medium">derived and read-only</span> here (curated for the live flagship) — no action
+          is required. <span className="font-medium">Export PDF</span> produces a shareable brief (contract + ontology +
+          lineage + approved actions) to hand to data owners / consumers.
+        </span>
+      </div>
+
       <Card className="shadow-sm">
         <CardHeader>
           <CardTitle className="flex items-center gap-2">
@@ -58,6 +74,14 @@ export function DataContract() {
               <Badge variant="outline">derived</Badge>
             )}
             <Badge variant="secondary">{contract.status}</Badge>
+            <ProvenanceBadge
+              origin={contract.live ? 'user' : 'heuristic'}
+              evidence={
+                contract.live
+                  ? 'hand-curated contract for the live flagship product, backed by a governed serving view'
+                  : 'grain, keys and quality checks inferred from column names and types — candidates for the data owner to confirm'
+              }
+            />
           </CardTitle>
           <CardDescription>
             Serving object: <code className="text-xs">{contract.serving_object}</code>
@@ -67,6 +91,12 @@ export function DataContract() {
           <div>
             <span className="font-semibold text-foreground">Grain: </span>
             <span className="text-muted-foreground">{contract.grain}</span>
+            {!contract.live && (
+              <span className="text-muted-foreground text-xs">
+                {' '}
+                — asserted from key columns, not yet verified against the data
+              </span>
+            )}
           </div>
         </CardContent>
       </Card>
@@ -150,6 +180,31 @@ export function DataContract() {
               <div className="text-xs uppercase tracking-wide text-muted-foreground">Excluded</div>
               <div className="text-muted-foreground">{contract.scope.excluded}</div>
             </div>
+            {pii.length > 0 && (
+              <div className="flex items-start gap-2 rounded-md border border-amber-300 bg-amber-50/60 p-2.5 dark:bg-amber-950/20">
+                <ShieldAlert className="mt-0.5 h-4 w-4 shrink-0 text-amber-600" />
+                {/* min-w-0 lets this flex child shrink below its content width; without
+                    it the long qualified column names force the card to overflow. */}
+                <div className="min-w-0 flex-1 text-xs">
+                  <span className="font-medium text-foreground">
+                    Possible personal data in this product
+                  </span>
+                  <div className="mt-0.5 text-muted-foreground">
+                    Flagged by column name only — <span className="font-medium">not confirmed</span>.
+                    Review with the data owner and mark the real ones as PII in Ontology Studio.
+                  </div>
+                  {/* one column per line, each able to break mid-token, so a long
+                      table.column name wraps instead of stretching the card */}
+                  <ul className="mt-1.5 space-y-0.5">
+                    {pii.map((c) => (
+                      <li key={c} className="min-w-0">
+                        <code className="text-[11px] break-all text-foreground/80">{c}</code>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              </div>
+            )}
           </CardContent>
         </Card>
       </div>

@@ -38,7 +38,7 @@ export function SchemaLoader() {
     isBundledSchema,
     removeSchema,
     savedSchemas,
-    saveSchema,
+    storeSchema,
     deleteSavedSchema,
     setSelectedSchemas,
   } = useProduct();
@@ -46,12 +46,29 @@ export function SchemaLoader() {
   const [status, setStatus] = useState<string | null>(null);
   const [filterNote, setFilterNote] = useState<string | null>(null);
   const [includeSystem, setIncludeSystem] = useState(false); // filter ON by default
-  const [storeOnLoad, setStoreOnLoad] = useState(false); // persist to the durable store
   const [schemaLabel, setSchemaLabel] = useState('');
   // optional grouping label saved to the store's `customer` field
   const [groupLabel, setGroupLabel] = useState('');
+  const [savingId, setSavingId] = useState<string | null>(null);
+
+  // Persist an ephemeral entry to the durable store (Delta + Volume). Reconciles
+  // the entry to its saved id in place so it stays selected and isn't duplicated.
+  const saveEntry = async (entryId: string) => {
+    setSavingId(entryId);
+    const r = await storeSchema(entryId, { customer: groupLabel.trim() || undefined });
+    setSavingId(null);
+    if (r.ok) {
+      setStatus('Saved to the schema store (survives reloads).');
+      setGroupLabel('');
+    } else {
+      setStatus(`Save failed: ${r.error ?? 'unknown'}`);
+    }
+  };
 
   // shared: filter noise schemas → add to the flat registry + select it.
+  // async to satisfy the onSchema Promise<void> contract (callers await it);
+  // saving is now a separate explicit step, so there's no await in the body.
+  // eslint-disable-next-line @typescript-eslint/require-await
   const applySchema = async (rawSchema: Schema, label: string) => {
     if (Object.keys(rawSchema).length === 0) throw new Error('No tables found.');
 
@@ -80,22 +97,11 @@ export function SchemaLoader() {
       schema,
     };
     addSchema(entry);
-    let storeNote = '';
-    if (storeOnLoad) {
-      setStatus(`Storing "${entryLabel}" to the durable schema store…`);
-      const r = await saveSchema({
-        customer: groupLabel.trim() || entryLabel,
-        schemaName: entryLabel,
-        source: label.toLowerCase(),
-        schema,
-      });
-      storeNote = r.ok
-        ? ' · stored durably (survives reloads)'
-        : ` · store failed: ${r.error ?? 'unknown'}`;
-    }
-    setStatus(`Added "${entryLabel}" (${tableCount} business tables) and selected it.${storeNote}`);
+    setStatus(
+      `Added "${entryLabel}" (${tableCount} business tables) and selected it. ` +
+        `Click Save to persist it (survives reloads).`
+    );
     setSchemaLabel('');
-    setGroupLabel('');
   };
 
   return (
@@ -132,6 +138,8 @@ export function SchemaLoader() {
             <div className="flex flex-col gap-0.5">
               {schemaEntries.map((s) => {
                 const bundled = isBundledSchema(s.id);
+                // ephemeral = loaded this session, not bundled and not yet saved
+                const ephemeral = !bundled && !s.savedId;
                 return (
                   <div
                     key={s.id}
@@ -140,22 +148,42 @@ export function SchemaLoader() {
                     <span className="truncate">
                       {s.label}
                       {bundled && <span className="text-muted-foreground"> · bundled</span>}
+                      {s.savedId && <span className="text-emerald-600"> · saved</span>}
                     </span>
-                    <Button
-                      size="sm"
-                      variant="ghost"
-                      className="h-6 w-6 p-0"
-                      disabled={bundled}
-                      title={bundled ? 'Bundled schema — not removable' : 'Remove schema'}
-                      onClick={() => {
-                        removeSchema(s.id);
-                        setStatus(`Removed schema "${s.label}".`);
-                      }}
-                    >
-                      <Trash2
-                        className={`h-3.5 w-3.5 ${bundled ? 'opacity-30' : 'text-destructive'}`}
-                      />
-                    </Button>
+                    <div className="flex items-center gap-1 shrink-0">
+                      {ephemeral && (
+                        <Button
+                          size="sm"
+                          variant="ghost"
+                          className="h-6 gap-1 px-2 text-xs text-primary"
+                          disabled={savingId === s.id}
+                          title="Save this schema to the store (survives reloads)"
+                          onClick={() => void saveEntry(s.id)}
+                        >
+                          {savingId === s.id ? (
+                            <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                          ) : (
+                            <Save className="h-3.5 w-3.5" />
+                          )}
+                          Save
+                        </Button>
+                      )}
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        className="h-6 w-6 p-0"
+                        disabled={bundled}
+                        title={bundled ? 'Bundled schema — not removable' : 'Remove schema'}
+                        onClick={() => {
+                          removeSchema(s.id);
+                          setStatus(`Removed schema "${s.label}".`);
+                        }}
+                      >
+                        <Trash2
+                          className={`h-3.5 w-3.5 ${bundled ? 'opacity-30' : 'text-destructive'}`}
+                        />
+                      </Button>
+                    </div>
                   </div>
                 );
               })}
@@ -173,10 +201,14 @@ export function SchemaLoader() {
             />
             <Input
               className="text-xs"
-              placeholder="Group label for the durable store (optional)"
+              placeholder="Group label for saving (optional)"
               value={groupLabel}
               onChange={(e) => setGroupLabel(e.target.value)}
             />
+            <p className="text-[11px] text-muted-foreground">
+              Load a schema below, then click <span className="font-medium">Save</span> next to it
+              to persist it to the store (Delta + Volume — survives reloads).
+            </p>
           </div>
 
           <label className="flex items-center gap-2 text-xs cursor-pointer">
@@ -187,12 +219,6 @@ export function SchemaLoader() {
             <Filter className="h-3.5 w-3.5" />
             Include system/pipeline schemas
             <span className="text-muted-foreground">(off = auto-drop dbt/test/DQ)</span>
-          </label>
-
-          <label className="flex items-center gap-2 text-xs cursor-pointer">
-            <Checkbox checked={storeOnLoad} onCheckedChange={(v) => setStoreOnLoad(Boolean(v))} />
-            <Save className="h-3.5 w-3.5" />
-            Store schema (persist to Delta + Volume — survives reloads)
           </label>
 
           <Tabs defaultValue="upload">
