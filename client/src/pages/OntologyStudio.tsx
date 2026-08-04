@@ -462,7 +462,21 @@ export function OntologyStudio() {
                 const gloss = overrideFor('glossary', c.class, 'define');
                 return (
                   <TableRow key={c.class}>
-                    <TableCell className="font-medium">{c.label}</TableCell>
+                    <TableCell className="font-medium">
+                      <div className="flex items-center gap-1.5">
+                        {c.label}
+                        {/* a curated name should not be mistaken for a derived one */}
+                        {c.renamedFrom && (
+                          <Badge
+                            variant="outline"
+                            className="text-[10px] font-normal cursor-help"
+                            title={`Renamed by a person — derived as "${c.renamedFrom}"`}
+                          >
+                            renamed
+                          </Badge>
+                        )}
+                      </div>
+                    </TableCell>
                     <TableCell>
                       <Badge variant={c.role === 'fact' ? 'default' : 'secondary'}>{c.role}</Badge>
                     </TableCell>
@@ -606,6 +620,14 @@ export function OntologyStudio() {
                             }
                             aria-label="PII"
                           />
+                          {/* PII is the most governance-sensitive edit on this row,
+                              so mark it like a role override rather than leaving the
+                              switch as the only signal. */}
+                          {m.piiOrigin === 'user' && (
+                            <Badge variant="outline" className="text-[10px]">
+                              edited
+                            </Badge>
+                          )}
                           {piiOv && (
                             <button
                               type="button"
@@ -951,6 +973,46 @@ export function OntologyStudio() {
         </CardHeader>
         {validation && (
           <CardContent className="space-y-3">
+            {validation.truncated && (
+              <div className="flex items-start gap-2 rounded-md border border-amber-300 bg-amber-50/60 p-2.5 dark:bg-amber-950/20">
+                <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-600" />
+                {/* min-w-0 so long table names wrap instead of stretching the card */}
+                <div className="min-w-0 flex-1 text-xs">
+                  <span className="font-medium text-foreground">Partial validation</span>
+                  <div className="mt-0.5 text-muted-foreground">
+                    This run did not cover the whole product, so the results below are{' '}
+                    <span className="font-medium">not a full check</span>.
+                    {validation.truncated.tables_total > validation.truncated.tables_checked && (
+                      <>
+                        {' '}
+                        Checked {validation.truncated.tables_checked} of{' '}
+                        {validation.truncated.tables_total} tables.
+                      </>
+                    )}
+                    {validation.truncated.relationships_total >
+                      validation.truncated.relationships_checked && (
+                      <>
+                        {' '}
+                        Checked {validation.truncated.relationships_checked} of{' '}
+                        {validation.truncated.relationships_total} relationships.
+                      </>
+                    )}
+                    {validation.truncated.tables_with_extra_keys.length > 0 && (
+                      <>
+                        {' '}
+                        Only the first {validation.truncated.max_keys_per_table} keys were profiled
+                        on:{' '}
+                        {validation.truncated.tables_with_extra_keys.map((t) => (
+                          <code key={t} className="mr-1 break-all text-[11px]">
+                            {t}
+                          </code>
+                        ))}
+                      </>
+                    )}
+                  </div>
+                </div>
+              </div>
+            )}
             <div>
               <div className="text-xs font-medium text-muted-foreground mb-1">Tables</div>
               <Table>

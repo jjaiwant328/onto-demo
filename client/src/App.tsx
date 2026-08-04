@@ -50,6 +50,7 @@ import { SemanticExplorer } from './pages/SemanticExplorer';
 import { BusinessView } from './pages/BusinessView';
 import { GraphExplorer } from './pages/GraphExplorer';
 import { DataContract } from './pages/DataContract';
+import { About } from './pages/About';
 import { ActionCenter } from './pages/ActionCenter';
 import { PrintProduct } from './pages/PrintProduct';
 import { PrintActions } from './pages/PrintActions';
@@ -74,6 +75,7 @@ const NAV_BUILDER = [
   { to: '/semantic-explorer', label: 'Semantic Explorer' },
   { to: '/graph-explorer', label: 'Graph Explorer' },
   { to: '/data-contract', label: 'Data Contract' },
+  { to: '/about', label: 'About' },
 ];
 // optional, gated by a settings toggle
 const NAV_BUSINESS_VIEW = { to: '/business-view', label: 'Business View' };
@@ -592,6 +594,7 @@ const router = createBrowserRouter([
       { path: '/semantic-explorer', element: <SemanticExplorer /> },
       { path: '/graph-explorer', element: <GraphExplorer /> },
       { path: '/data-contract', element: <DataContract /> },
+      { path: '/about', element: <About /> },
       { path: '/action-center', element: <ActionCenter /> },
       { path: '/business-view', element: <BusinessView /> },
       { path: '*', element: <Navigate to="/" replace /> },

@@ -107,12 +107,70 @@ function sourceCatalogOf(components: DerivedComponents, fallback?: string): stri
   return fallback ?? null;
 }
 
+// A real date/time column to hang a freshness SLA on, preferring a key. Returns
+// null when the schema has none — better to say so than to name a phantom column.
+function freshnessBasis(cols: ContractColumn[]): string | null {
+  const temporal = /^(date|timestamp|datetime)/i;
+  const namey = /(date|day|time|_dt$|_ts$|month|year|period)/i;
+  return (
+    cols.find((c) => c.key && (temporal.test(c.type) || namey.test(c.name)))?.name ??
+    cols.find((c) => temporal.test(c.type))?.name ??
+    cols.find((c) => namey.test(c.name))?.name ??
+    null
+  );
+}
+
+// Columns whose NAME suggests personal data. Deliberately name-based and therefore
+// only a candidate list for a human to confirm — never presented as a finding.
+// Industry-neutral: identity/contact/health identifiers rather than retail terms.
+const PII_PATTERNS =
+  /(^|_)(email|e_mail|phone|mobile|msisdn|ssn|sin|nino|tax_id|passport|dob|birth|birthdate|address|addr|street|postcode|zip|postal|lat|lon|latitude|longitude|first_name|last_name|full_name|surname|given_name|patient|member_name|customer_name|contact|gender|ethnicity|nationality|ip_address|device_id|account_number|iban|card_number|credit_card)($|_)/i;
+
+export function piiCandidates(cols: ContractColumn[]): string[] {
+  return cols.filter((c) => PII_PATTERNS.test(c.name)).map((c) => c.name);
+}
+
+// Same check across EVERY table the product touches, not just the fact columns that
+// make up the contract schema. Personal data usually lives on a joined dimension
+// (a patient/customer dim), which is precisely what a reviewer needs to see.
+export function piiCandidatesForProduct(components: DerivedComponents): string[] {
+  const hits = new Set<string>();
+  for (const t of components.tables) {
+    for (const c of t.columns) {
+      if (PII_PATTERNS.test(c.name)) hits.add(`${shortTable(t.table)}.${c.name}`);
+    }
+  }
+  return [...hits];
+}
+
+// Whether this product is genuinely the one FLAGSHIP_CONTRACT documents: at least
+// one of its source tables must be among the contract's declared lineage. A product
+// that merely shares the name (from an uploaded schema) fails this.
+function describesSameSources(product: CatalogProduct, components: DerivedComponents): boolean {
+  const declared = new Set(FLAGSHIP_CONTRACT.lineage.sources.map((s) => shortTable(s).toLowerCase()));
+  const actual = [
+    ...(product.fact_tables ?? []),
+    ...(product.dim_tables ?? []),
+    ...components.tables.map((t) => t.table),
+  ].map((t) => shortTable(t).toLowerCase());
+  return actual.some((t) => declared.has(t));
+}
+
 export function deriveContract(
   product: CatalogProduct,
   components: DerivedComponents,
   opts?: { sourceCatalog?: string; servingObject?: string }
 ): DataContract {
-  if (product.live && product.product_name === FLAGSHIP_CONTRACT.product) {
+  // The curated flagship contract is a hand-written document about ONE product in
+  // one catalog. Matching on product name alone would hand its lineage (and its
+  // fc_entdata_gold source tables) to any uploaded schema that happened to use the
+  // same product name, so also require the product to actually be built on the
+  // tables that contract describes.
+  if (
+    product.live &&
+    product.product_name === FLAGSHIP_CONTRACT.product &&
+    describesSameSources(product, components)
+  ) {
     return FLAGSHIP_CONTRACT;
   }
 
@@ -174,9 +232,25 @@ export function deriveContract(
   for (const m of measureCols.slice(0, 3)) {
     quality_checks.push({ id: `non_negative_${m.name}`, rule: `min(${m.name}) >= 0` });
   }
-  // parts <= total heuristic (a *_total / total_* measure dominates its siblings)
-  const totalCol = measureCols.find((c) => /total/i.test(c.name));
-  const partCols = measureCols.filter((c) => c !== totalCol && /(shop|fuel|dual|part|sub)/i.test(c.name));
+  // parts <= total: only assert this where the NAMES themselves establish the
+  // relationship, i.e. a sibling measure that is the total's name plus a qualifier
+  // (total_customers vs shop_customers → shares the "customers" stem). The previous
+  // rule matched a fixed retail vocabulary (shop|fuel|dual|part|sub), which invented
+  // a false constraint for any schema that happened to use those words — e.g.
+  // `total_scrap` / `scrap_parts` in manufacturing, which are unrelated measures.
+  const totalCol = measureCols.find((c) => /(^total_|_total$)/i.test(c.name));
+  const totalStem = totalCol
+    ? totalCol.name.toLowerCase().replace(/^total_/, '').replace(/_total$/, '')
+    : '';
+  const partCols =
+    totalCol && totalStem.length > 2
+      ? measureCols.filter(
+          (c) =>
+            c !== totalCol &&
+            // same stem, different qualifier: "<x>_<stem>" or "<stem>_<x>"
+            new RegExp(`(^|_)${totalStem}($|_)`, 'i').test(c.name)
+        )
+      : [];
   if (totalCol && partCols.length) {
     quality_checks.push({
       id: 'parts_le_total',
@@ -200,11 +274,23 @@ export function deriveContract(
     quality_checks,
     freshness: {
       sla: 'planned — no live serving layer yet (target: daily by 06:00 local)',
-      basis: grainKeys.find((k) => /date|day/i.test(k)) ?? 'load timestamp',
+      // Name a real column, or say we could not find one. The old fallback was the
+      // literal string 'load timestamp', which names a column most schemas don't
+      // have — an unverifiable claim dressed as a fact.
+      basis: freshnessBasis(schema) ?? 'unknown — no date/time column identified',
     },
     scope: {
       included: `${product.kpis.join(', ')} over ${factTables.map((t) => shortTable(t.table)).join(', ')}`,
-      excluded: 'customer PII; cross-domain measures not in the listed sources',
+      // Only claim PII is excluded if we can see none. Asserting it unconditionally
+      // is a governance statement the app has not verified.
+      excluded: [
+        piiCandidates(schema).length
+          ? `nothing verified — possible personal data present (${piiCandidates(schema)
+              .slice(0, 4)
+              .join(', ')}); confirm with the data owner`
+          : 'no personal-data columns detected by name',
+        'cross-domain measures not in the listed sources',
+      ].join('; '),
     },
     assumptions: [
       `Schema-derived from ${sourceCatalogPhrase} — not yet materialized as a governed serving view.`,

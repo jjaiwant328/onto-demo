@@ -26,10 +26,12 @@ import {
   Input,
   Label,
 } from '@databricks/appkit-ui/react';
-import { CheckCircle2, FileText, FileDown, Layers, Database, MessageSquare, BarChart3, Plus, Package, Pencil } from 'lucide-react';
+import { CheckCircle2, FileText, FileDown, Layers, Database, MessageSquare, BarChart3, Plus, Package, Pencil, AlertTriangle } from 'lucide-react';
 import { useNavigate } from 'react-router';
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useProduct } from '../lib/product';
+import { ProvenanceBadge } from '../components/ProvenanceBadge';
+import type { CatalogDomain, CatalogProduct, Origin } from '../lib/deriveComponents';
 import { CatalogLoadingSkeleton } from '../components/LoadingSkeleton';
 import { fetchProductLinks, attachLink, deleteLink, type ProductLink } from '../lib/productLinks';
 import { parseSpec } from '../lib/useCaseProduct';
@@ -40,6 +42,77 @@ function maturityVariant(m: string): 'default' | 'secondary' | 'outline' {
   if (s === 'ga') return 'default';
   if (s === 'beta') return 'secondary';
   return 'outline';
+}
+
+// How confidently a domain grouping was made. A weak match (one incidental keyword
+// hit) or an unclassified bucket must not look like a curated business domain — on a
+// non-retail schema that is the difference between a useful start and a wrong map.
+function DomainMatchBadge({ domain }: { domain: CatalogDomain }) {
+  // curated/data-backed domains aren't keyword-matched at all
+  if (domain.dataAvailable || !domain.matchStrength || domain.matchStrength === 'strong') return null;
+  const none = domain.matchStrength === 'none';
+  const alts = domain.alternateDomains ?? [];
+  return (
+    <TooltipProvider>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <Badge variant="outline" className="gap-1 text-[10px] font-normal cursor-help">
+            <AlertTriangle className="h-3 w-3 text-amber-600" />
+            {none ? 'unclassified' : 'weak match'}
+          </Badge>
+        </TooltipTrigger>
+        <TooltipContent className="max-w-xs">
+          {domain.matchEvidence}
+          {alts.length > 0 && (
+            <>
+              <br />
+              <span className="text-muted-foreground">
+                Also matched: {alts.join(', ')}. Reassign in Ontology Studio.
+              </span>
+            </>
+          )}
+        </TooltipContent>
+      </Tooltip>
+    </TooltipProvider>
+  );
+}
+
+// "How derived" for one product: the provenance of its labels/KPIs, plus a
+// warning when some KPI names don't resolve to a real column. See /about.
+function ProductProvenance({ product }: { product: CatalogProduct }) {
+  const unverified = product.unverifiedKpis ?? [];
+  // A live or data-backed product is curated and has a real serving object behind
+  // it, so it must not read as an inference like the schema-derived ones do.
+  const curated = product.dataAvailable || product.live;
+  const origin: Origin = curated ? 'observed' : (product.labelOrigin ?? 'heuristic');
+  const evidence = product.dataAvailable
+    ? 'curated product backed by real tables in the serving schema'
+    : product.live
+      ? 'curated product with a governed serving view in the warehouse'
+      : product.labelOrigin === 'llm'
+        ? 'name, business outcome and KPIs refined by the model over the derived draft'
+        : 'derived from table/column names and types by rule';
+  return (
+    <div className="flex flex-wrap items-center gap-1">
+      <ProvenanceBadge origin={origin} evidence={evidence} />
+      {unverified.length > 0 && (
+        <TooltipProvider>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Badge variant="outline" className="gap-1 text-[10px] font-normal cursor-help">
+                <AlertTriangle className="h-3 w-3 text-amber-600" />
+                {unverified.length} unverified KPI{unverified.length > 1 ? 's' : ''}
+              </Badge>
+            </TooltipTrigger>
+            <TooltipContent className="max-w-xs">
+              These KPI names do not match a column on this product&apos;s fact tables, so they
+              cannot be computed yet and need a definition: {unverified.join(', ')}
+            </TooltipContent>
+          </Tooltip>
+        </TooltipProvider>
+      )}
+    </div>
+  );
 }
 
 // A Genie-Space or Dashboard cell: opens the attached URL in a new window, or
@@ -304,7 +377,10 @@ export function DataProducts() {
                   <CardDescription>{d.description}</CardDescription>
                 </CardHeader>
                 <CardContent className="text-xs text-muted-foreground">
-                  {d.products.length} products
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    <span>{d.products.length} products</span>
+                    <DomainMatchBadge domain={d} />
+                  </div>
                 </CardContent>
               </Card>
             </button>
@@ -325,6 +401,7 @@ export function DataProducts() {
                 <TableHead>Product</TableHead>
                 <TableHead>Maturity</TableHead>
                 <TableHead>Status</TableHead>
+                <TableHead>How derived</TableHead>
                 <TableHead>Source tables</TableHead>
                 <TableHead>Genie Space</TableHead>
                 <TableHead>Dashboard</TableHead>
@@ -368,6 +445,9 @@ export function DataProducts() {
                       ) : (
                         <Badge variant="outline">schema-derived</Badge>
                       )}
+                    </TableCell>
+                    <TableCell>
+                      <ProductProvenance product={p} />
                     </TableCell>
                     <TableCell className="text-muted-foreground text-xs">
                       {p.fact_tables.length + p.dim_tables.length} tables
@@ -543,11 +623,36 @@ export function DataProducts() {
           <div>
             <div className="text-xs uppercase tracking-wide text-muted-foreground mb-1">KPIs</div>
             <div className="flex flex-wrap gap-1.5">
-              {(focusProduct?.kpis ?? []).map((k) => (
-                <Badge key={k} variant="secondary">
-                  {k}
-                </Badge>
-              ))}
+              {(focusProduct?.kpis ?? []).map((k) => {
+                // A KPI that maps to a real measure column can be computed today;
+                // one that doesn't is a proposal needing a definition. Showing both
+                // as plain badges was the app's most misleading output.
+                const unverified = (focusProduct?.unverifiedKpis ?? []).includes(k);
+                return unverified ? (
+                  <TooltipProvider key={k}>
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <Badge
+                          variant="outline"
+                          className="gap-1 cursor-help border-dashed text-muted-foreground"
+                        >
+                          <AlertTriangle className="h-3 w-3 text-amber-600" />
+                          {k}
+                        </Badge>
+                      </TooltipTrigger>
+                      <TooltipContent className="max-w-xs">
+                        No column named <code>{k}</code> on this product&apos;s fact tables. It may
+                        be a valid composite (a ratio or rate), but it needs a definition before it
+                        can be computed — it is not a column-backed measure.
+                      </TooltipContent>
+                    </Tooltip>
+                  </TooltipProvider>
+                ) : (
+                  <Badge key={k} variant="secondary">
+                    {k}
+                  </Badge>
+                );
+              })}
             </div>
           </div>
         </CardContent>

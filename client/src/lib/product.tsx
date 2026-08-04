@@ -16,12 +16,14 @@ import schemaQsrScJson from '../data/schema.qsr_sc.json';
 import {
   deriveProduct,
   buildEnterpriseGraph,
+  isCuratedMeasure,
   type Catalog,
   type CatalogDomain,
   type CatalogProduct,
   type DerivedComponents,
   type EnterpriseGraph,
   type GraphProductLink,
+  type Origin,
   type Schema,
 } from './deriveComponents';
 import { fetchProductLinks } from './productLinks';
@@ -323,20 +325,50 @@ function applyDomainEdits(catalog: Catalog, edits: DomainEditOp[]): Catalog {
   return { domains: domains.length ? domains : catalog.domains };
 }
 
-// keep only domains/products that reference tables present in the schema
-function sanitizeCatalog(catalog: Catalog, schema: Schema): Catalog {
+// keep only domains/products that reference tables present in the schema.
+//
+// `origin` records who authored these labels/KPIs — pass 'llm' for a catalog that
+// came back from /api/generate-catalog (or was cached from one) so the UI can badge
+// them AI-proposed. This function is the guard on model output: it already drops
+// tables that don't exist, and now also separates KPI names that resolve to a real
+// column from ones that don't.
+export function sanitizeCatalog(catalog: Catalog, schema: Schema, origin?: Origin): Catalog {
   const has = (t: string) => Object.prototype.hasOwnProperty.call(schema, t);
   const domains = catalog.domains
     .map((d) => ({
       ...d,
+      ...(origin ? { labelOrigin: origin } : {}),
       products: d.products
-        .map((p) => ({
-          ...p,
-          fact_tables: (p.fact_tables ?? []).filter(has),
-          dim_tables: (p.dim_tables ?? []).filter(has),
-          kpis: Array.isArray(p.kpis) && p.kpis.length ? p.kpis : ['record_count'],
-          maturity: p.maturity ?? 'incubating',
-        }))
+        .map((p) => {
+          const fact_tables = (p.fact_tables ?? []).filter(has);
+          const kpis = Array.isArray(p.kpis) && p.kpis.length ? p.kpis : ['record_count'];
+          // Columns actually available on this product's surviving fact tables.
+          const factCols = new Set(
+            fact_tables.flatMap((t) => (schema[t] ?? []).map((c) => c.name.toLowerCase()))
+          );
+          // Keep every KPI — a non-column name may be a legitimate composite (a
+          // ratio or rate) rather than a hallucination — but record which ones are
+          // neither column-backed nor curated, so they are never shown as additive
+          // measures. A curated KPI has a real formula in semantic_measures.yaml.
+          const unverifiedKpis = kpis.filter(
+            (k) => !factCols.has(String(k).toLowerCase()) && !isCuratedMeasure(String(k), schema)
+          );
+          // Verified KPIs first: the leading KPI is rendered as the product's
+          // headline, so it should be one we can actually compute.
+          const ordered = [
+            ...kpis.filter((k) => !unverifiedKpis.includes(k)),
+            ...unverifiedKpis,
+          ];
+          return {
+            ...p,
+            fact_tables,
+            dim_tables: (p.dim_tables ?? []).filter(has),
+            kpis: ordered,
+            maturity: p.maturity ?? 'incubating',
+            ...(origin ? { labelOrigin: origin } : {}),
+            ...(unverifiedKpis.length ? { unverifiedKpis } : {}),
+          };
+        })
         .filter((p) => p.fact_tables.length > 0)
         .slice(0, 4),
     }))
@@ -727,7 +759,11 @@ export function ProductProvider({ children }: { children: ReactNode }) {
           const cacheResp = await fetch(`/api/catalog-cache?sig=${encodeURIComponent(sig)}`);
           const cached = await cacheResp.json();
           if (!cancelled && cached?.catalog?.domains?.length) {
-            setLlmCatalog({ sig, catalog: sanitizeCatalog(cached.catalog as Catalog, schema) });
+            // cached from a previous LLM polish → still AI-authored labels
+            setLlmCatalog({
+              sig,
+              catalog: sanitizeCatalog(cached.catalog as Catalog, schema, 'llm'),
+            });
             return; // cache hit → skip the LLM entirely
           }
         } catch {
@@ -746,7 +782,7 @@ export function ProductProvider({ children }: { children: ReactNode }) {
         });
         const data = await resp.json();
         if (!cancelled && data?.llm && data?.catalog?.domains?.length) {
-          const refined = sanitizeCatalog(data.catalog as Catalog, schema);
+          const refined = sanitizeCatalog(data.catalog as Catalog, schema, 'llm');
           setLlmCatalog({ sig, catalog: refined });
           // 2) persist to the scope-sig cache so ANY later reload of this scope
           // (combined or not) skips the LLM.

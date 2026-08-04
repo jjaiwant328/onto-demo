@@ -99,6 +99,16 @@ export type ValidationResult = {
     child_rows?: number;
     error?: string;
   }[];
+  // Present when the server capped the run. Without this a partial validation
+  // renders identically to a full one, which would overstate the coverage.
+  truncated?: {
+    tables_checked: number;
+    tables_total: number;
+    relationships_checked: number;
+    relationships_total: number;
+    max_keys_per_table: number;
+    tables_with_extra_keys: string[];
+  } | null;
 };
 export async function validateOntology(args: {
   product: string;
@@ -274,10 +284,25 @@ export function applyOntologyOverrides(
     .map((c) => {
       const newId = remapClass(c.class);
       const g = glossary.get(c.class) ?? glossary.get(newId);
-      const base = newId !== c.class ? { ...c, class: newId, label: newId } : { ...c };
+      // A renamed entity is curated, not derived — record both the new provenance
+      // and the original derived name so the change stays auditable.
+      const base =
+        newId !== c.class
+          ? {
+              ...c,
+              class: newId,
+              label: newId,
+              origin: 'user' as const,
+              renamedFrom: c.class,
+              evidence: `renamed from "${c.class}" by a person`,
+            }
+          : { ...c };
       if (g) {
         base.definition = g.definition ?? base.definition;
         base.synonyms = g.synonyms ?? base.synonyms;
+        // a curated definition is a human assertion about meaning
+        base.origin = 'user';
+        base.evidence = 'business definition supplied by a person';
       }
       return base;
     });
@@ -294,7 +319,12 @@ export function applyOntologyOverrides(
           class: cls,
           role: role ?? m.role,
           pii: pii ?? m.pii,
-          origin: role != null || pii != null ? 'user' : m.origin,
+          origin: role != null ? 'user' : m.origin,
+          // A PII decision is the most governance-sensitive edit here, so track it
+          // separately from the role override — otherwise flagging PII silently
+          // reads as if the role had been curated too.
+          piiOrigin: pii != null ? 'user' : m.piiOrigin,
+          evidence: role != null ? 'role set by a person, overriding the derived role' : m.evidence,
         }
       : m;
   });
@@ -310,6 +340,10 @@ export function applyOntologyOverrides(
         status: status ?? r.status,
         origin: status === 'confirmed' ? ('user' as const) : r.origin,
         confidence: status === 'confirmed' ? 1 : r.confidence,
+        evidence:
+          status === 'confirmed'
+            ? 'confirmed by a person — treated as a real relationship'
+            : r.evidence,
       };
       return { remapped, ref };
     })

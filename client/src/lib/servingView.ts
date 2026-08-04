@@ -1,10 +1,33 @@
 // Generate a conformed CREATE VIEW (serving object) from a product's fact
 // table(s) + CONFIRMED relationships, joining fact→dims on the confirmed keys.
 // DDL execution is deferred (needs a one-time CREATE grant) — this only
-// generates + previews. Target: jai_ontos.demo_schema.jai_<product>_serving.
+// generates + previews.
+//
+// The target namespace is derived from the product's OWN source tables, not a
+// constant: emitting `jai_ontos.demo_schema.…` for an uploaded schema would hand
+// the user DDL pointing at this demo's catalog, which they may not have (or worse,
+// may share with someone else). Falls back to a clearly-fake placeholder so a
+// missing namespace reads as "fill this in" rather than a real-looking target.
 import type { CatalogProduct, DerivedComponents } from './deriveComponents';
 
-const SERVING_SCHEMA = 'jai_ontos.demo_schema';
+// Where governed views are expected to live within the source catalog. A naming
+// convention, not a fact — flagged as such in the generated DDL comment.
+const GOVERNED_SCHEMA = 'governed';
+const UNKNOWN_CATALOG = '<your_catalog>';
+
+// The catalog/namespace the product's own tables live in ("cat.schema.table" →
+// "cat.schema"; "schema.table" → "schema").
+function sourceNamespace(product: CatalogProduct, components: DerivedComponents): string | null {
+  const anchor =
+    (product.fact_tables ?? []).find(Boolean) ??
+    components.tables.find((t) => t.role === 'fact')?.table ??
+    components.tables[0]?.table;
+  if (!anchor) return null;
+  const parts = anchor.split('.');
+  if (parts.length >= 3) return parts.slice(0, -1).join('.');
+  if (parts.length === 2) return parts[0];
+  return null;
+}
 
 function shortName(t: string): string {
   return t.split('.').pop() ?? t;
@@ -28,7 +51,10 @@ export function generateServingView(
 ): GeneratedServingView {
   const factTables = (product.fact_tables ?? []).filter(Boolean);
   const fact = factTables[0] ?? components.tables.find((t) => t.role === 'fact')?.table;
-  const targetName = `${SERVING_SCHEMA}.jai_${product.product_name}_serving`;
+  // target lives alongside the product's own data, never in this demo's catalog
+  const ns = sourceNamespace(product, components);
+  const servingSchema = ns ? `${ns.split('.')[0]}.${GOVERNED_SCHEMA}` : `${UNKNOWN_CATALOG}.${GOVERNED_SCHEMA}`;
+  const targetName = `${servingSchema}.jai_${product.product_name}_serving`;
 
   if (!fact) {
     return {
@@ -103,7 +129,9 @@ export function generateServingView(
 
   const sql =
     `-- Serving view for ${product.display_name}\n` +
-    `-- Deferred: executing this DDL needs a one-time CREATE grant on ${SERVING_SCHEMA}.\n` +
+    `-- Deferred: executing this DDL needs a one-time CREATE grant on ${servingSchema}.\n` +
+    `-- Target namespace is a suggested convention derived from the source tables —\n` +
+    `-- change it to wherever your governed views actually live.\n` +
     `CREATE OR REPLACE VIEW ${targetName} AS\n` +
     `SELECT\n  ${selectList}\n` +
     `FROM ${fact} ${factAlias}\n` +

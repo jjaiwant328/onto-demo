@@ -33,8 +33,9 @@ import {
 } from '@databricks/appkit-ui/react';
 import { ArrowRight, Info, Search } from 'lucide-react';
 import { useProduct } from '../lib/product';
-import { deriveProduct } from '../lib/deriveComponents';
+import { deriveProduct, type DerivedMeasure } from '../lib/deriveComponents';
 import { CatalogLoadingSkeleton } from '../components/LoadingSkeleton';
+import { ProvenanceBadge } from '../components/ProvenanceBadge';
 import { GlossaryCell } from './OntologyStudio';
 
 export function SemanticExplorer() {
@@ -338,15 +339,8 @@ function MeasureTable({
   rows,
   renderGlossary,
 }: {
-  rows: {
-    measure: string;
-    type: string;
-    unit: string;
-    formula: string;
-    description: string;
-    definition?: string;
-    synonyms?: string[];
-  }[];
+  // the real derived shape, so provenance/unverified flags reach the table
+  rows: DerivedMeasure[];
   renderGlossary?: (m: { measure: string; definition?: string; synonyms?: string[] }) => React.ReactNode;
 }) {
   if (rows.length === 0)
@@ -365,7 +359,12 @@ function MeasureTable({
       <TableBody>
         {rows.map((m) => (
           <TableRow key={m.measure}>
-            <TableCell className="font-medium">{m.measure}</TableCell>
+            <TableCell className="font-medium">
+              <div className="flex items-center gap-1.5">
+                {m.measure}
+                <ProvenanceBadge origin={m.origin} evidence={m.evidence} showIcon={false} />
+              </div>
+            </TableCell>
             <TableCell>
               <Badge variant={m.type === 'derived' ? 'default' : 'secondary'}>
                 {m.type === 'derived' ? 'kpi' : 'base'}
@@ -373,7 +372,15 @@ function MeasureTable({
             </TableCell>
             <TableCell className="text-muted-foreground">{m.unit}</TableCell>
             <TableCell>
-              <code className="text-xs whitespace-pre-wrap">{m.formula}</code>
+              {/* An unverified measure has no column behind it, so its "formula" is
+                  a placeholder — style it as absent rather than as real SQL. */}
+              <code
+                className={`text-xs whitespace-pre-wrap ${
+                  m.unverified ? 'text-muted-foreground italic' : ''
+                }`}
+              >
+                {m.formula}
+              </code>
             </TableCell>
             <TableCell>
               <div className="space-y-0.5">
