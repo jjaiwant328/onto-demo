@@ -67,7 +67,9 @@ export function DomainAnalysis() {
     useCaseDrafts,
   } = useProduct();
   const navigate = useNavigate();
-  const [note, setNote] = useState<string | null>(null);
+  // A failed generation and a generation that merely failed to SAVE are different
+  // things; rendering both in destructive red made a working result look broken.
+  const [note, setNote] = useState<{ text: string; kind: 'error' | 'warning' } | null>(null);
   const [describingTitle, setDescribingTitle] = useState<string | null>(null);
 
   // titles that already have a draft (so the button reads "View draft")
@@ -78,15 +80,38 @@ export function DomainAnalysis() {
     setDescribingTitle(uc.title);
     const r = await describeUseCaseAsProduct(uc);
     setDescribingTitle(null);
-    if (!r.ok) setNote(`Could not describe "${uc.title}": ${r.error ?? 'unknown error'}`);
-    else void navigate('/data-product-drafts');
+    if (!r.ok)
+      setNote({
+        kind: 'error',
+        text: `Could not describe "${uc.title}": ${r.error ?? 'unknown error'}`,
+      });
+    else if (r.persist_warning) {
+      // Don't navigate to Product Drafts when the draft could not be saved — the
+      // user would arrive at an empty list with no explanation of why.
+      setNote({
+        kind: 'warning',
+        text:
+          `"${uc.title}" was described successfully but the draft could not be saved, because ${r.persist_warning}. ` +
+          `Product Drafts will not show it until the app's database is available.`,
+      });
+    } else void navigate('/data-product-drafts');
   };
 
   const run = async () => {
     setNote(null);
     const r = await regenerateDomainAnalysis();
-    if (!r.ok) setNote(`Generation failed: ${r.error ?? 'unknown error'}`);
-    else if (r.persist_warning) setNote(`Generated, but not persisted: ${r.persist_warning}`);
+    if (!r.ok)
+      setNote({ kind: 'error', text: `Generation failed: ${r.error ?? 'unknown error'}` });
+    else if (r.persist_warning)
+      // The analysis below is valid — only SAVING it failed. Say that plainly, and
+      // say what it means for the user (they'll need to regenerate next visit)
+      // rather than surfacing a database driver string.
+      setNote({
+        kind: 'warning',
+        text:
+          `This analysis was generated successfully but could not be saved, because ${r.persist_warning}. ` +
+          `You can use it now, but it will not be here when you come back — regenerate it then.`,
+      });
   };
 
   return (
@@ -114,7 +139,16 @@ export function DomainAnalysis() {
           </Button>
         </CardHeader>
         <CardContent className="space-y-2">
-          {note && <p className="text-sm text-destructive">{note}</p>}
+          {note && (
+            <p
+              className={`flex items-start gap-1.5 text-sm ${
+                note.kind === 'error' ? 'text-destructive' : 'text-amber-600'
+              }`}
+            >
+              <AlertTriangle className="h-3.5 w-3.5 mt-0.5 shrink-0" />
+              {note.text}
+            </p>
+          )}
           {domainAnalysis && domainAnalysisStale && (
             <div className="flex items-center gap-1.5 text-xs text-amber-600">
               <AlertTriangle className="h-3.5 w-3.5" /> The domain&apos;s products changed since this

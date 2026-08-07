@@ -17,6 +17,7 @@ import {
   artifactCounts,
   type OntologyArtifact,
 } from '../shared/ontologyArtifact';
+import { humanizeStateError } from '../shared/stateError';
 import { lbQuery, ensureLakebaseTables, lakebaseConfigured } from './lakebase';
 
 // The serving plugin is wired to a Foundation Model endpoint (alias "llm",
@@ -2900,7 +2901,7 @@ createApp({
           res.json({ ok: true, analysis_id: analysisId(schema, domain), llm_used: llmUsed, analysis });
         } catch (err) {
           // persistence failed (e.g. no Lakebase locally) — still return the analysis
-          res.json({ ok: true, analysis_id: analysisId(schema, domain), llm_used: llmUsed, analysis, persist_warning: humanizeSqlError(err) });
+          res.json({ ok: true, analysis_id: analysisId(schema, domain), llm_used: llmUsed, analysis, persist_warning: humanizeStateError(err) });
         }
       });
 
@@ -3132,7 +3133,7 @@ createApp({
           );
           res.json({ ok: true, draft_id: draftId, llm_used: llmUsed, spec });
         } catch (err) {
-          res.json({ ok: true, draft_id: draftId, llm_used: llmUsed, spec, persist_warning: humanizeSqlError(err) });
+          res.json({ ok: true, draft_id: draftId, llm_used: llmUsed, spec, persist_warning: humanizeStateError(err) });
         }
       });
 
