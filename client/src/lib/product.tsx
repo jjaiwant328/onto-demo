@@ -8,7 +8,7 @@
 // schema-derived. Selection is the single source of truth in this context and
 // persists across navigation and reloads.
 import { createContext, useContext, useMemo, useState, useCallback, useEffect, useRef } from 'react';
-import type { ReactNode } from 'react';
+import type { Context, ReactNode } from 'react';
 import catalogJson from '../data/catalog.json';
 import schemaJson from '../data/schema.json';
 import schemaQsrJson from '../data/schema.qsr.json';
@@ -249,7 +249,48 @@ export type ProductContextValue = {
   setScopeCache: <T>(bucket: string, value: T) => void;
 };
 
-const ProductContext = createContext<ProductContextValue | null>(null);
+// The context is split into four slices by change-frequency, so a consumer only
+// re-renders when a slice it actually reads changes — not on unrelated churn (an
+// artifact fetch, the 450ms `rebuilding` toggle, a nav-toggle flip). `useProduct()`
+// remains a shim that merges all four for callers not yet migrated to the narrow
+// hooks (useSelection / useDerived / useResources / useUiPrefs).
+export type SelectionContextValue = Pick<
+  ProductContextValue,
+  | 'schemaEntries' | 'selectedSchemaIds' | 'toggleSchema' | 'setSelectedSchemas'
+  | 'combineAll' | 'combined' | 'addSchema' | 'isBundledSchema' | 'removeSchema'
+  | 'resetSchemas' | 'savedSchemas' | 'refreshSavedSchemas' | 'saveSchema'
+  | 'storeSchema' | 'deleteSavedSchema' | 'domains' | 'domainScope' | 'productScope'
+  | 'domainScopeAll' | 'productScopeAll' | 'scopedDomains' | 'scopedProducts'
+  | 'selectedDomain' | 'setSelectedDomain' | 'productsInDomain' | 'selectedProduct'
+  | 'setSelectedProduct' | 'deleteDomain' | 'combineDomains' | 'unmergeDomain'
+  | 'isolationKey' | 'scopeSig'
+>;
+export type DerivedContextValue = Pick<
+  ProductContextValue,
+  | 'conformance' | 'catalogSource' | 'schema' | 'catalog' | 'catalogLoading'
+  | 'components' | 'enterpriseGraph' | 'enterpriseHighlight' | 'activeSourceCatalog'
+  | 'activeSchemaLabel'
+>;
+export type ResourcesContextValue = Pick<
+  ProductContextValue,
+  | 'llmRefining' | 'refreshGraphLinks' | 'productLinks' | 'artifact' | 'artifactStale'
+  | 'regenerateArtifact' | 'domainAnalysis' | 'domainAnalysisStale' | 'domainAnalyzing'
+  | 'domainAnalysisLabel' | 'regenerateDomainAnalysis' | 'useCaseDrafts'
+  | 'describeUseCaseAsProduct' | 'setUseCaseDraftStatus' | 'removeUseCaseDraft'
+  | 'updateUseCaseDraft' | 'ontologyOverrides' | 'saveOntologyOverride'
+  | 'deleteOntologyOverride' | 'rebuilding'
+>;
+export type UiPrefsContextValue = Pick<
+  ProductContextValue,
+  | 'syncScopeFromSections' | 'setSyncScopeFromSections' | 'showActionCenter'
+  | 'setShowActionCenter' | 'showBusinessView' | 'setShowBusinessView'
+  | 'showControlTower' | 'setShowControlTower' | 'getScopeCache' | 'setScopeCache'
+>;
+
+const SelectionContext = createContext<SelectionContextValue | null>(null);
+const DerivedContext = createContext<DerivedContextValue | null>(null);
+const ResourcesContext = createContext<ResourcesContextValue | null>(null);
+const UiPrefsContext = createContext<UiPrefsContextValue | null>(null);
 
 // built-in schemas (non-removable). fc_entdata_gold is curated (live flagship).
 function builtinSchemas(): RegistrySchema[] {
@@ -674,23 +715,26 @@ export function ProductProvider({ children }: { children: ReactNode }) {
   );
 
   // left-panel Scope setters. Picking a domain resets product scope to All.
-  const setSelectedDomain = (name: string) => {
-    if (name === ALL_SCOPE) {
-      setDomainName(ALL_SCOPE);
+  const setSelectedDomain = useCallback(
+    (name: string) => {
+      if (name === ALL_SCOPE) {
+        setDomainName(ALL_SCOPE);
+        setProductName(ALL_SCOPE);
+        return;
+      }
+      const d = domains.find((x) => x.name === name) ?? domains[0];
+      setDomainName(d?.name ?? ALL_SCOPE);
       setProductName(ALL_SCOPE);
-      return;
-    }
-    const d = domains.find((x) => x.name === name) ?? domains[0];
-    setDomainName(d?.name ?? ALL_SCOPE);
-    setProductName(ALL_SCOPE);
-  };
-  const setSelectedProduct = (name: string) => {
+    },
+    [domains]
+  );
+  const setSelectedProduct = useCallback((name: string) => {
     if (name === ALL_SCOPE) {
       setProductName(ALL_SCOPE);
       return;
     }
     setProductName(name);
-  };
+  }, []);
 
   // append a session domain edit (scoped to the current dataset signature)
   const pushDomainEdit = useCallback(
@@ -1420,86 +1464,219 @@ export function ProductProvider({ children }: { children: ReactNode }) {
     return set.size ? set : new Set<string>(Object.keys(enterpriseGraph.nodes));
   }, [enterpriseGraph, domainScopeAll, productScopeAll, scopedDomains, scopedProducts]);
 
-  const value: ProductContextValue = {
-    schemaEntries,
-    selectedSchemaIds,
-    toggleSchema,
-    setSelectedSchemas,
-    combineAll,
-    combined,
-    conformance,
-    catalogSource,
-    addSchema,
-    isBundledSchema,
-    removeSchema,
-    resetSchemas,
-    savedSchemas,
-    refreshSavedSchemas,
-    saveSchema,
-    storeSchema,
-    deleteSavedSchema,
-    schema,
-    catalog,
-    catalogLoading,
-    llmRefining,
-    domains,
-    domainScope: domainName,
-    productScope: productName,
-    domainScopeAll,
-    productScopeAll,
-    scopedDomains,
-    scopedProducts,
-    selectedDomain,
-    setSelectedDomain,
-    productsInDomain,
-    selectedProduct,
-    setSelectedProduct,
-    components,
-    deleteDomain,
-    combineDomains,
-    unmergeDomain,
-    enterpriseGraph,
-    enterpriseHighlight,
-    refreshGraphLinks,
-    productLinks: productLinksForArtifact,
-    artifact,
-    artifactStale,
-    regenerateArtifact,
-    domainAnalysis,
-    domainAnalysisStale,
-    domainAnalyzing,
-    domainAnalysisLabel: analysisDomainLabel,
-    regenerateDomainAnalysis,
-    useCaseDrafts,
-    describeUseCaseAsProduct,
-    setUseCaseDraftStatus,
-    removeUseCaseDraft,
-    updateUseCaseDraft,
-    isolationKey: sig,
-    syncScopeFromSections,
-    setSyncScopeFromSections,
-    showActionCenter,
-    setShowActionCenter,
-    showBusinessView,
-    setShowBusinessView,
-    showControlTower,
-    setShowControlTower,
-    activeSourceCatalog,
-    activeSchemaLabel,
-    ontologyOverrides,
-    saveOntologyOverride: saveOntologyOverrideFn,
-    deleteOntologyOverride: deleteOntologyOverrideFn,
-    scopeSig,
-    rebuilding,
-    getScopeCache,
-    setScopeCache,
-  };
+  // Four memoized context slices (see SelectionContextValue etc. above). Each is
+  // memoized on only its own fields, so a change to one slice (e.g. an artifact
+  // fetch in Resources, or the 450ms `rebuilding` toggle) never re-renders a
+  // consumer that reads only another slice. `useProduct()` below merges all four
+  // for callers not yet migrated to the narrow hooks.
+  const selectionValue: SelectionContextValue = useMemo(
+    () => ({
+      schemaEntries,
+      selectedSchemaIds,
+      toggleSchema,
+      setSelectedSchemas,
+      combineAll,
+      combined,
+      addSchema,
+      isBundledSchema,
+      removeSchema,
+      resetSchemas,
+      savedSchemas,
+      refreshSavedSchemas,
+      saveSchema,
+      storeSchema,
+      deleteSavedSchema,
+      domains,
+      domainScope: domainName,
+      productScope: productName,
+      domainScopeAll,
+      productScopeAll,
+      scopedDomains,
+      scopedProducts,
+      selectedDomain,
+      setSelectedDomain,
+      productsInDomain,
+      selectedProduct,
+      setSelectedProduct,
+      deleteDomain,
+      combineDomains,
+      unmergeDomain,
+      isolationKey: sig,
+      scopeSig,
+    }),
+    [
+      schemaEntries,
+      selectedSchemaIds,
+      toggleSchema,
+      setSelectedSchemas,
+      combineAll,
+      combined,
+      addSchema,
+      isBundledSchema,
+      removeSchema,
+      resetSchemas,
+      savedSchemas,
+      refreshSavedSchemas,
+      saveSchema,
+      storeSchema,
+      deleteSavedSchema,
+      domains,
+      domainName,
+      productName,
+      domainScopeAll,
+      productScopeAll,
+      scopedDomains,
+      scopedProducts,
+      selectedDomain,
+      setSelectedDomain,
+      productsInDomain,
+      selectedProduct,
+      setSelectedProduct,
+      deleteDomain,
+      combineDomains,
+      unmergeDomain,
+      sig,
+      scopeSig,
+    ]
+  );
 
-  return <ProductContext.Provider value={value}>{children}</ProductContext.Provider>;
+  const derivedValue: DerivedContextValue = useMemo(
+    () => ({
+      conformance,
+      catalogSource,
+      schema,
+      catalog,
+      catalogLoading,
+      components,
+      enterpriseGraph,
+      enterpriseHighlight,
+      activeSourceCatalog,
+      activeSchemaLabel,
+    }),
+    [
+      conformance,
+      catalogSource,
+      schema,
+      catalog,
+      catalogLoading,
+      components,
+      enterpriseGraph,
+      enterpriseHighlight,
+      activeSourceCatalog,
+      activeSchemaLabel,
+    ]
+  );
+
+  const resourcesValue: ResourcesContextValue = useMemo(
+    () => ({
+      llmRefining,
+      refreshGraphLinks,
+      productLinks: productLinksForArtifact,
+      artifact,
+      artifactStale,
+      regenerateArtifact,
+      domainAnalysis,
+      domainAnalysisStale,
+      domainAnalyzing,
+      domainAnalysisLabel: analysisDomainLabel,
+      regenerateDomainAnalysis,
+      useCaseDrafts,
+      describeUseCaseAsProduct,
+      setUseCaseDraftStatus,
+      removeUseCaseDraft,
+      updateUseCaseDraft,
+      ontologyOverrides,
+      saveOntologyOverride: saveOntologyOverrideFn,
+      deleteOntologyOverride: deleteOntologyOverrideFn,
+      rebuilding,
+    }),
+    [
+      llmRefining,
+      refreshGraphLinks,
+      productLinksForArtifact,
+      artifact,
+      artifactStale,
+      regenerateArtifact,
+      domainAnalysis,
+      domainAnalysisStale,
+      domainAnalyzing,
+      analysisDomainLabel,
+      regenerateDomainAnalysis,
+      useCaseDrafts,
+      describeUseCaseAsProduct,
+      setUseCaseDraftStatus,
+      removeUseCaseDraft,
+      updateUseCaseDraft,
+      ontologyOverrides,
+      saveOntologyOverrideFn,
+      deleteOntologyOverrideFn,
+      rebuilding,
+    ]
+  );
+
+  const uiPrefsValue: UiPrefsContextValue = useMemo(
+    () => ({
+      syncScopeFromSections,
+      setSyncScopeFromSections,
+      showActionCenter,
+      setShowActionCenter,
+      showBusinessView,
+      setShowBusinessView,
+      showControlTower,
+      setShowControlTower,
+      getScopeCache,
+      setScopeCache,
+    }),
+    [
+      syncScopeFromSections,
+      setSyncScopeFromSections,
+      showActionCenter,
+      setShowActionCenter,
+      showBusinessView,
+      setShowBusinessView,
+      showControlTower,
+      setShowControlTower,
+      getScopeCache,
+      setScopeCache,
+    ]
+  );
+
+  return (
+    <SelectionContext.Provider value={selectionValue}>
+      <DerivedContext.Provider value={derivedValue}>
+        <ResourcesContext.Provider value={resourcesValue}>
+          <UiPrefsContext.Provider value={uiPrefsValue}>{children}</UiPrefsContext.Provider>
+        </ResourcesContext.Provider>
+      </DerivedContext.Provider>
+    </SelectionContext.Provider>
+  );
 }
 
+function useCtx<T>(ctx: Context<T | null>, hook: string): T {
+  const v = useContext(ctx);
+  if (!v) throw new Error(`${hook} must be used within ProductProvider`);
+  return v;
+}
+
+// Narrow hooks — prefer these in new/migrated code so a component subscribes only
+// to the slice it reads and skips re-renders driven by the others.
+export const useSelection = (): SelectionContextValue => useCtx(SelectionContext, 'useSelection');
+export const useDerived = (): DerivedContextValue => useCtx(DerivedContext, 'useDerived');
+export const useResources = (): ResourcesContextValue => useCtx(ResourcesContext, 'useResources');
+export const useUiPrefs = (): UiPrefsContextValue => useCtx(UiPrefsContext, 'useUiPrefs');
+
+// Compatibility shim: merges all four slices into the original ProductContextValue.
+// Re-memoized on the slice references (each stable until its own fields change), so
+// the merged object stays identity-stable exactly as the single memoized value did.
+// Consumers still using useProduct() re-render on any slice change (as before);
+// migrate them to the narrow hooks above to narrow their subscriptions.
 export function useProduct(): ProductContextValue {
-  const ctx = useContext(ProductContext);
-  if (!ctx) throw new Error('useProduct must be used within ProductProvider');
-  return ctx;
+  const selection = useSelection();
+  const derived = useDerived();
+  const resources = useResources();
+  const uiPrefs = useUiPrefs();
+  return useMemo(
+    () => ({ ...selection, ...derived, ...resources, ...uiPrefs }),
+    [selection, derived, resources, uiPrefs]
+  );
 }

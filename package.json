@@ -25,7 +25,7 @@
     "prebuild": "npm run ontology && npm run sync && npm run typegen",
     "predev": "npm run ontology && npm run sync && npm run typegen",
     "sync": "appkit plugin sync --write --silent",
-    "typegen": "appkit generate-types",
+    "typegen": "node scripts/typegen.mjs",
     "setup": "appkit setup --write"
   },
   "keywords": [],

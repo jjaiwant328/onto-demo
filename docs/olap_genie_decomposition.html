@@ -1,0 +1,653 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Two Tables, Two Paths</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700;800&family=IBM+Plex+Mono:wght@500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+<style>
+  :root{
+    --ground:#f6f8fb;
+    --surface:#ffffff;
+    --surface-2:#eef2f8;
+    --ink:#1a2333;
+    --muted:#5a6576;
+    --faint:#8791a1;
+    --border:#e0e6ef;
+    --border-strong:#c9d2e0;
+    --accent:#3452c4;
+    --accent-soft:#eaeefb;
+    --critical:#c2410c;
+    --critical-soft:#fbece3;
+    --positive:#157f5b;
+    --positive-soft:#e6f2ec;
+    --shadow:0 1px 2px rgba(26,35,51,.05), 0 8px 24px rgba(26,35,51,.05);
+    --display:'Archivo', system-ui, -apple-system, sans-serif;
+    --body:'IBM Plex Sans', system-ui, -apple-system, sans-serif;
+    --mono:'IBM Plex Mono', ui-monospace, 'SFMono-Regular', Menlo, monospace;
+  }
+  @media (prefers-color-scheme: dark){
+    :root{
+      --ground:#0e1420;
+      --surface:#161d2b;
+      --surface-2:#1c2536;
+      --ink:#e7ecf5;
+      --muted:#9aa5b6;
+      --faint:#6f7a8c;
+      --border:#26303f;
+      --border-strong:#33404f;
+      --accent:#8aa2ff;
+      --accent-soft:#1b2540;
+      --critical:#f0895a;
+      --critical-soft:#2c1d16;
+      --positive:#4fc79b;
+      --positive-soft:#132a22;
+      --shadow:0 1px 2px rgba(0,0,0,.3), 0 10px 30px rgba(0,0,0,.35);
+    }
+  }
+  *{box-sizing:border-box}
+  html{-webkit-text-size-adjust:100%}
+  body{
+    margin:0;
+    background:var(--ground);
+    color:var(--ink);
+    font-family:var(--body);
+    font-size:16px;
+    line-height:1.6;
+    -webkit-font-smoothing:antialiased;
+  }
+  .wrap{
+    max-width:940px;
+    margin:0 auto;
+    padding-inline:24px;
+    padding-block:0;
+  }
+  a{color:var(--accent)}
+
+  /* ---- header ---- */
+  header{
+    border-bottom:1px solid var(--border);
+    background:linear-gradient(180deg,var(--surface),var(--ground));
+  }
+  .eyebrow{
+    font-family:var(--mono);
+    font-size:12.5px;
+    font-weight:600;
+    letter-spacing:.08em;
+    text-transform:uppercase;
+    color:var(--accent);
+  }
+  h1{
+    font-family:var(--display);
+    font-weight:800;
+    font-size:clamp(2rem,5.5vw,3.1rem);
+    line-height:1.04;
+    letter-spacing:-.02em;
+    text-wrap:balance;
+    margin:.5rem 0 .4rem;
+  }
+  .lede{
+    font-size:1.12rem;
+    color:var(--muted);
+    max-width:64ch;
+    margin:0;
+  }
+  .meta{
+    margin-top:1.4rem;
+    font-family:var(--mono);
+    font-size:12.5px;
+    color:var(--faint);
+    display:flex;flex-wrap:wrap;gap:.4rem 1.2rem;
+  }
+  .header-inner{padding-block:44px 34px}
+
+  /* ---- stat strip ---- */
+  .stats{
+    display:grid;
+    grid-template-columns:repeat(4,1fr);
+    gap:14px;
+    margin:-26px auto 0;
+    position:relative;
+  }
+  .stat{
+    background:var(--surface);
+    border:1px solid var(--border);
+    border-radius:12px;
+    padding:16px 18px;
+    box-shadow:var(--shadow);
+  }
+  .stat .n{
+    font-family:var(--display);
+    font-weight:700;
+    font-size:1.9rem;
+    letter-spacing:-.02em;
+    font-variant-numeric:tabular-nums;
+  }
+  .stat.warn .n{color:var(--critical)}
+  .stat.good .n{color:var(--positive)}
+  .stat .l{font-size:12.5px;color:var(--muted);margin-top:2px}
+
+  /* ---- sections ---- */
+  section{padding-block:34px}
+  section + section{border-top:1px solid var(--border)}
+  h2{
+    font-family:var(--display);
+    font-weight:700;
+    font-size:1.55rem;
+    letter-spacing:-.015em;
+    text-wrap:balance;
+    margin:0 0 .3rem;
+  }
+  h2 .idx{
+    font-family:var(--mono);
+    font-size:.9rem;
+    font-weight:600;
+    color:var(--accent);
+    margin-right:.6rem;
+  }
+  .sub{color:var(--muted);margin:.1rem 0 1.3rem;max-width:70ch}
+  p{max-width:72ch}
+  h3{
+    font-family:var(--display);
+    font-weight:600;
+    font-size:1.08rem;
+    margin:1.6rem 0 .5rem;
+  }
+  code,.mono{font-family:var(--mono);font-size:.86em}
+  code{
+    background:var(--surface-2);
+    padding:.08em .38em;
+    border-radius:5px;
+    border:1px solid var(--border);
+  }
+  pre{
+    background:var(--surface-2);
+    border:1px solid var(--border);
+    border-radius:10px;
+    padding:15px 17px;
+    overflow-x:auto;
+    font-family:var(--mono);
+    font-size:12.5px;
+    line-height:1.6;
+    margin:1rem 0;
+  }
+  pre code{background:none;border:none;padding:0;font-size:inherit}
+  .aside-note{font-size:13px;color:var(--faint);font-style:italic;margin:.2rem 0 1rem}
+
+  /* ---- verdict callout ---- */
+  .verdict{
+    background:var(--surface);
+    border:1px solid var(--border);
+    border-left:4px solid var(--accent);
+    border-radius:12px;
+    padding:20px 22px;
+    box-shadow:var(--shadow);
+  }
+  .verdict p{margin:.4rem 0}
+  .verdict p:first-child{margin-top:0}
+  .verdict strong{color:var(--ink)}
+
+  /* ---- tables ---- */
+  .tablewrap{overflow-x:auto;margin:1rem 0 .4rem;border:1px solid var(--border);border-radius:12px;background:var(--surface)}
+  table{border-collapse:collapse;width:100%;font-size:14.5px}
+  th,td{text-align:left;padding:11px 14px;vertical-align:top;border-bottom:1px solid var(--border)}
+  thead th{
+    background:var(--surface-2);
+    font-family:var(--display);
+    font-weight:600;
+    font-size:12.5px;
+    letter-spacing:.02em;
+    color:var(--muted);
+    white-space:nowrap;
+  }
+  tbody tr:last-child td{border-bottom:none}
+  td .mono{color:var(--accent);font-weight:600}
+  td.num{font-variant-numeric:tabular-nums;font-family:var(--mono);font-weight:600}
+  .prop{font-weight:600;color:var(--muted);white-space:nowrap}
+  caption{caption-side:bottom;text-align:left;color:var(--faint);font-size:12.5px;padding:8px 14px}
+  .yes{color:var(--positive);font-weight:700}
+  .no{color:var(--critical);font-weight:700}
+
+  /* two-sided compare emphasis */
+  .col-raw{color:var(--muted)}
+  .col-olap{}
+
+  /* ---- reason / advantage lists ---- */
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:1rem}
+  .item{
+    background:var(--surface);
+    border:1px solid var(--border);
+    border-radius:12px;
+    padding:16px 18px;
+  }
+  .item h4{
+    font-family:var(--display);
+    font-weight:600;
+    font-size:1rem;
+    margin:0 0 .25rem;
+    display:flex;align-items:baseline;gap:.5rem;
+  }
+  .item p{margin:0;font-size:14.5px;color:var(--muted);max-width:none}
+  .tag{
+    font-family:var(--mono);
+    font-size:11px;font-weight:600;
+    padding:.12em .5em;border-radius:999px;
+    text-transform:uppercase;letter-spacing:.05em;
+    flex:none;
+  }
+  .tag.bad{color:var(--critical);background:var(--critical-soft)}
+  .tag.good{color:var(--positive);background:var(--positive-soft)}
+
+  .pill{
+    display:inline-block;font-family:var(--mono);font-size:12px;font-weight:600;
+    padding:.15em .55em;border-radius:6px;background:var(--accent-soft);color:var(--accent);
+    border:1px solid var(--border);
+  }
+
+  ul.clean{margin:.5rem 0;padding-left:1.2rem}
+  ul.clean li{margin:.3rem 0;max-width:72ch}
+
+  footer{border-top:1px solid var(--border);padding-block:26px 48px;color:var(--faint);font-size:13px}
+  footer .mono{color:var(--faint)}
+
+  @media (max-width:640px){
+    .stats{grid-template-columns:repeat(2,1fr)}
+    .grid2{grid-template-columns:1fr}
+    .header-inner{padding-block:34px 30px}
+  }
+  @media print{
+    body{background:#fff}
+    .stat,.item,.verdict,.tablewrap{box-shadow:none}
+    section{break-inside:avoid}
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="wrap header-inner">
+    <div class="eyebrow">Genie One architecture &middot; retail sales</div>
+    <h1>Two Tables, Two Paths</h1>
+    <p class="lede">Keep both the curated <code>sales</code> summary and the 848-column OLAP cube, serve each to Genie through narrow MV-backed spaces &mdash; and cut scan before scaling, because the load test justifies neither swapping to the cube nor going XL.</p>
+    <div class="meta">
+      <span>Prepared 2026-09-16</span>
+      <span>Interactive: <span class="mono">pr_core_raw.default.sales</span></span>
+      <span>Deep-dive: <span class="mono">pr_core_raw_v1.default.sls_cust_trans_dtl_olap</span></span>
+    </div>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="stats">
+    <div class="stat"><div class="n">848</div><div class="l">columns in the OLAP superset</div></div>
+    <div class="stat"><div class="n">135</div><div class="l">columns in curated <span class="mono">sales</span></div></div>
+    <div class="stat good"><div class="n">~70</div><div class="l">real peak Genie users/hr &mdash; vs 1,200 targeted</div></div>
+    <div class="stat good"><div class="n">~$3.3K</div><div class="l">warehouse run rate / month</div></div>
+  </div>
+</div>
+
+<div class="wrap">
+
+  <!-- 1 -->
+  <section>
+    <h2><span class="idx">01</span>The decision</h2>
+    <p class="sub">What the analysis concludes, up front &mdash; the rest of the document is the evidence.</p>
+    <div class="verdict">
+      <p><strong>Keep both tables.</strong> <code>sales</code> (135 cols) is the curated fact behind today&rsquo;s metric views &mdash; the interactive Genie path for comp / sales / units. The OLAP cube (848 cols) is a governed <strong>superset</strong> for deep-dive analytics the summary cannot answer (2-year LLY comps, cost decomposition, weather, pro program, delivery, payment). The OLAP is not a replacement to retire, nor something to serve raw to one Genie space.</p>
+      <p><strong>Serve each through narrow, grain-scoped, MV-backed Genie spaces</strong> over shared conformed dimensions, fronted by a Genie One router &mdash; never the wide cube directly. Interactive questions ride slim <code>sales</code> metric views; deep-dive questions ride the five OLAP grain-scoped agents.</p>
+      <p><strong>The 250-user load test justifies neither drastic move.</strong> Real peak demand is ~70 users/hr against a 1,200 target, production latency is an order of magnitude better than the test, and the biggest cost day on record <em>was</em> the test itself. The lever is <strong>scan reduction</strong> (clustering, MVs, VACUUM), then right-sizing the warehouse against the real curve &mdash; not swapping in the cube or jumping to XL.</p>
+    </div>
+  </section>
+
+  <!-- 2 -->
+  <section>
+    <h2><span class="idx">02</span>The two tables</h2>
+    <p class="sub">Both are Unity Catalog managed Iceberg tables, but they answer at completely different grains and serve different jobs.</p>
+    <div class="tablewrap">
+      <table>
+        <thead>
+          <tr>
+            <th></th>
+            <th class="col-raw">Curated summary &mdash; <span class="mono">pr_core_raw.default.sales</span></th>
+            <th class="col-olap">OLAP superset &mdash; <span class="mono">pr_core_raw_v1.default.sls_cust_trans_dtl_olap</span></th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr><td class="prop">Role</td><td class="col-raw">Interactive Genie path (merchandising analysts)</td><td class="col-olap">Advanced deep-dive path (analytics that <span class="mono">sales</span> can&rsquo;t serve)</td></tr>
+          <tr><td class="prop">Columns</td><td class="col-raw">135</td><td class="col-olap">848</td></tr>
+          <tr><td class="prop">Grain</td><td class="col-raw">SKU &times; store &times; day &times; household <strong>summary</strong></td><td class="col-olap">Transaction <strong>line item</strong> (<span class="mono">POS_TRANS_ID</span> + <span class="mono">POS_SEQ_NBR</span>)</td></tr>
+          <tr><td class="prop">Rows</td><td class="col-raw">~55.4B</td><td class="col-olap">~84.3B</td></tr>
+          <tr><td class="prop">Size</td><td class="col-raw">~7.5&nbsp;TB (~7.1&nbsp;TB scanned with clustering)</td><td class="col-olap">~26&nbsp;TB (~26.8&nbsp;TB scanned &mdash; ~3.8&times; larger)</td></tr>
+          <tr><td class="prop">Clustering</td><td class="col-raw"><span class="mono">SLS_DT, SKU_NBR, STR_NBR, CUST_HH_ID_KEY</span> (4 keys &mdash; over-specified, see &sect;06)</td><td class="col-olap"><span class="mono">SLS_DT, SKU_NBR</span> (2 keys) &#10003;</td></tr>
+          <tr><td class="prop">Measure types</td><td class="col-raw"><span class="mono">DOUBLE</span> (68 TY/LY measure cols)</td><td class="col-olap"><span class="mono">DECIMAL(38,9)</span> (full TY/LY/LLY, ~370 cols)</td></tr>
+          <tr><td class="prop">Nature</td><td class="col-raw">Pre-aggregated TY-vs-LY comparative $/unit measures</td><td class="col-olap">Operational POS detail + wide comparative measures denormalized on</td></tr>
+        </tbody>
+      </table>
+      <caption>The <span class="mono">sales</span> table is the slim, curated version; the OLAP cube is the full denormalized BQ-style cube. Same event universe, different grain and width.</caption>
+    </div>
+  </section>
+
+  <!-- 3 -->
+  <section>
+    <h2><span class="idx">03</span>What the OLAP adds &mdash; and what&rsquo;s redundant</h2>
+    <p class="sub">The cube is 848 columns to <code>sales</code>&rsquo;s 135. The <span class="pill">713 extra columns</span> are the real, standalone value &mdash; they group into five families, and they map cleanly onto the five deep-dive agents.</p>
+
+    <div class="tablewrap">
+      <table>
+        <thead>
+          <tr><th>Column family (OLAP-only)</th><th>#</th><th>Representative columns</th><th>Analytics it unlocks</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>LLY (last-last-year) measures</td><td class="num">~135</td><td><span class="mono">LLY_SLS_AMT, LLY_COMP_SLS_AMT, LLY_MARGIN_AMT</span></td><td>2-year comp analysis, 3-year trend &mdash; impossible on <span class="mono">sales</span> without self-joins</td></tr>
+          <tr><td>Extended measures (cost / markdown / weather / TUM / pro)</td><td class="num">~100</td><td><span class="mono">TY_FOB_COST_AMT, TY_LND_COST_AMT, TY_NET_NET_COST_AMT, TY_STR_MKDN_AMT, TY_AVG_TEMP, TY_MGD_TUM_SLS_AMT</span></td><td>Cost decomposition, markdown drivers by reason code, weather impact, territory-manager performance</td></tr>
+          <tr><td>Transaction-level detail</td><td class="num">~200</td><td><span class="mono">RGSTR_NBR, POS_TRANS_ID, CUST_ORD_NBR, SHIP_NODE, ACT_DELV_TS, LATE_DELV_FLG, USER_ID</span></td><td>Transaction drill-down, delivery-SLA / late-delivery, associate-attributed sales</td></tr>
+          <tr><td>Customer / payment detail</td><td class="num">~100</td><td><span class="mono">SVOC_ID, MAIN_TENDER_TYP, TAP_TO_PAY_TRAN_FLG, PRO_PAINT_TIER, TRAN_PERK_REDEM_AMT</span></td><td>Payment mix, pro-program attribution, perk / reward redemption</td></tr>
+          <tr><td>Channel / experience granularity</td><td class="num">~50</td><td><span class="mono">SMRY_CHNL_SUB_DTL, CUST_FULFIL_MTHD, BORIS_IND, ROPIS_FLG, CURBSIDE_FLG</span></td><td>Sub-channel and fulfillment-method detail beyond <span class="mono">sales</span>&rsquo;s <span class="mono">SMRY_CHNL</span></td></tr>
+        </tbody>
+        <tbody>
+          <tr><td class="prop">Total OLAP-only</td><td class="num">~713</td><td colspan="2">= 848 OLAP columns &minus; the 135-column curated core</td></tr>
+        </tbody>
+      </table>
+      <caption>The 713 columns present in the OLAP cube but absent from the curated <span class="mono">sales</span> summary.</caption>
+    </div>
+
+    <h3>Where the summary is enough &mdash; and where only the cube will do</h3>
+    <div class="tablewrap">
+      <table>
+        <thead><tr><th>Analytic need</th><th><span class="mono">sales</span> (135)</th><th>OLAP (848)</th></tr></thead>
+        <tbody>
+          <tr><td>Comp % by class last week</td><td class="yes">&#10003;</td><td class="yes">&#10003;</td></tr>
+          <tr><td>2-year comp trend (LLY)</td><td class="no">&#10007;</td><td class="yes">&#10003;</td></tr>
+          <tr><td>Cost decomposition (FOB, landed, net-net)</td><td class="no">&#10007;</td><td class="yes">&#10003;</td></tr>
+          <tr><td>Markdown analysis by reason code</td><td class="no">&#10007;</td><td class="yes">&#10003;</td></tr>
+          <tr><td>Weather impact on sales</td><td class="no">&#10007;</td><td class="yes">&#10003;</td></tr>
+          <tr><td>Pro-program attribution / territory-manager performance</td><td class="no">&#10007;</td><td class="yes">&#10003;</td></tr>
+          <tr><td>Delivery performance (late-delivery %)</td><td class="no">&#10007;</td><td class="yes">&#10003;</td></tr>
+          <tr><td>Payment-method / perk-redemption analysis</td><td class="no">&#10007;</td><td class="yes">&#10003;</td></tr>
+          <tr><td>Transaction-level drill-down</td><td class="no">&#10007;</td><td class="yes">&#10003;</td></tr>
+        </tbody>
+      </table>
+      <caption>The cube is a superset: it covers everything <span class="mono">sales</span> does, plus a large class of questions the summary structurally cannot answer.</caption>
+    </div>
+
+    <h3>What is redundant &mdash; the overlapping TY/LY measures</h3>
+    <p>The cube&rsquo;s <span class="mono">TY_*</span> / <span class="mono">LY_*</span> comparative measures (gross sales, COGS, GM, discounts, comp sales, ship&hellip;) do the <em>same job</em> the curated <code>sales</code> summary already does. Carrying them into every interactive Genie space would duplicate <code>sales</code> and inflate width for no gain &mdash; so interactive comparative questions are served from <code>sales</code>, and the cube&rsquo;s unique 713 columns are reserved for the deep-dive path.</p>
+  </section>
+
+  <!-- 4 -->
+  <section>
+    <h2><span class="idx">04</span>Why the raw cube must not be served to Genie</h2>
+    <p class="sub">Keeping the cube is right; serving all 848 columns as one Genie space is not. Five concrete failure modes.</p>
+    <div class="grid2">
+      <div class="item"><h4><span class="tag bad">1</span>Context / token blowout</h4><p>848 column descriptions cannot be curated within prompt-matching budget; the knowledge store degrades and Genie loses the plot.</p></div>
+      <div class="item"><h4><span class="tag bad">2</span>Column ambiguity &rarr; wrong SQL</h4><p>Near-duplicate families (<span class="mono">TY_*/LY_*/LLY_*</span>, cost variants, <span class="mono">*_DRVD</span>) make Genie select the wrong column.</p></div>
+      <div class="item"><h4><span class="tag bad">3</span>Mixed grain &rarr; double counting</h4><p>Line-level rows carry hundreds of pre-aggregated period measures; a naive <code>SUM</code> over the detail grain is simply wrong.</p></div>
+      <div class="item"><h4><span class="tag bad">4</span>No join model</h4><p>A flat cube gives Genie no dimensional structure to reason with &mdash; no conformed store, calendar, product, or customer.</p></div>
+      <div class="item"><h4><span class="tag bad">5</span>Scan cost</h4><p>Every question scans a ~26&nbsp;TB-class wide table instead of a narrow, purpose-built view.</p></div>
+    </div>
+  </section>
+
+  <!-- 5 -->
+  <section>
+    <h2><span class="idx">05</span>Architecture &mdash; two serving paths</h2>
+    <p class="sub">Each table gets its own set of narrow, MV-backed Genie spaces over shared conformed dimensions, dispatched by one router. Two distinct sets of metric views &mdash; do not confuse them.</p>
+
+    <div class="grid2">
+      <div class="item"><h4><span class="tag good">A</span>Interactive path &mdash; over <span class="mono">sales</span></h4><p>A small set of slim metric views (&asymp;5) over the curated summary handles the everyday comp / sales / units merchandising questions. Metric views cover ~79% of current Genie queries today; the target MV set lifts that to ~93% while cutting scan.</p></div>
+      <div class="item"><h4><span class="tag good">B</span>Deep-dive path &mdash; over the OLAP</h4><p>The cube&rsquo;s transaction-detail value decomposes into five grain-scoped agents (below), each a narrow metric view for the advanced questions <span class="mono">sales</span> cannot answer. Targeted MVs cover the most common advanced patterns.</p></div>
+    </div>
+
+    <h3>The five deep-dive agents (OLAP path)</h3>
+    <div class="tablewrap">
+      <table>
+        <thead>
+          <tr><th>#</th><th>Agent &amp; metric view</th><th>Grain</th><th>Headline KPIs</th><th>Example questions</th></tr>
+        </thead>
+        <tbody>
+          <tr><td class="num">1</td><td>Transactions &amp; Basket<br><span class="mono">jai_sales_txn_basket</span></td><td>transaction line</td><td><span class="mono">transaction_count, avg_basket_size, units_per_txn</span></td><td>&ldquo;avg basket by store last week&rdquo;, &ldquo;transactions by hour&rdquo;, &ldquo;tender mix&rdquo;</td></tr>
+          <tr><td class="num">2</td><td>Returns &amp; Exchanges<br><span class="mono">jai_sales_returns</span></td><td>return line &harr; original</td><td><span class="mono">return_rate, return_amount, net_sales_after_returns</span></td><td>&ldquo;return rate by category&rdquo;, &ldquo;top return reasons&rdquo;</td></tr>
+          <tr><td class="num">3</td><td>Omnichannel Fulfillment<br><span class="mono">jai_omnichannel_fulfillment</span></td><td>order line</td><td><span class="mono">fulfillment_mix, pickup_rate, cancel_rate, delivery_sla_pct</span></td><td>&ldquo;BOPIS picked up same day&rdquo;, &ldquo;delivery SLA by store&rdquo;</td></tr>
+          <tr><td class="num">4</td><td>Customer &amp; Loyalty<br><span class="mono">jai_customer_loyalty</span></td><td>customer-transaction</td><td><span class="mono">loyalty_penetration_pct, sales_per_customer, pro_xtra_share</span></td><td>&ldquo;loyalty penetration by store&rdquo;, &ldquo;PRO Xtra sales share&rdquo;</td></tr>
+          <tr><td class="num">5</td><td>Promotions &amp; Pricing<br><span class="mono">jai_promotions_pricing</span></td><td>promo-attributed line</td><td><span class="mono">promo_sales_share, discount_rate, markdown_amount</span></td><td>&ldquo;sales on promotion by week&rdquo;, &ldquo;top promos by sales&rdquo;</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <h3>The supporting structure (both paths)</h3>
+    <ul class="clean">
+      <li><strong>Conformed dimensions</strong> &mdash; pull the repeated dims out of both tables into shared <span class="mono">dim_store</span>, <span class="mono">dim_calendar</span>, <span class="mono">dim_product</span>, <span class="mono">dim_customer_household</span>, referenced by every agent. This is the de-denormalization that keeps each scan narrow and answers consistent.</li>
+      <li><strong>Centralized measures</strong> &mdash; every formula defined once in <code>ontology/semantic_measures.yaml</code> (base/derived, grain, additivity), so the split cannot reintroduce double counting.</li>
+      <li><strong>Interactive comparatives on <code>sales</code></strong> &mdash; TY/LY period comparisons come from the slim summary metric views rather than re-importing the cube&rsquo;s wide measure sections.</li>
+      <li><strong>Genie One router</strong> &mdash; a supervisor classifies intent and dispatches interactive questions to the <code>sales</code> spaces and advanced questions to the OLAP agents, composing cross-domain answers over the conformed dims.</li>
+    </ul>
+  </section>
+
+  <!-- 6 -->
+  <section>
+    <h2><span class="idx">06</span>Cut scan before scaling &mdash; tuning <code>sales</code></h2>
+    <p class="sub">Before any warehouse resize, cut the bytes each question reads. The curated <code>sales</code> table is the interactive hot path and it is measurably over-clustered.</p>
+
+    <h3>Configuration vs. recommendation</h3>
+    <div class="tablewrap">
+      <table>
+        <thead><tr><th>Setting</th><th>Current</th><th>Recommendation</th><th></th></tr></thead>
+        <tbody>
+          <tr><td class="prop">Clustering</td><td><span class="mono">SLS_DT, SKU_NBR, STR_NBR, CUST_HH_ID_KEY</span></td><td><span class="mono">SLS_DT, SKU_NBR</span></td><td><span class="tag bad">fix</span></td></tr>
+          <tr><td class="prop">clusterByAuto</td><td><span class="mono">false</span></td><td><span class="mono">true</span></td><td><span class="tag bad">fix</span></td></tr>
+          <tr><td class="prop">Deletion vectors</td><td>1,916 DVs (340M rows)</td><td>VACUUM to reclaim</td><td><span class="tag bad">watch</span></td></tr>
+          <tr><td class="prop">Hierarchical colocation</td><td>Not configured</td><td>Enable <span class="mono">SLS_DT &rarr; SKU_NBR</span></td><td><span class="tag bad">watch</span></td></tr>
+          <tr><td class="prop">PK/FK constraints</td><td>None declared</td><td>Add <span class="mono">RELY</span> constraints (9 FKs)</td><td><span class="tag bad">fix</span></td></tr>
+          <tr><td class="prop">Predictive Optimization</td><td>Enabled (inherited)</td><td>Keep &mdash; confirm VACUUM runs</td><td><span class="tag good">ok</span></td></tr>
+          <tr><td class="prop">Format / compression</td><td>Iceberg V3 / zstd</td><td>Keep</td><td><span class="tag good">ok</span></td></tr>
+          <tr><td class="prop">Columns</td><td>135 (slim vs 848-col OLAP)</td><td>Keep</td><td><span class="tag good">ok</span></td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3>Why 4-key clustering dilutes pruning</h3>
+    <p>From validated query analysis (13,822 sales queries with <span class="mono">read_bytes</span>), only the first two keys earn their place; the trailing two are almost never filtered on, yet they dilute file co-location for the keys that matter.</p>
+    <div class="tablewrap">
+      <table>
+        <thead><tr><th>Clustering key</th><th>In WHERE</th><th>Pruning effective?</th><th>Verdict</th></tr></thead>
+        <tbody>
+          <tr><td><span class="mono">SLS_DT</span></td><td class="num">57%</td><td><span class="yes">&#10003;</span> Yes (strong time pruning)</td><td>Keep</td></tr>
+          <tr><td><span class="mono">SKU_NBR</span></td><td class="num">10%</td><td>~ Partial (diluted by 4 keys)</td><td>Keep</td></tr>
+          <tr><td><span class="mono">STR_NBR</span></td><td class="num">3%</td><td><span class="no">&#10007;</span> Minimal</td><td><strong>Remove</strong></td></tr>
+          <tr><td><span class="mono">CUST_HH_ID_KEY</span></td><td class="num">&lt;0.1%</td><td><span class="no">&#10007;</span> Never used in WHERE</td><td><strong>Remove</strong></td></tr>
+        </tbody>
+      </table>
+      <caption>Filtering on Class Nbr (53% of queries, resolves through SKU) yields only ~3% scan reduction today (56.1 vs 59.7 GB); a 523-file validation confirmed classes are mixed within time-pruned files. Concentrating on 2 keys is estimated to lift class pruning from 3% to 30&ndash;50%.</caption>
+    </div>
+
+    <h3>Action items (advisory &mdash; prioritized by impact / risk)</h3>
+    <p class="aside-note">These are production DDL against <code>pr_core_raw.default.sales</code>; they are recommendations for the table owner and have <strong>not</strong> been executed here.</p>
+    <pre><code>-- 1. Reduce clustering to 2 keys (highest impact, lowest risk)
+ALTER TABLE pr_core_raw.default.sales CLUSTER BY (SLS_DT, SKU_NBR);
+
+-- 2. Enable auto-clustering
+ALTER TABLE pr_core_raw.default.sales
+  SET TBLPROPERTIES ('clusterByAuto' = 'true');
+
+-- 3. OPTIMIZE (schedule off-hours; ~7.5 TB will take hours)
+OPTIMIZE pr_core_raw.default.sales;
+
+-- 4. Add PK/FK RELY constraints for Genie join inference (all 9 FKs)
+ALTER TABLE pr_core_raw.default.sales
+  ADD CONSTRAINT fk_sales_product
+  FOREIGN KEY (UPC_CD, SKU_NBR, SKU_CRT_DT)
+  REFERENCES pr_core_raw.default.product (UPC_CD, SKU_NBR, SKU_CRT_DT) RELY;
+-- ... remaining 8 FK declarations per the architecture doc
+
+-- 5. Create the 5 interactive metric views (93% query coverage, ~91% scan elimination)
+
+-- 6. Hierarchical colocation (after workspace validation)
+ALTER TABLE pr_core_raw.default.sales
+  SET TBLPROPERTIES (
+    'delta.universalformat.config.iceberg.liquid.hierarchicalClusteringColumns' = 'SLS_DT,SKU_NBR'
+  );</code></pre>
+
+    <h3>The 340M deleted rows</h3>
+    <p>1,916 deletion vectors mark 340M rows from <span class="mono">REPLACE USING</span> recast operations. With Predictive Optimization inherited, PO-managed <span class="mono">VACUUM</span> should reclaim them &mdash; but if it isn&rsquo;t running, those rows add scan overhead to every query. Verify:</p>
+    <pre><code>SELECT operation_type, start_time, end_time, operation_metrics
+FROM system.storage.predictive_optimization_operations_history
+WHERE table_name = 'sales' AND operation_type = 'VACUUM'
+ORDER BY start_time DESC LIMIT 5;</code></pre>
+  </section>
+
+  <!-- 7 -->
+  <section>
+    <h2><span class="idx">07</span>Does the load test justify the drastic moves? No</h2>
+    <p class="sub">A review of the 2026-09-01 250-user Genie load test against real production demand and cost &mdash; the evidence points away from both a cube-swap and an XL warehouse.</p>
+
+    <h3>What the test actually exercised</h3>
+    <p>The 284-question set ran against <strong>metric views across seven domains</strong>
+    (<span class="mono">edw_data.genbi_templates_0507/0512.{sales, inventory, weather, plan, events, channel}</span>)
+    plus cross-domain combinations, in a GCP POC workspace &mdash; <em>not</em> a single OLAP cube, and
+    <strong>not</strong> the production <code>sales</code> table. Its absolute figures do not transfer to production.</p>
+
+    <h3>(a) Was it done properly? &mdash; partially; not a basis for a 1,200-user decision</h3>
+    <div class="grid2">
+      <div class="item"><h4><span class="tag bad">!</span>Wrong environment</h4><p>Ran on an <span class="mono">edw_data.genbi_templates</span> POC (GCP), not the prod table / warehouse. The 44 TB scanned, the node ceiling, and the latencies don&rsquo;t carry over.</p></div>
+      <div class="item"><h4><span class="tag bad">!</span>Bottleneck &ne; warehouse queue</h4><p>Queue ratio 0.079, compute-wait 0.0. 80% of wall time is executing massive scans (~7,000,000 rows read per row produced; spills) &mdash; plus Genie API <span class="mono">429</span> rate-limits, which a bigger warehouse won&rsquo;t fix.</p></div>
+      <div class="item"><h4><span class="tag bad">!</span>Unrealistic load model</h4><p>250 Locust clients, no think-time, result cache disabled (0% hits) &mdash; saturating bots, not humans; inflates load versus reality.</p></div>
+      <div class="item"><h4><span class="tag bad">!</span>Under-scoped for the target</h4><p>Only 250 of 1,200 users tested, with no ramp curve &mdash; and ceilings were already hit at 250, so linear extrapolation is invalid.</p></div>
+      <div class="item"><h4><span class="tag bad">!</span>Partial, hand-recovered run</h4><p>Locust exited with an error; 618 client errors were reclassified post-hoc to reach the 90.8% success figure. Defensible, but not a clean run.</p></div>
+      <div class="item"><h4><span class="tag bad">!</span>Latency already fails UX</h4><p>P50 end-to-end <strong>2m 27s</strong>, P95 4m 34s at 250 synthetic users &mdash; a poor experience regardless of node count, and a red flag for 1,200.</p></div>
+    </div>
+
+    <h3>(b) Does it justify replacing <code>sales</code> with the OLAP cube, or going XL?</h3>
+    <div class="verdict">
+      <p><strong>No &mdash; the evidence points the other way.</strong> The cost driver is scan volume, not
+      table choice. <code>sales</code> is a summary; the OLAP cube is far larger transaction detail
+      (848 cols, ~26.8 TB scanned) &mdash; swapping it in <em>increases</em> bytes scanned and makes the
+      node ceiling worse.</p>
+      <p>The pain concentrates in the <strong>sales</strong> domain, which calls for <em>more</em>
+      curation (aggregates, pruning, conformed dims &mdash; &sect;06), not consolidation onto a wide cube.
+      The Genie API <span class="mono">429</span> ceiling is independent of the table. &ldquo;Go XL&rdquo;
+      is a vertical band-aid: it lifts the node ceiling but leaves scan amplification, API limits, and
+      2.5-minute latencies unaddressed, and won&rsquo;t linearly reach 1,200.</p>
+    </div>
+
+    <h3>Real demand &mdash; the test&rsquo;s 250 is far above reality</h3>
+    <p>Production Genie usage on recent Mondays (the weekly peak) shows real concurrency an order of magnitude below the tested and targeted loads.</p>
+    <div class="tablewrap">
+      <table>
+        <thead><tr><th>Monday</th><th>Genie queries</th><th>Distinct users</th><th>P50</th><th>P95</th><th>Peak users/hr</th><th>Peak queries/hr</th></tr></thead>
+        <tbody>
+          <tr><td>Aug 24</td><td class="num">6,605</td><td class="num">123</td><td class="num">5.9s</td><td class="num">44.6s</td><td class="num">42</td><td class="num">1,311</td></tr>
+          <tr><td>Aug 31</td><td class="num">7,793</td><td class="num">149</td><td class="num">8.4s</td><td class="num">67.0s</td><td class="num">43</td><td class="num">1,739</td></tr>
+          <tr><td>Sep 7</td><td class="num">4,625</td><td class="num">113</td><td class="num">8.8s</td><td class="num">50.5s</td><td class="num">53</td><td class="num">1,841</td></tr>
+          <tr><td>Sep 14</td><td class="num">11,031</td><td class="num">206</td><td class="num">6.5s</td><td class="num">39.0s</td><td class="num">70</td><td class="num">2,557</td></tr>
+        </tbody>
+      </table>
+      <caption>Real peak &asymp; 70 users/hr and 2,557 queries/hr (~0.71 q/s) on the busiest Monday &mdash; roughly 3.6&times; below the 250 synthetic users tested and ~17&times; below the 1,200 target. Production P50 6&ndash;9s vs the test&rsquo;s 2m 27s confirms the test latencies were saturation artifacts. (Peak users/hr overstates true instantaneous concurrency &mdash; real users have think-time &mdash; but is still far under 250.)</caption>
+    </div>
+
+    <h3>Warehouse cost &mdash; modest, bursty, and the spike was the test</h3>
+    <p>The serving warehouse (<span class="mono">9f07257e4b897000</span>, PREMIUM_SERVERLESS_SQL) ran
+    <strong>$6,619 over 60 days &mdash; ~$3,300/month</strong>, active on 35 of 60 days at an average of
+    <strong>$189/day</strong>. Usage is bursty, from $5/day quiet to a <strong>$914/day peak on Sep 1
+    &mdash; which is the load test itself</strong>. In other words, the single most expensive day on record
+    was the synthetic test, not real demand.</p>
+    <p class="aside-note">Note: this warehouse was labelled <code>rc_finance</code> in the metering export, versus <code>pr_finance</code> elsewhere in this analysis &mdash; confirm they refer to the same environment before acting on the figures.</p>
+
+    <h3>A proper scale test</h3>
+    <ul class="clean">
+      <li>Run in the <strong>production</strong> environment (the prod table / Genie space / warehouse), not a POC.</li>
+      <li><strong>Size concurrency from real Monday usage</strong> (~70 peak users/hr), with realistic think-time and result cache enabled.</li>
+      <li><strong>Ramp</strong> against the real curve rather than jumping to 250/1,200 with no ramp.</li>
+      <li><strong>Separate the two ceilings</strong> &mdash; warehouse (scan/exec) vs. Genie API <span class="mono">429</span> &mdash; and address each.</li>
+      <li><strong>Cut scan volume first</strong> (clustering, MVs, conformed dims &mdash; &sect;06), <em>then</em> right-size the warehouse against the real curve.</li>
+    </ul>
+  </section>
+
+  <!-- 8 -->
+  <section>
+    <h2><span class="idx">08</span>Advantages of the two-path design</h2>
+    <p class="sub">The design is not just avoidance of the anti-pattern &mdash; it is a stronger platform on its own terms.</p>
+    <div class="grid2">
+      <div class="item"><h4><span class="tag good">&#10003;</span>Higher answer accuracy</h4><p>Narrow, curated context per space &mdash; Genie picks the right table and column, far better than 848 columns in one room.</p></div>
+      <div class="item"><h4><span class="tag good">&#10003;</span>Trustworthy, grain-consistent KPIs</h4><p>Governed measures in one place; no detail-vs-pre-aggregate double counting. Numbers that reconcile.</p></div>
+      <div class="item"><h4><span class="tag good">&#10003;</span>Faster &amp; cheaper</h4><p>Slim metric views + conformed dims mean small scans; the interactive path never pays the cube&rsquo;s ~26 TB tax.</p></div>
+      <div class="item"><h4><span class="tag good">&#10003;</span>Full coverage preserved</h4><p>Keeping the cube retains the 713 advanced columns &mdash; LLY, cost, weather, pro, delivery &mdash; for the deep-dive path.</p></div>
+      <div class="item"><h4><span class="tag good">&#10003;</span>Consistency across spaces</h4><p>Shared conformed dimensions mean the same store, calendar, product, and customer definitions everywhere.</p></div>
+      <div class="item"><h4><span class="tag good">&#10003;</span>Independent iteration &amp; isolation</h4><p>Each space is tuned, benchmarked, and versioned separately; a change or failure in one doesn&rsquo;t ripple to the others.</p></div>
+      <div class="item"><h4><span class="tag good">&#10003;</span>No duplication</h4><p>TY/LY comparatives reuse the curated <code>sales</code> summary rather than re-importing the cube&rsquo;s wide measure sections.</p></div>
+      <div class="item"><h4><span class="tag good">&#10003;</span>Governed &amp; owned</h4><p>An Ontos product, contract, and semantic model per space, each mapped to a business domain and owner.</p></div>
+    </div>
+  </section>
+
+  <!-- A -->
+  <section>
+    <h2><span class="idx">A</span>Appendix &mdash; assumptions &amp; next steps</h2>
+    <ul class="clean">
+      <li><strong>Cross-metastore reachability</strong> &mdash; <span class="mono">pr_core_raw_v1</span> and <span class="mono">pr_core_raw</span> likely do not live in the <span class="mono">jai_classic_ws</span> metastore; the metric/serving views must be built where the source data is reachable (naming stays <span class="mono">jai_</span> per convention).</li>
+      <li><strong>Column curation</strong> &mdash; the exact expose-vs-hide set and the lean measure list per space need a <code>DESCRIBE</code>-validated pass on the deployed 848-column table before writing SQL expressions (unqualified/incorrect columns cause runtime &ldquo;column does not exist&rdquo;).</li>
+      <li><strong>Fulfillment domain</strong> &mdash; the Omnichannel agent has no existing entry in the app&rsquo;s <span class="mono">DOMAIN_DEFS</span>; either add one or attach it under <span class="mono">merchandise_inventory</span> / <span class="mono">sales_pos</span>.</li>
+      <li><strong>Warehouse naming</strong> &mdash; reconcile <span class="mono">rc_finance</span> (metering export) with <span class="mono">pr_finance</span> (elsewhere) before quoting cost figures operationally.</li>
+      <li><strong>Suggested next step</strong> &mdash; produce the per-space column manifest (which of the 848 columns each view exposes or hides) and a benchmark set of &ge;5 questions per space for run-and-tune, then execute the &sect;06 tuning on <code>sales</code>.</li>
+    </ul>
+  </section>
+
+  <!-- B -->
+  <section>
+    <h2><span class="idx">B</span>Appendix &mdash; rebuilding <code>sales</code> from the OLAP</h2>
+    <p class="aside-note">An exploratory aside, separate from the recommendation above &mdash; not a dependency of the two-path design.</p>
+    <p>Could the curated <code>pr_core_raw.default.sales</code> summary be regenerated <em>from</em> the OLAP cube? The OLAP is finer-grained transaction detail that carries all four of <code>sales</code>&rsquo;s grain keys &mdash; <span class="mono">SLS_DT, SKU_NBR, STR_NBR, CUST_HH_ID_KEY</span> &mdash; so <code>sales</code> is essentially a <strong>roll-up of the OLAP to that grain</strong>. By column name, <span class="pill">76 of 135</span> <code>sales</code> columns (56%) have a direct source in the OLAP; the remaining 59 are derived, keyed, or multi-year and need recomputation or other sources.</p>
+
+    <h3>Reconstructable by roll-up (the 76 shared columns)</h3>
+    <div class="tablewrap">
+      <table>
+        <thead><tr><th>Role in <span class="mono">sales</span></th><th>#</th><th>How to rebuild from the OLAP</th></tr></thead>
+        <tbody>
+          <tr><td>Additive $/unit measures (gross sales, COGS, discounts, ship, comp sales/units, boris)</td><td class="num">24</td><td><span class="mono">SUM(&hellip;)</span> grouped by the four grain keys</td></tr>
+          <tr><td>Transaction counts / indicators</td><td class="num">3</td><td><span class="mono">COUNT(DISTINCT UNIQUE_TRANS_ID)</span> &mdash; never <span class="mono">SUM</span></td></tr>
+          <tr><td>Grain attributes &amp; descriptors (household, fulfillment, dates)</td><td class="num">44</td><td><span class="mono">ANY_VALUE()</span>/<span class="mono">MAX()</span> within grain, or from conformed dims</td></tr>
+          <tr><td>Surrogate / dimension keys</td><td class="num">5</td><td>Grain key carried directly; others via dimension lookup</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3>The gap &mdash; 59 columns not present in the OLAP by name</h3>
+    <div class="tablewrap">
+      <table>
+        <thead><tr><th>Gap category</th><th>#</th><th>Examples</th><th>How to fill</th></tr></thead>
+        <tbody>
+          <tr><td>Derived &amp; <span class="mono">_CALC</span> measures (GM, retail GM/COGS, calc variants)</td><td class="num">36</td><td><span class="mono">TY_GM_AMT, TY_COGS_AMT_CALC, TY_RETAIL_GM_AMT, TY_GROSS_SLS, TY_SHIP_AMT</span></td><td>Recompute from base components (the summary derives these downstream)</td></tr>
+          <tr><td>Surrogate keys</td><td class="num">9</td><td><span class="mono">TY_SLS_TXN_KEY, TY_CUST_HH_ID_KEY, TY_COMP_SLS_TXN_KEY</span></td><td>Pipeline-assigned &mdash; not reconstructable from source; need the key pipeline / lookup</td></tr>
+          <tr><td>Multi-year comps (2YR / LLY)</td><td class="num">5</td><td><span class="mono">COMP_SLS_AMT_2YR, LLY_COMP_SLS_2YR, LLY_COMP_SLS_2YR_TXN</span></td><td>Need 2+ years of history and a comp-store flag; beyond a single-period roll-up (the cube&rsquo;s LLY block helps here)</td></tr>
+          <tr><td>Counts</td><td class="num">5</td><td><span class="mono">TY_SLS_TXN, LY_SLS_TXN, SKU_COUNT, STR_COUNT</span></td><td><span class="mono">COUNT(DISTINCT &hellip;)</span>; <span class="mono">SKU_COUNT</span>/<span class="mono">STR_COUNT</span> are degenerate (=1) at this grain</td></tr>
+          <tr><td>Dimension attributes</td><td class="num">3</td><td><span class="mono">HH_SEGMENT_ID, PRO_XTRA_IND, NET_CTNT_UOM_CD, OMS_ITEM_ID</span></td><td>From product / customer dimensions</td></tr>
+          <tr><td>Fiscal date</td><td class="num">1</td><td><span class="mono">FSCL_PRD_END_DT</span></td><td>From the calendar dimension</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3>Illustrative roll-up</h3>
+    <pre><code>-- sales &asymp; roll-up of the OLAP detail to the summary grain
+SELECT
+  SLS_DT, SKU_NBR, STR_NBR, CUST_HH_ID_KEY,
+  SUM(TY_SLS_AMT)                  AS TY_SLS_AMT,
+  SUM(TY_GROSS_SALES_AMT)          AS TY_GROSS_SALES_AMT,
+  SUM(TY_COGS_AMT)                 AS TY_COGS_AMT,
+  COUNT(DISTINCT UNIQUE_TRANS_ID)  AS TY_SLS_TXN,        -- count, never SUM
+  ANY_VALUE(HH_ID)                 AS HH_ID,             -- grain-constant attribute
+  -- derived measures are recomputed from components, not copied:
+  SUM(TY_GROSS_SALES_AMT) - SUM(TY_COGS_AMT) AS TY_GM_AMT
+FROM pr_core_raw_v1.default.sls_cust_trans_dtl_olap
+GROUP BY SLS_DT, SKU_NBR, STR_NBR, CUST_HH_ID_KEY;</code></pre>
+
+    <p><strong>Verdict:</strong> because the OLAP is finer-grained and transaction-grounded, it is a viable &mdash; arguably better &mdash; source for regenerating the <em>additive core</em> of <code>sales</code> (~56% direct, plus derived measures recomputed from components). A faithful 1:1 rebuild also needs recomputed GM/retail measures, pipeline-assigned surrogate keys, and multi-year comp logic, so treat the OLAP as a <strong>strong basis, not a drop-in replacement</strong> &mdash; which is exactly why the two-path design keeps both tables.</p>
+  </section>
+
+</div>
+
+<footer>
+  <div class="wrap">
+    <div class="mono">two tables &middot; two Genie paths &middot; cut scan before scaling &nbsp;&middot;&nbsp; analysis document &nbsp;&middot;&nbsp; 2026-09-16</div>
+  </div>
+</footer>
+
+</body>
+</html>
