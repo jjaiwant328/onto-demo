@@ -183,6 +183,59 @@ describe('fetchNeighbors — mapping', () => {
     expect(neighbors).toEqual(expected);
   });
 
+  it('still parses relationship fields when SDL descriptions precede them', async () => {
+    const h = makeHarness();
+    // descriptions on data-type fields (one-line and multi-line docstrings) —
+    // a swallowed field here would silently drop neighbors from the expansion
+    const describedSdl = [
+      'type Customer {',
+      '  id: ID!',
+      '  uri: String!',
+      '  label: String',
+      '  """Maps onto the customer dimension."""',
+      '  firstName: String',
+      '  """Orders placed by this customer."""',
+      '  hasOrder: [Order]',
+      '}',
+      '',
+      'type Order {',
+      '  id: ID!',
+      '  uri: String!',
+      '  label: String',
+      '  """',
+      '  The customer who placed the order.',
+      '  """',
+      '  placedBy: [Customer]',
+      '}',
+      '',
+      'type Query {',
+      '  customer(id: String!): Customer',
+      '  order(id: String!): Order',
+      '}',
+    ].join('\n');
+    serveGraph(
+      h,
+      PROBE_FOUND,
+      {
+        data: {
+          customer: {
+            uri: IRI_C1,
+            label: 'Alice',
+            __typename: 'Customer',
+            hasOrder: [{ uri: IRI_O9, label: 'Order 1009', __typename: 'Order' }],
+          },
+        },
+      },
+      describedSdl
+    );
+    const neighbors = await h.client.fetchNeighbors(DOMAIN, IRI_C1, 2);
+    expect(neighbors).toEqual([
+      { iri: IRI_O9, label: 'Order 1009', types: ['Order'], predicate: 'hasOrder', direction: 'out' },
+    ]);
+    // placedBy, behind a multi-line description, still expands at hop 2
+    expect(bodyOf(h.calls[2]).query).toContain('placedBy {');
+  });
+
   it('returns [] for an origin with no relationships', async () => {
     const h = makeHarness();
     serveGraph(h, PROBE_FOUND, {
