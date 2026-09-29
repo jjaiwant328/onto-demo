@@ -1,0 +1,130 @@
+# Open Data Contract Standard (ODCS) v3.1.0 rendering of the RT_onto serving
+# contract for the Store Traffic & Labor Efficiency data product.
+#
+# Converted from: ontos/contracts/jai_store_traffic_labor_efficiency_contract.yaml
+# (ontos/v1 DataContract). Schema fields, SLA freshness, and quality checks are
+# semantically identical to that source; only their ODCS spellings change
+# (nullable → required, key → primaryKey, decimal physical types preserved).
+apiVersion: v3.1.0
+kind: DataContract
+id: urn:datacontract:jai_ontos:jai_store_traffic_labor_efficiency
+name: jai_store_traffic_labor_efficiency_contract
+version: 1.0.0
+status: draft # source contract status was 'defined' (defined | active | breaking)
+domain: store-operations
+dataProduct: jai_store_traffic_labor_efficiency
+description:
+  usage: store-day traffic + labor + efficiency KPIs for active stores
+  limitations: >-
+    fuel margin, shrink, bonuses, and customer PII are out of scope;
+    region_name may be stale (monthly source) or null (A3); dual_customers is
+    loyalty-biased (A5); derived KPIs are computed from re-aggregated base sums
+    (see ontology/semantic_measures.yaml)
+team:
+  - username: jaiwant.jonathan@databricks.com
+    role: owner
+slaProperties:
+  - property: freshness
+    value: data available by 06:00 local for prior business_day
+    description: Freshness basis is the calendar_day column (prior business day).
+customProperties:
+  - property: warehouseId
+    value: '310314146ebd3230'
+schema:
+  - name: jai_store_day_traffic_labor
+    logicalType: object
+    physicalName: jai_ontos.demo_schema.jai_store_day_traffic_labor
+    physicalType: table
+    dataGranularityDescription: one row per (store_number, calendar_day)
+    properties:
+      - name: store_number
+        logicalType: integer
+        physicalType: INT
+        required: true
+        primaryKey: true
+        primaryKeyPosition: 1
+        description: Store number (business key of the Store concept).
+      - name: store_name
+        logicalType: string
+        physicalType: STRING
+        description: Store display name.
+      - name: store_city
+        logicalType: string
+        physicalType: STRING
+      - name: state_code
+        logicalType: string
+        physicalType: STRING
+      - name: region_name
+        logicalType: string
+        physicalType: STRING
+        description: Monthly source; may be stale or null (A3).
+      - name: store_status
+        logicalType: string
+        physicalType: STRING
+      - name: date_key
+        logicalType: integer
+        physicalType: INT
+        required: true
+        primaryKey: true
+        primaryKeyPosition: 2
+      - name: calendar_day
+        logicalType: date
+        physicalType: DATE
+        required: true
+        primaryKey: true
+        primaryKeyPosition: 3
+      - name: total_customers
+        logicalType: integer
+        physicalType: BIGINT
+        required: true
+      - name: shop_customers
+        logicalType: integer
+        physicalType: BIGINT
+        required: true
+      - name: fuel_customers
+        logicalType: integer
+        physicalType: BIGINT
+        required: true
+      - name: dual_customers
+        logicalType: integer
+        physicalType: BIGINT
+        required: true
+        description: Loyalty-biased measure (A5).
+      - name: total_labor_hours
+        logicalType: number
+        physicalType: DECIMAL(18,2)
+        required: true
+      - name: total_labor_cost
+        logicalType: number
+        physicalType: DECIMAL(18,2)
+        required: true
+      - name: labor_cost_per_customer
+        logicalType: number
+        physicalType: DECIMAL(18,4)
+      - name: labor_hours_per_customer
+        logicalType: number
+        physicalType: DECIMAL(18,4)
+      - name: dual_customer_conversion_rate_pct
+        logicalType: number
+        physicalType: DECIMAL(18,2)
+    quality:
+      - id: unique_grain
+        dimension: uniqueness
+        type: text
+        severity: error
+        description: count(*) = count(distinct store_number, date_key)
+      - id: non_negative_customers
+        dimension: accuracy
+        type: text
+        severity: error
+        description: min(total_customers) >= 0
+      - id: kpi_divzero_guarded
+        dimension: accuracy
+        type: text
+        severity: warning
+        description: labor_cost_per_customer is null only when total_customers = 0
+      - id: customer_parts_consistent
+        dimension: consistency
+        type: text
+        severity: error
+        description: shop_customers <= total_customers AND fuel_customers <= total_customers
