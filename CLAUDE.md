@@ -24,6 +24,7 @@
 | Artifact catalog/schema | `jai_ontos.demo_schema` |
 | Warehouse | `310314146ebd3230` |
 | App | `RT_onto_demo` (Streamlit) |
+| Companion apps | `ontos` + `jai_ontobricks` via env `ONTOS_APP_URL`/`ONTOS_MCP_TOKEN`, `ONTOBRICKS_APP_URL`/`ONTOBRICKS_TOKEN`, `ONTOBRICKS_DOMAIN` (unset → routes degrade to offline shapes) |
 
 ## First use case
 

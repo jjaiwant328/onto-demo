@@ -1,5 +1,8 @@
 import { createApp, analytics, server, serving, getWorkspaceClient } from '@databricks/appkit';
 import { randomUUID, createHash } from 'node:crypto';
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import {
   demoExceptionSql,
   demoAggregateSql,
@@ -19,6 +22,9 @@ import {
 } from '../shared/ontologyArtifact';
 import { humanizeStateError } from '../shared/stateError';
 import { lbQuery, ensureLakebaseTables, lakebaseConfigured } from './lakebase';
+import { createOntosClient, type OntosClient } from './ontosClient';
+import { createOntobricksClient, type OntobricksClient } from './ontobricksClient';
+import { loadCuratedMeasures } from './measuresSource';
 
 // The serving plugin is wired to a Foundation Model endpoint (alias "llm",
 // endpoint name from DATABRICKS_SERVING_ENDPOINT_NAME). It powers the optional
@@ -26,6 +32,57 @@ import { lbQuery, ensureLakebaseTables, lakebaseConfigured } from './lakebase';
 // endpoint is configured the route reports llm:false and callers fall back to the
 // heuristic — the feature never blocks on the model.
 const hasLlm = Boolean(process.env.DATABRICKS_SERVING_ENDPOINT_NAME);
+
+// ---- Companion-app integrations (ontos governance, ontobricks graph) ------
+// Both clients are built lazily from env and cached — the ontobricks client's
+// SDL cache is a per-client closure, so a fresh client per request would add
+// three HTTP round-trips to every neighbor query. With the env absent, every
+// integration route below degrades to its offline shape instead of erroring.
+let cachedOntos: OntosClient | null = null;
+let cachedOntobricks: OntobricksClient | null = null;
+// product name -> contract id, learned from successful syncs; before any sync,
+// the id scheme the committed contract carries is derived from the product name.
+const syncedContractIds = new Map<string, string>();
+
+const errMsg = (err: unknown): string => String((err as { message?: string })?.message ?? err);
+
+function ontosClient(): OntosClient | null {
+  const baseUrl = (process.env.ONTOS_APP_URL ?? '').trim();
+  const apiToken = (process.env.ONTOS_MCP_TOKEN ?? '').trim();
+  if (!baseUrl || !apiToken) return null;
+  cachedOntos ??= createOntosClient({ baseUrl, apiToken });
+  return cachedOntos;
+}
+
+function ontobricksClient(): OntobricksClient | null {
+  const baseUrl = (process.env.ONTOBRICKS_APP_URL ?? '').trim();
+  const token = (process.env.ONTOBRICKS_TOKEN ?? '').trim();
+  if (!baseUrl || !token) return null;
+  cachedOntobricks ??= createOntobricksClient({ baseUrl, token });
+  return cachedOntobricks;
+}
+
+function contractIdFor(product: string): string {
+  return syncedContractIds.get(product) ?? `urn:datacontract:jai_ontos:${product}`;
+}
+
+// Read a committed repo file (the ODCS contract) whether the server runs from
+// source (server/) or the bundle (dist/): app root (cwd) first, then
+// module-relative.
+function readRepoFile(relPath: string): string | null {
+  const candidates = [
+    path.resolve(process.cwd(), relPath),
+    fileURLToPath(new URL(`../${relPath}`, import.meta.url)),
+  ];
+  for (const p of candidates) {
+    try {
+      return readFileSync(p, 'utf8');
+    } catch {
+      // try the next candidate
+    }
+  }
+  return null;
+}
 
 createApp({
   plugins: [
@@ -3345,6 +3402,116 @@ createApp({
         } catch (e) {
           res.json({ rows: [], sql, error: humanizeSqlError(e) });
         }
+      });
+
+      // ---- Companion apps: ontos (governance) + ontobricks (graph) ----------
+      // All four routes degrade to offline shapes when the companion apps are
+      // not configured (env absent), so the client can fall back to bundled data.
+
+      // GET /api/contract — a product's ODCS contract validation state in ontos.
+      app.get('/api/contract', async (req, res) => {
+        const client = ontosClient();
+        if (!client) {
+          res.json({ source: 'offline', validation: null });
+          return;
+        }
+        const product = (req.query.product as string | undefined)?.trim();
+        const contractId =
+          (req.query.contract as string | undefined)?.trim() || (product ? contractIdFor(product) : '');
+        if (!contractId) {
+          res.status(400).json({
+            source: 'offline',
+            validation: null,
+            error: 'product (or contract) query param required',
+          });
+          return;
+        }
+        try {
+          const validation = await client.getContractValidationState(contractId);
+          res.json({ source: 'ontos', validation });
+        } catch (err) {
+          // not synced yet (404) or ontos unreachable — offline either way
+          res.json({ source: 'offline', validation: null, error: errMsg(err) });
+        }
+      });
+
+      // POST /api/contract/sync — push the committed ODCS contract to ontos, then
+      // create its data product. Never reports silent success: any failure
+      // surfaces a humanized error (the client shows it inline).
+      app.post('/api/contract/sync', async (_req, res) => {
+        const client = ontosClient();
+        if (!client) {
+          res.json({ ok: false, error: 'ontos not configured' });
+          return;
+        }
+        const yaml = readRepoFile('ontology/odcs/jai_store_traffic_labor_efficiency_contract.odcs.yaml');
+        if (yaml === null) {
+          res.json({ ok: false, error: 'ODCS contract file not found on disk' });
+          return;
+        }
+        let contractId: string;
+        try {
+          contractId = (await client.importOdcsContract(yaml)).contractId;
+        } catch (err) {
+          res.json({ ok: false, error: errMsg(err) });
+          return;
+        }
+        let productId: string;
+        try {
+          productId = (
+            await client.createProductFromContract(contractId, 'jai_store_traffic_labor_efficiency')
+          ).productId;
+        } catch (err) {
+          // known upstream bug: ontos' from-contract endpoint 500s. The
+          // contract IS imported — surface both facts, never claim full success.
+          res.json({
+            ok: false,
+            error: `contract ${contractId} imported, but the upstream ontos data-product endpoint failed: ${errMsg(err)}`,
+          });
+          return;
+        }
+        syncedContractIds.set('jai_store_traffic_labor_efficiency', contractId);
+        res.json({ ok: true, contractId, productId });
+      });
+
+      // GET /api/graph/neighbors — expand a node's ontology-graph neighborhood
+      // through the ontobricks GraphQL proxy (domain defaults to the env var).
+      app.get('/api/graph/neighbors', async (req, res) => {
+        const client = ontobricksClient();
+        if (!client) {
+          res.json({ source: 'none', neighbors: [] });
+          return;
+        }
+        const node = (req.query.node as string | undefined)?.trim();
+        if (!node) {
+          res.status(400).json({ source: 'ontobricks', neighbors: [], error: 'node query param required' });
+          return;
+        }
+        const domain =
+          (req.query.domain as string | undefined)?.trim() || (process.env.ONTOBRICKS_DOMAIN ?? '').trim();
+        if (!domain) {
+          res.json({
+            source: 'ontobricks',
+            neighbors: [],
+            error: 'no ontology domain configured (set ONTOBRICKS_DOMAIN or pass ?domain=)',
+          });
+          return;
+        }
+        const h = Math.round(Number(req.query.hops ?? 1));
+        const hops = Number.isFinite(h) ? Math.min(Math.max(h, 1), 3) : 1;
+        try {
+          const neighbors = await client.fetchNeighbors(domain, node, hops);
+          res.json({ source: 'ontobricks', neighbors });
+        } catch (err) {
+          res.json({ source: 'ontobricks', neighbors: [], error: errMsg(err) });
+        }
+      });
+
+      // GET /api/measures — curated KPI definitions in the same shape the client
+      // bundles at build time; loaded from ontology/semantic_measures.yaml once,
+      // then cached (the client falls back to its bundled copy on error).
+      app.get('/api/measures', (_req, res) => {
+        res.json(loadCuratedMeasures());
       });
     });
   },

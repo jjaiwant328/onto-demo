@@ -24,3 +24,19 @@ env:
     value: 'projects/jai-onto-demo/branches/production/endpoints/primary'
   - name: PGSSLMODE
     value: 'require'
+  # Companion apps the server integrates with: ontos (governance system of
+  # record for contracts/data products) and jai_ontobricks (ontology graph,
+  # GraphQL neighbor expansion). Empty defaults here — the operator sets the
+  # real values as app secrets. While unset, the /api/contract*, /api/graph/
+  # neighbors routes degrade to their offline shapes.
+  - name: ONTOS_APP_URL
+    value: ''
+  - name: ONTOS_MCP_TOKEN
+    value: ''
+  - name: ONTOBRICKS_APP_URL
+    value: ''
+  - name: ONTOBRICKS_TOKEN
+    value: ''
+  # ontobricks ontology domain (default domain for /api/graph/neighbors)
+  - name: ONTOBRICKS_DOMAIN
+    value: ''
