@@ -44,6 +44,63 @@ for (const s of SECTIONS) {
   });
 }
 
+// ---- integration UI smoke (offline mode) -----------------------------------
+// The companion apps (ontos for contracts, ontobricks for the graph) are not
+// configured in local dev, so their server routes return the offline shapes
+// (`source:'offline'` / `source:'none'`). These tests pin that the integration
+// UI degrades to its bundled/offline view instead of crashing. Cytoscape nodes
+// are canvas-rendered (and the cytoscape script itself is a CDN global), so
+// travel is driven through the DOM-side search jump, never the canvas.
+
+test('smoke test - Data Contract page shows ontos validation offline', async ({ page }) => {
+  await page.goto('/data-contract');
+  await expect(page.getByRole('heading', { name: 'Data Contract', level: 2 })).toBeVisible();
+
+  // the validation card settles on the offline hint (never an empty flash —
+  // a skeleton shows while the initial fetch is in flight)
+  await expect(page.getByText('ontos not configured or contract not synced')).toBeVisible();
+
+  // both integration actions exist
+  await expect(page.getByRole('button', { name: 'Sync to Ontos' })).toBeVisible();
+  const runValidation = page.getByRole('button', { name: 'Run validation' });
+  await expect(runValidation).toBeVisible();
+
+  // clicking "Run validation" offline re-fetches, stays on the page, and the
+  // offline content is intact (no crash, no error-state takeover)
+  await runValidation.click();
+  await expect(page.getByRole('heading', { name: 'Data Contract', level: 2 })).toBeVisible();
+  await expect(page.getByText('ontos not configured or contract not synced')).toBeVisible();
+  expect(pageErrors).toEqual([]);
+});
+
+test('smoke test - Graph Explorer page loads and travels a node offline', async ({ page }) => {
+  await page.goto('/graph-explorer');
+  await expect(page.getByRole('heading', { name: 'Graph Explorer', level: 2 })).toBeVisible();
+
+  // default scope is "All products" (no auto-focus), so Back/Overview start
+  // disabled until a node is traveled to
+  const back = page.getByRole('button', { name: 'Back' });
+  await expect(back).toBeDisabled();
+
+  // travel via the Explore tab's node search (Enter jumps to the first match —
+  // the enterprise root node, whose label always ends in "Enterprise"). On
+  // focus, TravelCanvas fetches /api/graph/neighbors; offline it gets
+  // `source:'none'` and falls back to the native edges-table ego graph.
+  const search = page.getByPlaceholder('Search nodes (products, tables, domains…)');
+  await search.fill('Enterprise');
+  await search.press('Enter');
+
+  // focused: Back enables and the inspector shows the focused node (the root's
+  // detail text is DOM-side, independent of the canvas)
+  await expect(back).toBeEnabled();
+  await expect(page.getByText(/\d+ domains · \d+ data products/)).toBeVisible();
+
+  // Overview returns to the full map without a crash
+  await page.getByRole('button', { name: 'Overview' }).first().click();
+  await expect(page.getByText('No node selected.')).toBeVisible();
+  expect(pageErrors).toEqual([]);
+});
+
 test.beforeEach(async ({ page }) => {
   consoleErrors = [];
   pageErrors = [];
