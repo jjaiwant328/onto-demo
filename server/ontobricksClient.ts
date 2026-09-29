@@ -96,9 +96,10 @@ function parseSdl(sdl: string): SdlTypes {
   for (const rawLine of sdl.split('\n')) {
     const line = rawLine.trim();
     if (line.includes('"""')) {
-      // an unpaired `"""` (odd occurrence count) opens or closes a multi-line
-      // description; an open-and-close pair on one line leaves it unchanged
-      if (line.split('"""').length % 2 === 1) inDescription = !inDescription;
+      // an UNPAIRED `"""` (one occurrence → split length 2) opens or closes a
+      // multi-line description; a self-closed pair like """desc""" (two
+      // occurrences → split length 3) leaves the state unchanged
+      if (line.split('"""').length % 2 === 0) inDescription = !inDescription;
       continue;
     }
     if (inDescription || line === '') continue;

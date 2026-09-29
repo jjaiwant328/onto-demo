@@ -183,19 +183,20 @@ describe('fetchNeighbors — mapping', () => {
     expect(neighbors).toEqual(expected);
   });
 
-  it('still parses relationship fields when SDL descriptions precede them', async () => {
+  it('still parses fields after a one-line SDL description (not swallowed)', async () => {
     const h = makeHarness();
-    // descriptions on data-type fields (one-line and multi-line docstrings) —
-    // a swallowed field here would silently drop neighbors from the expansion
+    // a SINGLE self-closed """desc""" directly above a relationship field,
+    // followed by another field: the old (buggy) parity check toggled into
+    // description mode here and swallowed hasOrder, refersTo and the rest of
+    // the SDL — silently dropping neighbors from the expansion
     const describedSdl = [
       'type Customer {',
       '  id: ID!',
       '  uri: String!',
       '  label: String',
-      '  """Maps onto the customer dimension."""',
-      '  firstName: String',
       '  """Orders placed by this customer."""',
       '  hasOrder: [Order]',
+      '  refersTo: [Customer]',
       '}',
       '',
       'type Order {',
@@ -203,9 +204,9 @@ describe('fetchNeighbors — mapping', () => {
       '  uri: String!',
       '  label: String',
       '  """',
-      '  The customer who placed the order.',
+      '  The source system of the order.',
       '  """',
-      '  placedBy: [Customer]',
+      '  orderDate: String',
       '}',
       '',
       'type Query {',
@@ -229,11 +230,14 @@ describe('fetchNeighbors — mapping', () => {
       describedSdl
     );
     const neighbors = await h.client.fetchNeighbors(DOMAIN, IRI_C1, 2);
+    // the relationship field under the description still yields neighbors
     expect(neighbors).toEqual([
       { iri: IRI_O9, label: 'Order 1009', types: ['Order'], predicate: 'hasOrder', direction: 'out' },
     ]);
-    // placedBy, behind a multi-line description, still expands at hop 2
-    expect(bodyOf(h.calls[2]).query).toContain('placedBy {');
+    // and BOTH fields after the description are selected by the expansion
+    const query = bodyOf(h.calls[2]).query as string;
+    expect(query).toContain('hasOrder {');
+    expect(query).toContain('refersTo {');
   });
 
   it('returns [] for an origin with no relationships', async () => {
