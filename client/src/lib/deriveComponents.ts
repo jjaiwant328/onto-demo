@@ -178,12 +178,70 @@ export type DerivedComponents = {
 // the strongest trust signal in the app — while referencing columns that schema
 // does not have. So a curated definition applies only when every column its
 // formula references actually exists in the active schema.
-const CURATED_MEASURES = new Map<string, { formula: string; unit: string; description: string }>(
+type CuratedEntry = { formula: string; unit: string; description: string };
+const BUNDLED_CURATED_MEASURES = new Map<string, CuratedEntry>(
   (ontologyJson.measures ?? []).map((m) => [
     m.measure,
     { formula: m.formula, unit: m.unit, description: m.description },
   ])
 );
+
+// The ACTIVE curated measures: the bundled copy until GET /api/measures (served
+// from ontology/semantic_measures.yaml at runtime, same shape as the bundled
+// ontology.json) lands with a non-empty list. Empty list / error body / fetch
+// failure keeps the bundled copy, so the app works fully offline.
+let CURATED_MEASURES: ReadonlyMap<string, CuratedEntry> = BUNDLED_CURATED_MEASURES;
+
+// One curated KPI as /api/measures serves it (see server/measuresSource.ts).
+type ServerCuratedMeasure = {
+  measure?: unknown;
+  type?: unknown;
+  unit?: unknown;
+  formula?: unknown;
+  description?: unknown;
+  depends_on?: unknown;
+};
+
+let measuresLoad: Promise<void> | null = null;
+
+// Kick off (once) the runtime refresh of the curated measures. Cached in module
+// state for the process lifetime; never rejects — failures just keep the bundle.
+function ensureMeasuresLoaded(): Promise<void> {
+  measuresLoad ??= (async () => {
+    try {
+      // failures come back HTTP 200 with `error` in the body — read the body
+      const d = (await (await fetch('/api/measures')).json()) as {
+        measures?: ServerCuratedMeasure[];
+        error?: string;
+      };
+      const list = Array.isArray(d?.measures) ? d.measures : [];
+      if (d?.error || list.length === 0) return; // offline shape → bundled copy applies
+      const next = new Map<string, CuratedEntry>();
+      for (const m of list) {
+        if (typeof m?.measure !== 'string' || !m.measure) continue;
+        if (typeof m.formula !== 'string' || !m.formula) continue;
+        next.set(m.measure, {
+          formula: m.formula,
+          unit: typeof m.unit === 'string' ? m.unit : '',
+          description: typeof m.description === 'string' ? m.description : '',
+        });
+      }
+      // a non-empty server list replaces the bundled one — an identical list
+      // means identical behavior (same shape, same keys)
+      if (next.size > 0) CURATED_MEASURES = next;
+    } catch {
+      /* offline / server down → the bundled copy stays */
+    }
+  })();
+  return measuresLoad;
+}
+
+// Runtime refresh of the curated KPIs from GET /api/measures. Exported so the
+// refresh can be awaited explicitly (tests); first use of the curated measures
+// triggers it automatically (fire-and-forget).
+export function refreshCuratedMeasures(): Promise<void> {
+  return ensureMeasuresLoaded();
+}
 
 // SQL identifiers in a formula that are functions/keywords rather than columns.
 const SQL_NOISE = new Set([
@@ -204,6 +262,7 @@ export function curatedMeasureFor(
   name: string,
   schema: Schema
 ): { formula: string; unit: string; description: string } | null {
+  void ensureMeasuresLoaded(); // first use kicks off the runtime refresh
   const curated = CURATED_MEASURES.get(name);
   if (!curated) return null;
   const available = new Set(
