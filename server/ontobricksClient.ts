@@ -28,6 +28,7 @@
 // Errors are humanized the way shared/stateError.ts humanizes app-state
 // failures: status + a short response snippet, never raw fetch internals.
 import type { GraphNeighbor, OntobricksClientConfig } from '../shared/ontobricksTypes';
+import { getSpGateToken } from './spGateToken';
 
 export interface OntobricksClient {
   fetchNeighbors(domain: string, iri: string, hops: number): Promise<GraphNeighbor[]>;
@@ -162,6 +163,9 @@ function buildExpansionQuery(originType: string, types: SdlTypes, hops: number):
 export function createOntobricksClient(cfg: OntobricksClientConfig): OntobricksClient {
   const base = cfg.baseUrl.replace(/\/+$/, '');
   const fetchImpl = cfg.fetchImpl ?? fetch;
+  // SP OAuth token for the Apps gate; null (offline) → no Authorization
+  // header and the request goes out exactly as it did before the gate.
+  const gateToken = cfg.gateToken ?? getSpGateToken;
   // domain -> relationship map, so repeated expansions skip the schema call
   const sdlCache = new Map<string, SdlTypes>();
 
@@ -180,11 +184,14 @@ export function createOntobricksClient(cfg: OntobricksClientConfig): OntobricksC
   }
 
   async function request(method: string, path: string, body?: unknown): Promise<unknown> {
+    // minted before the try so a mint failure surfaces its own humanized
+    // error rather than "could not reach the ontobricks app"
+    const gate = await gateToken();
     let res: Response;
     try {
       res = await fetchImpl(`${base}${path}`, {
         method,
-        headers: headers(),
+        headers: { ...headers(), ...(gate ? { Authorization: `Bearer ${gate}` } : {}) },
         ...(body === undefined ? {} : { body: JSON.stringify(body) }),
       });
     } catch (err) {

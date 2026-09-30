@@ -1,11 +1,14 @@
 // Unit tests for the ontos client. All responses are served by an injected
-// fetchImpl — no network, no auth. The wire expectations (URLs, X-API-key
-// header, body shapes) are the contract with the deployed ontos app.
+// fetchImpl — no network, no real auth. The wire expectations (URLs, X-API-key
+// and gate Authorization headers, body shapes) are the contract with the
+// deployed ontos app.
 import { describe, expect, it } from 'vitest';
 import { createOntosClient } from './ontosClient';
+import type { OntosClientConfig } from '../shared/ontosTypes';
 
 const BASE = 'https://ontos.example';
 const TOKEN = 'tok-123';
+const SP_TOKEN = 'sp-oauth-tok';
 
 function jsonResponse(status: number, body: unknown): Response {
   return new Response(JSON.stringify(body), {
@@ -14,8 +17,10 @@ function jsonResponse(status: number, body: unknown): Response {
   });
 }
 
-// Records every fetch the client makes and serves canned responses.
-function makeHarness() {
+// Records every fetch the client makes and serves canned responses. The
+// gate-token resolver defaults to null so these tests stay hermetic offline —
+// a dev shell with the SP env vars exported must never leak a live mint.
+function makeHarness(cfgOverrides: Partial<OntosClientConfig> = {}) {
   const calls: Array<{ url: string; init: RequestInit }> = [];
   let respond: (url: string) => Response = () => jsonResponse(200, {});
   const fetchImpl = (input: string, init?: RequestInit): Promise<Response> => {
@@ -31,6 +36,8 @@ function makeHarness() {
       baseUrl: BASE,
       apiToken: TOKEN,
       fetchImpl: fetchImpl as unknown as typeof fetch,
+      gateToken: () => Promise.resolve(null),
+      ...cfgOverrides,
     }),
   };
 }
@@ -210,5 +217,48 @@ describe('connection failures', () => {
     await expect(h.client.getProduct('dp-1')).rejects.toThrow(
       /could not reach the ontos app at https:\/\/ontos\.example \(fetch failed\)/
     );
+  });
+});
+
+describe('gate token — Authorization header', () => {
+  it('adds Authorization: Bearer to every request kind when a gate token resolves', async () => {
+    const h = makeHarness({ gateToken: () => Promise.resolve(SP_TOKEN) });
+    h.respondWith(() => jsonResponse(200, { id: 'x' }));
+    await h.client.importOdcsContract('apiVersion: v3.1.0');
+    await h.client.createProductFromContract('c-1', 'X');
+    await h.client.getProduct('dp-1');
+    await h.client.getContractValidationState('c-1');
+    expect(h.calls.length).toBe(4);
+    for (const call of h.calls) {
+      expect(headersOf(call.init).Authorization).toBe(`Bearer ${SP_TOKEN}`);
+      // the app-level X-API-key header stays untouched alongside the gate auth
+      expect(headersOf(call.init)['X-API-key']).toBe(TOKEN);
+    }
+  });
+
+  it('sends no Authorization header when the gate token resolves null (offline passthrough)', async () => {
+    const h = makeHarness({ gateToken: () => Promise.resolve(null) });
+    h.respondWith(() => jsonResponse(200, { id: 'x' }));
+    await h.client.importOdcsContract('apiVersion: v3.1.0');
+    await h.client.createProductFromContract('c-1', 'X');
+    await h.client.getProduct('dp-1');
+    await h.client.getContractValidationState('c-1');
+    expect(h.calls.length).toBe(4);
+    for (const call of h.calls) {
+      expect(headersOf(call.init).Authorization).toBeUndefined();
+      expect(headersOf(call.init)['X-API-key']).toBe(TOKEN);
+    }
+  });
+
+  it('propagates a humanized mint failure from the gate-token resolver', async () => {
+    const h = makeHarness({
+      gateToken: () =>
+        Promise.reject(new Error('the SP gate-token mint failed with status 400')),
+    });
+    h.respondWith(() => jsonResponse(200, { id: 'x' }));
+    await expect(h.client.getProduct('dp-1')).rejects.toThrow(
+      /SP gate-token mint failed with status 400/
+    );
+    expect(h.calls.length).toBe(0); // nothing went out after the failed mint
   });
 });

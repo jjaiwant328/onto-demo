@@ -1,13 +1,15 @@
 // Unit tests for the ontobricks graph client. All responses are served by an
-// injected fetchImpl — no network, no auth. The wire expectations (URLs,
-// X-Databricks-* headers, GraphQL body shapes) are the contract with the
-// deployed ontobricks app, per its documented API (docs/api.md § GraphQL API).
+// injected fetchImpl — no network, no real auth. The wire expectations (URLs,
+// X-Databricks-* and gate Authorization headers, GraphQL body shapes) are the
+// contract with the deployed ontobricks app, per its documented API (docs/
+// api.md § GraphQL API).
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createOntobricksClient } from './ontobricksClient';
 import type { GraphNeighbor, OntobricksClientConfig } from '../shared/ontobricksTypes';
 
 const BASE = 'https://ontobricks.example';
 const TOKEN = 'dapi-tok-123';
+const SP_TOKEN = 'sp-oauth-tok';
 const HOST = 'adb-example.azuredatabricks.net';
 const DOMAIN = 'retail_demo';
 const GRAPHQL_URL = `${BASE}/api/v1/graphql/${DOMAIN}`;
@@ -72,6 +74,10 @@ function makeHarness(cfgOverrides: Partial<OntobricksClientConfig> = {}) {
       token: TOKEN,
       databricksHost: HOST,
       fetchImpl: fetchImpl as unknown as typeof fetch,
+      // gate-token resolver pinned to null so these tests stay hermetic
+      // offline — a dev shell with the SP env vars exported must never
+      // leak a live mint into them
+      gateToken: () => Promise.resolve(null),
       ...cfgOverrides,
     }),
   };
@@ -304,5 +310,40 @@ describe('workspace host resolution', () => {
     for (const call of h.calls) {
       expect(headersOf(call.init)['X-Databricks-Host']).toBe('env-host.example');
     }
+  });
+});
+
+describe('gate token — Authorization header', () => {
+  it('adds Authorization: Bearer to the schema, probe and expansion calls', async () => {
+    const h = makeHarness({ gateToken: () => Promise.resolve(SP_TOKEN) });
+    serveGraph(h, PROBE_FOUND, { data: { customer: null } });
+    await h.client.fetchNeighbors(DOMAIN, IRI_C1, 2);
+    expect(h.calls.length).toBe(3);
+    for (const call of h.calls) {
+      expect(headersOf(call.init).Authorization).toBe(`Bearer ${SP_TOKEN}`);
+      // the app-level PAT header stays untouched alongside the gate auth
+      expect(headersOf(call.init)['X-Databricks-Token']).toBe(TOKEN);
+    }
+  });
+
+  it('sends no Authorization header when the gate token resolves null (offline passthrough)', async () => {
+    const h = makeHarness({ gateToken: () => Promise.resolve(null) });
+    serveGraph(h, PROBE_FOUND, { data: { customer: null } });
+    await h.client.fetchNeighbors(DOMAIN, IRI_C1, 1);
+    for (const call of h.calls) {
+      expect(headersOf(call.init).Authorization).toBeUndefined();
+      expect(headersOf(call.init)['X-Databricks-Token']).toBe(TOKEN);
+    }
+  });
+
+  it('propagates a humanized mint failure from the gate-token resolver', async () => {
+    const h = makeHarness({
+      gateToken: () => Promise.reject(new Error('the SP gate-token mint failed with status 400')),
+    });
+    serveGraph(h, PROBE_FOUND, { data: { customer: null } });
+    await expect(h.client.fetchNeighbors(DOMAIN, IRI_C1, 2)).rejects.toThrow(
+      /SP gate-token mint failed with status 400/
+    );
+    expect(h.calls.length).toBe(0); // nothing went out after the failed mint
   });
 });

@@ -47,4 +47,11 @@ export interface OntobricksClientConfig {
   token: string; // PAT
   fetchImpl?: typeof fetch;
   databricksHost?: string;
+  /**
+   * Resolves the SP OAuth bearer for the Databricks Apps gate (sent as
+   * `Authorization: Bearer` on every call — schema, probe and expansion).
+   * Defaults to the shared gate-token manager; resolving null (offline
+   * mode) sends no Authorization header.
+   */
+  gateToken?: () => Promise<string | null>;
 }

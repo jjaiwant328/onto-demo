@@ -22,6 +22,7 @@ import type {
   DataProductSummary,
   OntosClientConfig,
 } from '../shared/ontosTypes';
+import { getSpGateToken } from './spGateToken';
 
 export interface OntosClient {
   importOdcsContract(yaml: string): Promise<{ contractId: string }>;
@@ -124,6 +125,9 @@ function lifecycleToState(raw: unknown): ContractValidationState['status'] {
 export function createOntosClient(cfg: OntosClientConfig): OntosClient {
   const base = cfg.baseUrl.replace(/\/+$/, '');
   const fetchImpl = cfg.fetchImpl ?? fetch;
+  // SP OAuth token for the Apps gate; null (offline) → no Authorization
+  // header and the request goes out exactly as it did before the gate.
+  const gateToken = cfg.gateToken ?? getSpGateToken;
 
   async function request(
     method: string,
@@ -131,11 +135,18 @@ export function createOntosClient(cfg: OntosClientConfig): OntosClient {
     init: { headers?: Record<string, string>; body?: string | FormData } = {},
     allowNotFound = false
   ): Promise<OntosResponse> {
+    // minted before the try so a mint failure surfaces its own humanized
+    // error rather than "could not reach the ontos app"
+    const gate = await gateToken();
     let res: Response;
     try {
       res = await fetchImpl(`${base}/api${path}`, {
         method,
-        headers: { 'X-API-key': cfg.apiToken, ...init.headers },
+        headers: {
+          'X-API-key': cfg.apiToken,
+          ...init.headers,
+          ...(gate ? { Authorization: `Bearer ${gate}` } : {}),
+        },
         body: init.body,
       });
     } catch (err) {
