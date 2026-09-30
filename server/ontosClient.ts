@@ -224,7 +224,8 @@ export function createOntosClient(cfg: OntosClientConfig): OntosClient {
         id: firstString(body, ['id']) ?? id,
         name: firstString(body, ['name']) ?? id,
         status: firstString(body, ['status']),
-        domain: firstString(body, ['domain']),
+        // upstream spells it `domain_id`; tolerate both so either shape maps
+        domain: firstString(body, ['domain_id', 'domain']),
         owner: firstString(body, ['owner_team_name', 'owner_team_id', 'owner']),
       };
     },

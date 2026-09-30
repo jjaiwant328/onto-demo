@@ -40,3 +40,10 @@ env:
   # ontobricks ontology domain (default domain for /api/graph/neighbors)
   - name: ONTOBRICKS_DOMAIN
     value: ''
+  # Machine SP OAuth credentials that mint the Apps-gate bearer token
+  # (server/spGateToken.ts) for calls to the companion apps. Empty defaults
+  # here — the operator sets the real values as app secrets.
+  - name: RT_INTEGRATION_SP_CLIENT_ID
+    value: ''
+  - name: RT_INTEGRATION_SP_SECRET
+    value: ''

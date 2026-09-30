@@ -94,10 +94,9 @@ PATs work fine against workspace APIs and as the app-level
 
 ## 4. Wiring RT_onto_demo
 
-The server reads these env vars. Most are declared in `app.yaml` with empty
-defaults; the two `RT_INTEGRATION_SP_*` vars are not yet declared there
-(operators add them — step 3 below). Values are set at deploy time,
-secrets never in the repo:
+The server reads these env vars. All are declared in `app.yaml` with empty
+defaults; operators switch the secret-bearing ones to `valueFrom`
+(step 3 below). Values are set at deploy time, secrets never in the repo:
 
 | Env var | Kind | Where to obtain the value |
 | --- | --- | --- |
@@ -133,10 +132,11 @@ To set the secret-bearing values on the deployed app:
        valueFrom: rt-integration-sp-secret
    ```
 
-   Add the two `RT_INTEGRATION_SP_*` entries (not yet declared) and switch
-   the other secret-bearing entries from their empty `value: ''` defaults
-   to `valueFrom`; plain values (URLs, client id, domain name) stay as
-   `value`. `valueFrom` may also reference the attached `sql-warehouse`
+   Switch the secret-bearing entries (including the two
+   `RT_INTEGRATION_SP_*` vars, now declared with empty defaults) from their
+   empty `value: ''` defaults to `valueFrom`; plain values (URLs, client id,
+   domain name) stay as `value`. `valueFrom` may also reference the attached
+   `sql-warehouse`
    resource, as the existing `DATABRICKS_WAREHOUSE_ID` entry does.
 4. **Redeploy** (env values resolve at deploy time) — see
    `docs/appkit_app_notes.md` for the full flow:
@@ -187,6 +187,12 @@ edges, and `/api/measures` serves the bundled measures.
    that `jai_rt_onto_integration` is a member — the REST routes resolve
    the gate identity's role, so losing membership breaks the DataContract
    sync/validation flow.
+
+**Re-publishing a domain:** the server caches the OntoBricks GraphQL SDL
+per domain for the life of the process (`server/ontobricksClient.ts`), so
+after a domain is re-published with changed relationships the running
+server keeps the stale fields (expansion then 400s, humanized). Restart
+or redeploy the RT_onto app so the server picks up the new domain schema.
 
 ## 6. Verification
 
