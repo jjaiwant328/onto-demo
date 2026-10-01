@@ -3458,12 +3458,15 @@ createApp({
         }
         let productId: string;
         try {
+          // uploaded contracts start as draft; from-contract requires an
+          // active/approved/certified one — walk the ODCS lifecycle first.
+          await client.activateContract(contractId);
           productId = (
             await client.createProductFromContract(contractId, 'jai_store_traffic_labor_efficiency')
           ).productId;
         } catch (err) {
-          // known upstream bug: ontos' from-contract endpoint 500s. The
-          // contract IS imported — surface both facts, never claim full success.
+          // The contract IS imported — surface both facts, never claim full
+          // success on a partially-completed sync.
           res.json({
             ok: false,
             error: `contract ${contractId} imported, but the upstream ontos data-product endpoint failed: ${errMsg(err)}`,

@@ -26,6 +26,7 @@ import { getSpGateToken } from './spGateToken';
 
 export interface OntosClient {
   importOdcsContract(yaml: string): Promise<{ contractId: string }>;
+  activateContract(contractId: string): Promise<void>;
   createProductFromContract(contractId: string, name: string): Promise<{ productId: string }>;
   getProduct(id: string): Promise<DataProductSummary | null>;
   getContractValidationState(contractId: string): Promise<ContractValidationState>;
@@ -188,6 +189,18 @@ export function createOntosClient(cfg: OntosClientConfig): OntosClient {
         throw new Error('ontos imported the contract but returned no contract id');
       }
       return { contractId };
+    },
+
+    // A freshly uploaded contract sits in `draft`; the from-contract product
+    // endpoint only accepts active/approved/certified contracts. Walk the ODCS
+    // lifecycle one step at a time (ontos rejects skipping transitions).
+    async activateContract(contractId: string): Promise<void> {
+      for (const status of ['proposed', 'under_review', 'approved', 'active']) {
+        await request('POST', `/data-contracts/${encodeURIComponent(contractId)}/change-status`, {
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ new_status: status }),
+        });
+      }
     },
 
     async createProductFromContract(

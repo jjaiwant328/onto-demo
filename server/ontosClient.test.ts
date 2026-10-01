@@ -111,6 +111,33 @@ describe('createProductFromContract', () => {
   });
 });
 
+describe('activateContract', () => {
+  it('walks the ODCS lifecycle one status at a time', async () => {
+    const h = makeHarness();
+    h.respondWith((url) => jsonResponse(200, { status: url.split('/').pop() }));
+    await h.client.activateContract('c-1');
+    expect(h.calls.map((c) => c.url)).toEqual([
+      `${BASE}/api/data-contracts/c-1/change-status`,
+      `${BASE}/api/data-contracts/c-1/change-status`,
+      `${BASE}/api/data-contracts/c-1/change-status`,
+      `${BASE}/api/data-contracts/c-1/change-status`,
+    ]);
+    const bodies = h.calls.map((c) => JSON.parse(c.init.body as string));
+    expect(bodies).toEqual([
+      { new_status: 'proposed' },
+      { new_status: 'under_review' },
+      { new_status: 'approved' },
+      { new_status: 'active' },
+    ]);
+  });
+
+  it('humanizes a rejected lifecycle transition', async () => {
+    const h = makeHarness();
+    h.respondWith(() => jsonResponse(409, { detail: 'Invalid transition' }));
+    await expect(h.client.activateContract('c-1')).rejects.toThrow(/status 409.*Invalid transition/);
+  });
+});
+
 describe('getProduct', () => {
   it('maps the product document onto the summary and tolerates unknown fields', async () => {
     const h = makeHarness();
