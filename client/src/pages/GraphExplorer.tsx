@@ -29,6 +29,8 @@ import {
   Search,
   ChevronDown,
   ChevronRight,
+  PanelLeftClose,
+  PanelLeftOpen,
   PanelRightClose,
   PanelRightOpen,
 } from 'lucide-react';
@@ -53,6 +55,7 @@ const CANVAS_HEIGHT_WIDE = 860;
 const HELP_KEY = 'rt_onto_gx_help';
 const LEGEND_KEY = 'rt_onto_gx_legend';
 const WIDE_KEY = 'rt_onto_gx_wide';
+const PANE_KEY = 'rt_onto_gx_pane';
 
 function readPref(key: string, fallback: boolean): boolean {
   try {
@@ -296,12 +299,15 @@ export function GraphExplorer() {
   const [showHelp, setShowHelp] = useState(() => readPref(HELP_KEY, false));
   const [showLegend, setShowLegend] = useState(() => readPref(LEGEND_KEY, false));
   const [wide, setWide] = useState(() => readPref(WIDE_KEY, false));
+  const [showPane, setShowPane] = useState(() => readPref(PANE_KEY, true));
   useEffect(() => writePref(HELP_KEY, showHelp), [showHelp]);
   useEffect(() => writePref(LEGEND_KEY, showLegend), [showLegend]);
   useEffect(() => writePref(WIDE_KEY, wide), [wide]);
-  // reclaim the rows the collapsed chrome gave back
-  const canvasHeight =
-    (wide ? CANVAS_HEIGHT_WIDE : CANVAS_HEIGHT) + (showHelp ? 0 : 60) + (showLegend ? 0 : 24);
+  useEffect(() => writePref(PANE_KEY, showPane), [showPane]);
+  // All chrome lives in the left control pane now, so the canvas keeps its full
+  // height regardless of help/legend state; the inspector toggle is the only
+  // thing that changes how much room it gets.
+  const canvasHeight = (wide ? CANVAS_HEIGHT_WIDE : CANVAS_HEIGHT) + 84;
 
   // node search (works on the active tab's node set; jumps to a match)
   const [search, setSearch] = useState('');
@@ -438,120 +444,108 @@ export function GraphExplorer() {
 
   return (
     <div className="space-y-2 max-w-[1800px]">
-      {/* Title + help on ONE row, with the help text collapsed by default: this page
-          is a canvas, so vertical space above it is the scarcest thing here. */}
+      {/* Title row + the control-pane toggle. Everything else that used to sit in
+          rows above the canvas lives in the left control pane (OntoBricks-style:
+          controls left, canvas fills the rest). */}
       <div className="flex items-baseline gap-2">
         <h2 className="text-2xl font-bold text-foreground">Graph Explorer</h2>
         <button
           type="button"
-          className="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground"
-          aria-expanded={showHelp}
-          onClick={() => setShowHelp((v) => !v)}
-        >
-          <Info className="h-3.5 w-3.5" />
-          {showHelp ? 'Hide help' : 'How to read this'}
-        </button>
-        <button
-          type="button"
           className="ml-auto flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground"
-          aria-pressed={wide}
-          title={wide ? 'Show the inspector panel' : 'Hide the inspector for a wider canvas'}
-          onClick={() => setWide((v) => !v)}
+          aria-pressed={showPane}
+          title={showPane ? 'Hide the control pane for a wider canvas' : 'Show the control pane'}
+          onClick={() => setShowPane((v) => !v)}
         >
-          {wide ? <PanelRightOpen className="h-3.5 w-3.5" /> : <PanelRightClose className="h-3.5 w-3.5" />}
-          {wide ? 'Show inspector' : 'Widen canvas'}
+          {showPane ? <PanelLeftClose className="h-3.5 w-3.5" /> : <PanelLeftOpen className="h-3.5 w-3.5" />}
+          {showPane ? 'Hide controls' : 'Show controls'}
         </button>
       </div>
-      {showHelp && (
-        <p className="flex items-start gap-1.5 text-sm text-muted-foreground">
-          <Info className="h-3.5 w-3.5 mt-0.5 shrink-0" />
-          {isExplore
-            ? 'Explore: the full enterprise map (enterprise → domains → products → shared tables → metric views). Your domain/product selection is highlighted; the rest stays visible but dimmed. Click any node to center it and ring its neighbors (green = incoming, red = outgoing) and travel — even across a shared dimension to another product. Back / Overview returns to the full map.'
-            : `Ontology + lineage: a per-product bird’s-eye map (source tables → serving view → product → KPIs). Click a node to highlight its connections. Drag to pan, scroll to zoom.${fromArtifact ? ' Rendered from the generated ontology artifact (OWL/TTL).' : ''}`}
-        </p>
-      )}
 
       <Tabs value={tab} onValueChange={(v) => setTab(v as 'explore' | 'onto')}>
-        <TabsList>
-          <TabsTrigger value="explore">Explore</TabsTrigger>
-          <TabsTrigger value="onto">Ontology + lineage</TabsTrigger>
-        </TabsList>
+        <div className="flex flex-col lg:flex-row gap-3 mt-2 items-start">
+          {showPane && (
+            <div className="w-full lg:w-60 shrink-0 rounded-md border bg-card p-3 space-y-4">
+              <section>
+                <div className="text-xs font-medium uppercase tracking-wide text-muted-foreground mb-1.5">View</div>
+                <TabsList className="flex flex-col h-auto w-full items-stretch gap-1">
+                  <TabsTrigger value="explore">Explore</TabsTrigger>
+                  <TabsTrigger value="onto">Ontology + lineage</TabsTrigger>
+                </TabsList>
+              </section>
 
-        {/* inspector is narrower than before (280 -> 240) and can be hidden entirely,
-            which is the single biggest win for seeing a wide estate */}
-        <div
-          className={`grid grid-cols-1 gap-3 mt-2 ${
-            wide ? '' : 'lg:grid-cols-[1fr_240px]'
-          }`}
-        >
-          <Card className="shadow-sm overflow-hidden">
-            <CardHeader className="py-2.5 gap-2">
-              {/* node search — jumps to a matching node in the active view */}
-              <div ref={searchRef} className="relative w-full max-w-sm">
-                <div className="relative">
-                  <Search className="absolute left-2 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-muted-foreground" />
-                  <Input
-                    className="pl-8 pr-7 h-8 text-xs"
-                    placeholder={isExplore ? 'Search nodes (products, tables, domains…)' : 'Search ontology nodes…'}
-                    value={search}
-                    onChange={(e) => {
-                      setSearch(e.target.value);
-                      setSearchOpen(true);
-                    }}
-                    onFocus={() => setSearchOpen(true)}
-                    onKeyDown={(e) => {
-                      if (e.key === 'Enter' && searchResults[0]) jumpToSearch(searchResults[0].id);
-                      if (e.key === 'Escape') {
-                        setSearch('');
-                        setSearchOpen(false);
-                      }
-                    }}
-                  />
-                  {search && (
-                    <button
-                      type="button"
-                      className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
-                      onClick={() => {
-                        setSearch('');
-                        setSearchOpen(false);
+              <section>
+                <div className="text-xs font-medium uppercase tracking-wide text-muted-foreground mb-1.5">Search</div>
+                {/* node search — jumps to a matching node in the active view */}
+                <div ref={searchRef} className="relative w-full">
+                  <div className="relative">
+                    <Search className="absolute left-2 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-muted-foreground" />
+                    <Input
+                      className="pl-8 pr-7 h-8 text-xs"
+                      placeholder={isExplore ? 'Search nodes (products, tables, domains…)' : 'Search ontology nodes…'}
+                      value={search}
+                      onChange={(e) => {
+                        setSearch(e.target.value);
+                        setSearchOpen(true);
                       }}
-                      aria-label="Clear search"
-                    >
-                      <X className="h-3.5 w-3.5" />
-                    </button>
+                      onFocus={() => setSearchOpen(true)}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter' && searchResults[0]) jumpToSearch(searchResults[0].id);
+                        if (e.key === 'Escape') {
+                          setSearch('');
+                          setSearchOpen(false);
+                        }
+                      }}
+                    />
+                    {search && (
+                      <button
+                        type="button"
+                        className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+                        onClick={() => {
+                          setSearch('');
+                          setSearchOpen(false);
+                        }}
+                        aria-label="Clear search"
+                      >
+                        <X className="h-3.5 w-3.5" />
+                      </button>
+                    )}
+                  </div>
+                  {searchOpen && searchResults.length > 0 && (
+                    <div className="absolute z-20 mt-1 w-full max-h-64 overflow-auto rounded-md border bg-background shadow-md">
+                      {searchResults.map((r) => (
+                        <button
+                          key={r.id}
+                          type="button"
+                          className="flex w-full items-center justify-between gap-2 px-3 py-1.5 text-left text-xs hover:bg-muted"
+                          onClick={() => jumpToSearch(r.id)}
+                        >
+                          <span className="truncate">{r.label}</span>
+                          {r.kindLabel && (
+                            <span className="text-[10px] text-muted-foreground shrink-0">{r.kindLabel}</span>
+                          )}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                  {searchOpen && search.trim() && searchResults.length === 0 && (
+                    <div className="absolute z-20 mt-1 w-full rounded-md border bg-background p-2 text-xs text-muted-foreground shadow-md">
+                      No matching nodes.
+                    </div>
                   )}
                 </div>
-                {searchOpen && searchResults.length > 0 && (
-                  <div className="absolute z-20 mt-1 w-full max-h-64 overflow-auto rounded-md border bg-background shadow-md">
-                    {searchResults.map((r) => (
-                      <button
-                        key={r.id}
-                        type="button"
-                        className="flex w-full items-center justify-between gap-2 px-3 py-1.5 text-left text-xs hover:bg-muted"
-                        onClick={() => jumpToSearch(r.id)}
-                      >
-                        <span className="truncate">{r.label}</span>
-                        {r.kindLabel && (
-                          <span className="text-[10px] text-muted-foreground shrink-0">{r.kindLabel}</span>
-                        )}
-                      </button>
-                    ))}
-                  </div>
-                )}
-                {searchOpen && search.trim() && searchResults.length === 0 && (
-                  <div className="absolute z-20 mt-1 w-full rounded-md border bg-background p-2 text-xs text-muted-foreground shadow-md">
-                    No matching nodes.
-                  </div>
-                )}
-              </div>
+              </section>
+
               <TabsContent value="explore" className="m-0">
-                <div className="flex items-center gap-2 flex-wrap">
-                  <Button variant="outline" size="sm" onClick={goBack} disabled={!focusId}>
-                    Back
-                  </Button>
-                  <Button variant="outline" size="sm" onClick={reset} disabled={!focusId}>
-                    Overview
-                  </Button>
+                <section>
+                  <div className="text-xs font-medium uppercase tracking-wide text-muted-foreground mb-1.5">Travel</div>
+                  <div className="flex gap-2">
+                    <Button variant="outline" size="sm" onClick={goBack} disabled={!focusId}>
+                      Back
+                    </Button>
+                    <Button variant="outline" size="sm" onClick={reset} disabled={!focusId}>
+                      Overview
+                    </Button>
+                  </div>
                   <Breadcrumb
                     trail={trail}
                     focusId={focusId}
@@ -559,14 +553,13 @@ export function GraphExplorer() {
                     onJump={jumpTrail}
                     onReset={reset}
                   />
-                </div>
+                </section>
               </TabsContent>
-              {/* legend collapsed by default — it costs a full row and is reference
-                  information, not something you read on every visit */}
-              <div className="flex items-center gap-3">
+
+              <section>
                 <button
                   type="button"
-                  className="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground shrink-0"
+                  className="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground"
                   aria-expanded={showLegend}
                   onClick={() => setShowLegend((v) => !v)}
                 >
@@ -578,7 +571,7 @@ export function GraphExplorer() {
                   Legend
                 </button>
                 {showLegend && (
-                  <div className="flex flex-wrap gap-3">
+                  <div className="flex flex-col gap-1.5 mt-1.5">
                     {LEGEND.map((l) => (
                       <span
                         key={l.label}
@@ -593,8 +586,44 @@ export function GraphExplorer() {
                     ))}
                   </div>
                 )}
-              </div>
-            </CardHeader>
+              </section>
+
+              <section>
+                <button
+                  type="button"
+                  className="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground"
+                  aria-expanded={showHelp}
+                  onClick={() => setShowHelp((v) => !v)}
+                >
+                  <Info className="h-3.5 w-3.5" />
+                  {showHelp ? 'Hide help' : 'How to read this'}
+                </button>
+                {showHelp && (
+                  <p className="flex items-start gap-1.5 text-xs text-muted-foreground mt-1.5">
+                    <Info className="h-3.5 w-3.5 mt-0.5 shrink-0" />
+                    {isExplore
+                      ? 'Explore: the full enterprise map (enterprise → domains → products → shared tables → metric views). Your domain/product selection is highlighted; the rest stays visible but dimmed. Click any node to center it and ring its neighbors (green = incoming, red = outgoing) and travel — even across a shared dimension to another product. Back / Overview returns to the full map.'
+                      : `Ontology + lineage: a per-product bird’s-eye map (source tables → serving view → product → KPIs). Click a node to highlight its connections. Drag to pan, scroll to zoom.${fromArtifact ? ' Rendered from the generated ontology artifact (OWL/TTL).' : ''}`}
+                  </p>
+                )}
+              </section>
+
+              <section>
+                <button
+                  type="button"
+                  className="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground"
+                  aria-pressed={wide}
+                  title={wide ? 'Show the inspector panel' : 'Hide the inspector for a wider canvas'}
+                  onClick={() => setWide((v) => !v)}
+                >
+                  {wide ? <PanelRightOpen className="h-3.5 w-3.5" /> : <PanelRightClose className="h-3.5 w-3.5" />}
+                  {wide ? 'Show inspector' : 'Widen canvas'}
+                </button>
+              </section>
+            </div>
+          )}
+
+          <Card className="shadow-sm overflow-hidden flex-1 min-w-0 w-full">
             <CardContent className="p-0">
               <TabsContent value="explore" className="m-0">
                 {/* one enterprise map for the whole app; selection highlights, not filters */}
@@ -623,26 +652,28 @@ export function GraphExplorer() {
           </Card>
 
           {!wide && (
-            <Inspector
-              node={selectedNode}
-              sharedProducts={
-                isExplore && focusId ? enterpriseGraph.productsForNode(focusId) : []
-              }
-              onOpenProduct={(pn) => {
-                if (syncScopeFromSections) setSelectedProduct(pn);
-                const pnode = `prod:${pn}`;
-                if (enterpriseGraph.nodes[pnode]) travelTo(pnode);
-              }}
-              onClear={() => (isExplore ? reset() : setSelOntoId(null))}
-              onJump={(n) => {
-                // genie/dashboard link nodes → open the external URL in a new window
-                if (n.openUrl) {
-                  window.open(n.openUrl, '_blank');
-                  return;
+            <div className="w-full lg:w-60 shrink-0">
+              <Inspector
+                node={selectedNode}
+                sharedProducts={
+                  isExplore && focusId ? enterpriseGraph.productsForNode(focusId) : []
                 }
-                if (n.openIn) navigate(`/${n.openIn}`);
-              }}
-            />
+                onOpenProduct={(pn) => {
+                  if (syncScopeFromSections) setSelectedProduct(pn);
+                  const pnode = `prod:${pn}`;
+                  if (enterpriseGraph.nodes[pnode]) travelTo(pnode);
+                }}
+                onClear={() => (isExplore ? reset() : setSelOntoId(null))}
+                onJump={(n) => {
+                  // genie/dashboard link nodes → open the external URL in a new window
+                  if (n.openUrl) {
+                    window.open(n.openUrl, '_blank');
+                    return;
+                  }
+                  if (n.openIn) navigate(`/${n.openIn}`);
+                }}
+              />
+            </div>
           )}
         </div>
       </Tabs>

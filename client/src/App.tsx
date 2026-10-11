@@ -584,13 +584,19 @@ function Layout() {
       </header>
 
       <div className="flex-1 flex min-h-0">
-        {/* persistent left control panel (desktop) — collapsible for more canvas */}
+        {/* persistent left control panel (desktop) — slides in/out like a drawer
+            so wide canvases (Graph Explorer) can reclaim the space smoothly */}
         <aside
-          className={`hidden shrink-0 overflow-y-auto ${
-            sidebarCollapsed ? '' : 'md:block w-72 lg:w-80 border-r p-4'
+          aria-hidden={sidebarCollapsed}
+          className={`hidden md:block shrink-0 overflow-hidden transition-all duration-300 ease-in-out ${
+            sidebarCollapsed
+              ? 'w-0 opacity-0 -translate-x-3 border-r-0'
+              : 'w-72 lg:w-80 opacity-100 translate-x-0 border-r'
           }`}
         >
-          <ControlPanel />
+          <div className="w-72 lg:w-80 h-full overflow-y-auto p-4">
+            <ControlPanel />
+          </div>
         </aside>
 
         {/* main content: top section tabs + scope-sync toggle + routed page */}
