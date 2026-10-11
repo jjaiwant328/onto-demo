@@ -29,6 +29,11 @@ export interface CyCollection {
   length: number;
 }
 
+export interface CyLayout {
+  run(): void;
+  one(evt: string, cb: () => void): void;
+}
+
 export interface CyCore {
   add(els: CyElementDef[]): void;
   on(evt: string, selector: string, cb: (e: { target: CyCollection }) => void): void;
@@ -37,7 +42,8 @@ export interface CyCore {
   nodes(sel?: string): CyCollection;
   edges(sel?: string): CyCollection;
   getElementById(id: string): CyCollection;
-  layout(opts: Record<string, unknown>): { run(): void };
+  layout(opts: Record<string, unknown>): CyLayout;
+  animate(opts: Record<string, unknown>, animOpts?: Record<string, unknown>): void;
   fit(padding?: number): void;
   center(): void;
   zoom(level?: number): number;

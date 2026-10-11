@@ -271,7 +271,14 @@ export function TravelCanvas({
       const pos = ringPositions(ring.length);
       cy.getElementById(center).position({ x: 0, y: 0 });
       ring.forEach((id, i) => cy.getElementById(id).position(pos[i]));
-      cy.layout({ name: 'preset', fit: true, padding: 60, animate: true, animationDuration: 350 }).run();
+      const layout = cy.layout({ name: 'preset', fit: true, padding: 80, animate: true, animationDuration: 350 });
+      // a small ego-graph must not balloon to fill the whole canvas — cap at 100%
+      layout.one('layoutstop', () => {
+        if (cy.zoom() > 1) {
+          cy.animate({ zoom: 1, center: { eles: cy.getElementById(center) } }, { duration: 200 });
+        }
+      });
+      layout.run();
     }
   }, [focusId, graph, rootId, liveEdges]);
 

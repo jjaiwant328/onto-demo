@@ -584,19 +584,38 @@ function Layout() {
       </header>
 
       <div className="flex-1 flex min-h-0">
-        {/* persistent left control panel (desktop) — slides in/out like a drawer
-            so wide canvases (Graph Explorer) can reclaim the space smoothly */}
+        {/* persistent left control panel (desktop) — slides in/out like a drawer:
+            "Hide controls" collapses it to a slim rail, the rail reopens it */}
         <aside
-          aria-hidden={sidebarCollapsed}
-          className={`hidden md:block shrink-0 overflow-hidden transition-all duration-300 ease-in-out ${
-            sidebarCollapsed
-              ? 'w-0 opacity-0 -translate-x-3 border-r-0'
-              : 'w-72 lg:w-80 opacity-100 translate-x-0 border-r'
+          className={`hidden md:flex shrink-0 overflow-hidden border-r transition-all duration-300 ease-in-out ${
+            sidebarCollapsed ? 'w-9' : 'w-72 lg:w-80'
           }`}
         >
-          <div className="w-72 lg:w-80 h-full overflow-y-auto p-4">
-            <ControlPanel />
-          </div>
+          {sidebarCollapsed ? (
+            <button
+              type="button"
+              className="flex w-9 flex-col items-center gap-2 pt-3 text-muted-foreground hover:text-foreground"
+              title="Show the controls panel"
+              onClick={() => setSidebarCollapsed(false)}
+            >
+              <PanelLeftOpen className="h-4 w-4" />
+              <span className="text-[10px] tracking-wide [writing-mode:vertical-rl]">Controls</span>
+            </button>
+          ) : (
+            <div className="h-full w-72 lg:w-80 overflow-y-auto p-4">
+              <div className="mb-1 flex justify-end">
+                <button
+                  type="button"
+                  className="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground"
+                  onClick={() => setSidebarCollapsed(true)}
+                >
+                  <PanelLeftClose className="h-3.5 w-3.5" />
+                  Hide controls
+                </button>
+              </div>
+              <ControlPanel />
+            </div>
+          )}
         </aside>
 
         {/* main content: top section tabs + scope-sync toggle + routed page */}
