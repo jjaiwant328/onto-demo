@@ -104,7 +104,7 @@ defaults; operators switch the secret-bearing ones to `valueFrom`
 | `ONTOS_MCP_TOKEN` | secret | ontos MCP API token — mint at `POST <ontos-url>/api/mcp-tokens` authenticated as a workspace user (`Authorization: Bearer $(databricks auth token -p fe-vm-jai-classic-ws)`; exact payload in the ontos Swagger at `<ontos-url>/docs`). Request scopes covering `data-products` and `data-contracts` read/write. |
 | `ONTOBRICKS_APP_URL` | plain | `https://jai-ontobricks-687974281268075.aws.databricksapps.com` |
 | `ONTOBRICKS_TOKEN` | secret | workspace PAT — `databricks tokens create --comment "jai-ontobricks machine token for RT_onto GraphQL integration" -p fe-vm-jai-classic-ws` (record the returned `token_id` for later revocation). |
-| `ONTOBRICKS_DOMAIN` | plain | Name of the published OntoBricks domain (set after section 5 step 2). |
+| `ONTOBRICKS_DOMAIN` | plain | `jaistoretrafficlabor` — set 2026-10-06 (section 5 step 2). |
 | `RT_INTEGRATION_SP_CLIENT_ID` | plain | `a1e01f11-2292-4a68-af1a-b8c6c932532f` (the machine SP's OAuth client_id). |
 | `RT_INTEGRATION_SP_SECRET` | secret | The SP's OAuth client secret — generate under workspace Settings → Identity → Service principals → `jai_rt_onto_integration` → OAuth client secrets. |
 | `DATABRICKS_HOST` | runtime | Always present in the App runtime; used as the token-endpoint host. |
@@ -159,29 +159,41 @@ edges, and `/api/measures` serves the bundled measures.
 
 ## 5. Remaining operator steps
 
-1. **OntoBricks registry Initialize (UI).** Open
-   `https://jai-ontobricks-687974281268075.aws.databricksapps.com` →
-   Settings → Registry → Initialize. This creates the Postgres schema
-   `jai_ontobricks` in `jai_ontobricks_registry` and self-applies the SP
-   schema grants. Until then, GraphQL/registry endpoints return
-   `relation "jai_ontobricks.registries" does not exist` — that message
-   pre-Initialize is expected. Optionally re-run, from a clone of v0.8.0:
-
-   ```bash
-   scripts/bootstrap/lakebase-perms.sh -i jai-ontobricks-registry -b production \
-     -d jai_ontobricks_registry -s jai_ontobricks -c jai_ontos \
-     -a jai-ontobricks -a jai-mcp-ontobricks
-   ```
-
-2. **Author the flagship domain in OntoViz (UI, one-time).** Import the
-   repo's `ontology/retail_traffic_labor.ttl` (OntoBricks accepts
-   OWL/RDFS import), map the classes to the serving views in
-   `jai_ontos.demo_schema` (`jai_store_day_traffic_labor`,
-   `jai_store_efficiency_summary`, `jai_store_efficiency_opportunities`,
-   `jai_product_registry`), then publish through the server-enforced
-   lifecycle DRAFT → IN-REVIEW → PUBLISHED (transitions are UI-only; only
-   PUBLISHED versions are queryable). Afterwards set `ONTOBRICKS_DOMAIN`
-   to the published domain name (section 4) and redeploy.
+1. ~~OntoBricks registry Initialize~~ **DONE 2026-10-06** — done via API
+   (`POST /settings/registry/initialize`), not UI. Registry schema
+   `jai_ontobricks` created in `jai_ontobricks_registry`, SP grants
+   self-applied.
+2. ~~Author the flagship domain in OntoViz~~ **DONE 2026-10-06** — done
+   fully via API (the "UI-only" assumption was wrong; v0.8.0 exposes the
+   whole flow over REST). Published domain: **`jaistoretrafficlabor`**
+   (v2 PUBLISHED), 27 240 triples in graph `JaiStoreTrafficLabor_V2`;
+   `ONTOBRICKS_DOMAIN=jaistoretrafficlabor` is set in the deployed
+   onto-demo-integ `app.yaml` and `/api/graph/neighbors` serves live
+   neighbors. API flow: `parse-owl` → `domain/info` →
+   `metadata/initialize` → `mapping/auto-assign/single` per item →
+   `mapping/save` → `domain/save-to-uc` →
+   `review/{domain}/{v}/submit|signoff|publish` → `dtwin/sync/start`.
+   Gotchas hit (all cost a version cycle):
+   - POSTs need session cookies + `X-CSRF-Token` header (from the
+     `csrf_token` cookie) + `X-Requested-With: XMLHttpRequest`; settings
+     POSTs also need an **admin identity** — the integration SP gets 403,
+     use a personal token (`databricks auth token`).
+   - Domain names must be CamelCase alphanumeric once the session is
+     reset; the registry lowercases the folder (`JaiStoreTrafficLabor` →
+     `jaistoretrafficlabor`) and review/GraphQL paths use the folder.
+   - The materializer derives instance URIs from the domain name
+     (`…/JaiStoreTrafficLabor/<Class>/<id>`); the OWL import prefix must
+     match or the GraphQL resolver finds 0 subjects.
+   - `mapping/auto-assign/*` tasks race: run them sequentially or
+     mappings overwrite each other. The LLM also invents wrong
+     `source_class`/`target_class` for relationships — verify with
+     `mapping/load` and patch via `mapping/save`.
+   - Union-domain object properties (`rdfs:domain [ owl:unionOf … ]`)
+     never become GraphQL fields; use a single domain class.
+   - After any PUBLISH, run `POST /dtwin/sync/start` — GraphQL serves
+     from the materialized graph, not the mapping SQL.
+   - Re-publishing flips the version back to DRAFT if you reopen it
+     afterwards; check `domain/list-versions` before declaring done.
 3. **ontos: verify the machine SP's role.** In the ontos UI, confirm the
    "Data Producer" AppRole still includes the `data-producers` group and
    that `jai_rt_onto_integration` is a member — the REST routes resolve
