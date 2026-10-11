@@ -1,0 +1,39 @@
+name: Deploy - Dev
+
+on:
+  workflow_dispatch:
+    inputs:
+      user_prefix:
+        description: 'Your short_name (app: rt-onto-demo-dev-<prefix>)'
+        required: true
+        type: string
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  DATABRICKS_AUTH_TYPE: github-oidc
+  DATABRICKS_HOST: ${{ vars.DATABRICKS_HOST }}
+  DATABRICKS_CLIENT_ID: ${{ vars.DATABRICKS_SP_CLIENT_ID }}
+
+jobs:
+  deploy-dev:
+    name: Deploy App to Dev (${{ inputs.user_prefix }})
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - run: npm ci
+      - run: npm run build
+
+      - uses: databricks/setup-cli@main
+      - name: Deploy bundle (dev)
+        run: databricks bundle deploy --target dev
+        env:
+          DATABRICKS_BUNDLE_VAR_app_name: rt-onto-demo-dev-${{ inputs.user_prefix }}

@@ -1,7 +1,7 @@
 # ---- Node / AppKit (new deployed app) ----
 node_modules/
-client/dist/
-dist/
+# dist/ is NOT ignored — Databricks Apps platform needs pre-built assets
+# The CI/CD pipeline runs `npm run build` before `bundle deploy`
 build/
 .databricks/
 .smoke-test/
