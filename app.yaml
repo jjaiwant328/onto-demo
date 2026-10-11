@@ -19,7 +19,7 @@ env:
   - name: PGDATABASE
     value: 'databricks_postgres'
   - name: PGUSER
-    value: 'bf309888-d7fa-4311-b847-22b6a8b19693'
+    value: 'ccd7b429-2606-409d-bc81-90b912e5e84e'
   - name: LAKEBASE_ENDPOINT
     value: 'projects/jai-onto-demo/branches/production/endpoints/primary'
   - name: PGSSLMODE
